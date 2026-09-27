@@ -1,0 +1,65 @@
+pdfNote License Notice
+======================
+
+Copyright (C) 2026 Kyohei Izumi (泉　恭平)
+
+pdfNote is licensed under the GNU Affero General Public License, version 3 or
+(at your option) any later version published by the Free Software Foundation
+(the "AGPL"). The text of the AGPL is in the file LICENSE (also
+legal/AGPL-3.0.txt). pdfNote is distributed WITHOUT ANY WARRANTY, to the
+extent permitted by applicable law; see sections 15 and 16 of the AGPL.
+
+Components supplied by third parties are licensed under their own licenses;
+see legal/THIRD_PARTY_NOTICES.txt.
+
+
+Additional terms under section 7 of the AGPL
+--------------------------------------------
+
+The following additional terms apply to all material in pdfNote of which
+Kyohei Izumi is the copyright holder, that is, all of pdfNote except the
+third-party components listed in legal/THIRD_PARTY_NOTICES.txt. Anyone who
+conveys that material, in its original or a modified form, must comply with
+them.
+
+1.1 Legal notices (section 7(b)). Every copy and every modified version must
+    preserve the copyright notice above, this file, and the copyright notice
+    and license statement shown in the About box and in the License
+    Information dialog of the program.
+
+1.2 Marking of modified versions (section 7(c)). A modified version must be
+    marked in reasonable ways as different from the original version. In
+    particular:
+    (a) its name, the title shown in its windows, its icon and the name under
+        which it is distributed or listed must not be "pdfNote" or confusingly
+        similar to it; and
+    (b) its About box, and any page or listing from which it is distributed,
+        must state that it is a modified version of pdfNote and that it is not
+        provided or supported by Kyohei Izumi.
+
+1.3 Origin (section 7(c)). No one may represent that a copy they convey,
+    modified or not, is published, endorsed or supported by Kyohei Izumi, or
+    that it is the edition of pdfNote that Kyohei Izumi publishes in the
+    Microsoft Store.
+
+1.4 Publicity (section 7(d)). The name of Kyohei Izumi may not be used for
+    publicity purposes, including to promote a copy or a modified version,
+    other than to state authorship as required by these terms.
+
+1.5 Trademarks (section 7(e)). The AGPL does not grant any right under
+    trademark law to use the name "pdfNote" or the pdfNote icon.
+
+1.6 Indemnification (section 7(f)). Anyone who conveys the material, or a
+    modified version of it, with contractual assumptions of liability to the
+    recipient must indemnify Kyohei Izumi for any liability that those
+    assumptions directly impose on Kyohei Izumi.
+
+
+Other documents
+---------------
+
+The pdfNote Terms of Use (legal/TERMS_OF_USE_en.md and
+legal/TERMS_OF_USE_ja.md) apply to the edition of pdfNote published in the
+Microsoft Store. The Terms of Use, the pdfNote Privacy Policy and the
+Microsoft Store listing materials are not licensed under the AGPL, even where
+they are distributed with pdfNote. All rights in them are reserved.

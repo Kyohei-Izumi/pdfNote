@@ -1,0 +1,287 @@
+pdfNote -- Third-Party Software Notices
+=======================================
+
+pdfNote itself is licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version. See AGPL-3.0.txt.
+
+The Windows executable (pdfNote.exe) also contains the third-party software
+listed below. Each component stays under its own license; nothing in pdfNote's
+license changes the terms of any component. The full text of every license
+named here is in AGPL-3.0.txt, GPL-3.0.txt, LGPL-3.0.txt, Apache-2.0.txt,
+Python-LICENSE.txt, PyInstaller-COPYING.txt or THIRD_PARTY_LICENSES.txt.
+
+This list was made from each component's own license and attribution files
+for the exact version in this build: for Qt, the qt_attribution.json files of
+Qt 6.11.1; for MuPDF, its 1.28.2 source tree. License names are SPDX
+identifiers. The authoritative copyright notices are those in each
+component's source distribution (section 4).
+
+
+1. Components
+-------------
+
+PyMuPDF 1.28.2
+    License:   GNU AGPL v3.0 (AGPL-3.0.txt) -- or an Artifex commercial license,
+               which does not apply to this distribution
+    Copyright: Artifex Software, Inc.
+
+MuPDF 1.28.2 (contained in PyMuPDF)
+    License:   GNU AGPL v3.0 or later (AGPL-3.0.txt)
+    Copyright: Artifex Software, Inc.
+
+    Libraries distributed with MuPDF (a given build may not compile in every
+    one of them):
+      extract              AGPL-3.0-or-later   Artifex Software, Inc.
+      jbig2dec             AGPL-3.0-or-later   Artifex Software, Inc.
+      MuJS                 ISC                 Artifex Software, Inc.
+      Little CMS 2 (lcms2mt, Artifex fork)
+                           MIT                 Marti Maria Saguer; Artifex Software, Inc.
+      FreeType             FTL                 The FreeType Project
+      HarfBuzz             MIT ("Old MIT")     The HarfBuzz authors
+      libjpeg              IJG                 Thomas G. Lane, Guido Vollbeding
+                                               (Independent JPEG Group)
+      OpenJPEG             BSD-2-Clause        The OpenJPEG authors
+      zlib                 Zlib                Jean-loup Gailly and Mark Adler
+      Gumbo                Apache-2.0          Google Inc.
+      Brotli               MIT                 The Brotli Authors
+      Tesseract            Apache-2.0          Google Inc. and the Tesseract contributors
+      Leptonica            BSD-2-Clause        Dan Bloomberg
+      zxing-cpp            Apache-2.0          The ZXing authors
+      zint                 BSD-3-Clause        Robin Stuart and the zint contributors
+      cmark-gfm            BSD-2-Clause        John MacFarlane; GitHub, Inc.
+
+    Fonts built into MuPDF (used to show PDF text whose fonts are not
+    embedded in the document):
+      Nimbus Sans, Nimbus Roman, Nimbus Mono PS, Standard Symbols PS and
+      Dingbats (URW base-35 fonts)
+                           OFL-1.1             (URW)++ Design & Development
+      Noto Sans and Noto Serif families for many scripts, Noto Sans Math,
+      Noto Sans Symbols, Noto Music, Noto Naskh Arabic and others
+                           OFL-1.1             Google LLC; The Noto Project Authors
+      Charis SIL           OFL-1.1, Reserved Font Names "Charis" and "SIL"
+                                               SIL International
+      Droid Sans Fallback (Chinese, Japanese and Korean)
+                           Apache-2.0          The Android Open Source Project
+
+Qt 6.11.1 -- Qt Core, Qt GUI, Qt Widgets, Qt Print Support, Qt SVG, the
+platform plugins for Windows, the image format and icon engine plugins, and
+the Qt translations
+    License:   GNU LGPL v3.0 (LGPL-3.0.txt, which incorporates GPL-3.0.txt)
+    Copyright: The Qt Company Ltd. and other contributors
+
+    Third-party code in these Qt modules (Qt 6.11.1 qt_attribution.json):
+
+    Qt Core
+      zlib 1.3.2                        Zlib
+          (C) 1995-2026 Jean-loup Gailly and Mark Adler
+      double-conversion 3.4.0           BSD-3-Clause
+          Copyright 2006-2012, the V8 project authors
+      Easing Equations by Robert Penner BSD-3-Clause
+          Copyright (c) 2001 Robert Penner
+      PCRE2 10.47                       BSD-3-Clause with the PCRE2 binary-like
+                                        packages exception
+          Copyright (c) 1997-2007 University of Cambridge; Copyright (c)
+          2007-2024 Philip Hazel; Copyright (c) 2010-2024 Zoltan Herczeg
+      PCRE2 stack-less JIT compiler     BSD-2-Clause
+          Copyright Zoltan Herczeg
+      SHA-384 and SHA-512 (RFC 6234)    BSD-3-Clause
+          Copyright (c) 2011 IETF Trust and the persons identified as authors
+          of the code
+      SHA-1                             public domain
+          Dominik Reichl; Copyright (C) 2016 The Qt Company Ltd
+      SHA-3 Keccak                      CC0-1.0
+          Guido Bertoni, Joan Daemen, Michael Peeters and Gilles Van Assche
+      SHA-3 brg_endian                  BSD-2-Clause
+          Copyright (c) 1998-2013, Brian Gladman, Worcester, UK
+      BLAKE2                            CC0-1.0 (chosen from CC0-1.0 OR Apache-2.0)
+          Copyright 2012, Samuel Neves
+      MD4 and MD5                       public domain
+          Alexander Peslyak (MD4); Colin Plumb and Ian Jackson (MD5)
+      SipHash                           CC0-1.0
+          Jean-Philippe Aumasson, Daniel J. Bernstein; Intel Corporation
+      TinyCBOR 7.0                      MIT
+          Copyright (C) 2015-2025 Intel Corporation
+      tl::expected                      CC0-1.0
+          Sy Brand
+      Apache Tika MIME type definitions Apache-2.0
+          Copyright 2026 The Apache Software Foundation
+      Unicode Character Database        Unicode-3.0
+          Copyright (C) 1991-2025 Unicode, Inc.
+      Unicode CLDR v48.1                Unicode-3.0
+          Copyright (C) 2004-2025 Unicode, Inc.
+
+    Qt GUI
+      FreeType 2.14.3                   FTL (chosen from FTL OR GPL-2.0-only)
+          Copyright (c) 1996-2026 David Turner, Robert Wilhelm, Werner Lemberg
+          and the other FreeType authors; its gzip module is Zlib (Jean-loup
+          Gailly and Mark Adler), its BDF module MIT (Computing Research Labs,
+          New Mexico State University; Francesco Zappa Nardelli) and its PCF
+          module MIT AND MIT-open-group (David Turner, Robert Wilhelm and
+          Werner Lemberg; Francesco Zappa Nardelli; The Open Group)
+      Anti-aliasing rasterizer from FreeType
+                                        FTL (chosen from FTL OR GPL-2.0-only)
+          Copyright 2000-2016 David Turner, Robert Wilhelm and Werner Lemberg
+      HarfBuzz 14.2.0                   MIT ("Old MIT")
+          Google, Inc.; Ebrahim Byagowi; Facebook, Inc.; Mozilla Foundation;
+          Red Hat, Inc.; Behdad Esfahbod; and the other HarfBuzz authors
+      libpng 1.6.58                     libpng-2.0 AND Libpng
+          The PNG Reference Library Authors; Cosmin Truta; Glenn
+          Randers-Pehrson; Andreas Dilger; Guy Eric Schalnat, Group 42, Inc.
+      MD4C 0.5.2                        MIT
+          Copyright (c) 2016-2024 Martin Mitas
+      Emoji Segmenter 0.4.0             Apache-2.0
+          Copyright 2019 Google LLC
+      sRGB color profile (sRGB2014.icc) International Color Consortium license
+          Copyright International Color Consortium, 2015
+      Smooth scaling algorithm          BSD-2-Clause AND Imlib2
+          Copyright (C) 2004, 2005 Daniel M. Duley; (C) Carsten Haitzler and
+          various contributors; (C) Willem Monsuwe
+      X server region code (QRegion)    X11 AND HPND
+          Copyright (c) 1987 X Consortium; Copyright 1987 by Digital
+          Equipment Corporation, Maynard, Massachusetts
+      Adobe Glyph List For New Fonts    BSD-3-Clause
+          Copyright 2002, 2003, 2005, 2006, 2008, 2010, 2015 Adobe Systems
+      WebGradients                      MIT
+          Copyright (c) 2017 itmeo
+      OpenGL and OpenGL ES 2 headers    MIT
+          Copyright (c) 2013-2014 The Khronos Group Inc.
+      Vulkan API Registry 1.4.308       MIT (chosen from Apache-2.0 OR MIT)
+          Copyright (c) 2015-2025 The Khronos Group Inc.
+      Vulkan Memory Allocator 3.2.1     MIT
+          Copyright (c) 2017-2025 Advanced Micro Devices, Inc.
+      D3D12 Memory Allocator            MIT
+          Copyright (c) 2019-2022 Advanced Micro Devices, Inc.
+      Mipmap generator for D3D12        MIT
+          Copyright (c) 2015 Microsoft
+
+    Qt platform plugin for Windows
+      Wintab API                        LCS/Telegraphics license
+          Copyright 1991-1998 by LCS/Telegraphics
+
+    Qt JPEG image plugin
+      libjpeg-turbo 3.1.4               IJG AND BSD-3-Clause (its SIMD code:
+                                        Zlib, subsumed by the IJG License)
+          Copyright (C) 2009-2026 D. R. Commander and the other holders listed
+          in THIRD_PARTY_LICENSES.txt; Copyright (C) 1991-2020 Thomas G.
+          Lane, Guido Vollbeding
+
+    Qt SVG
+      XSVG                              HPND-sell-variant
+          Copyright 2002 USC/Information Sciences Institute
+
+    Qt Image Formats
+      libtiff 4.7.1                     libtiff
+          Copyright (c) 1988-1997 Sam Leffler; Copyright (c) 1991-1997
+          Silicon Graphics, Inc.
+      libwebp 1.6.0                     BSD-3-Clause, with Google's WebM
+                                        patent grant
+          Copyright (c) 2010, Google Inc.
+
+    (Pixman, which Qt GUI uses only on ARM processors, and code used only on
+    macOS, Linux or Android are not part of this build.)
+
+PySide6 and Shiboken6 6.11.1 (Qt for Python)
+    License:   GNU LGPL v3.0 (LGPL-3.0.txt)
+    Copyright: The Qt Company Ltd.
+
+Python 3.12.10 (runtime and standard library)
+    License:   Python Software Foundation License Version 2 (Python-LICENSE.txt,
+               which also contains the licenses of the libraries shipped with
+               Python for Windows, among them libffi (MIT), Expat (MIT), zlib,
+               bzip2, XZ Utils and mpdecimal)
+    Copyright: Python Software Foundation
+
+OpenSSL 3 (used by Python's ssl and hashlib modules)
+    License:   Apache License 2.0 (Apache-2.0.txt)
+    Copyright: The OpenSSL Project Authors
+
+PyInstaller 6.22.0 bootloader
+    License:   GNU GPL v2.0 or later with the PyInstaller bootloader exception,
+               which permits distributing the bootloader with programs under
+               any license (PyInstaller-COPYING.txt)
+    Copyright: PyInstaller Development Team
+
+PyWinRT 3.2.1 (winrt-runtime, winrt-Windows.Foundation,
+winrt-Windows.Foundation.Collections and winrt-Windows.Services.Store), which
+the Microsoft Store edition uses to ask the Microsoft Store about purchases;
+it contains code generated with C++/WinRT
+    License:   MIT (THIRD_PARTY_LICENSES.txt, section 17)
+    Copyright: Copyright (c) Microsoft Corporation. All rights reserved.
+               Copyright (c) 2021-2025 David Lechner <david@pybricks.com>
+
+typing_extensions 4.15.0 (used by PyWinRT)
+    License:   Python Software Foundation License Version 2 (Python-LICENSE.txt)
+    Copyright: Python Software Foundation
+
+Microsoft Visual C++ runtime (vcruntime140.dll, msvcp140*.dll)
+    Distributed as "Distributable Code" under the Microsoft Software License
+    Terms for Microsoft Visual Studio. Copyright Microsoft Corporation.
+
+
+2. License texts
+----------------
+
+THIRD_PARTY_LICENSES.txt reproduces, from each component's own distribution,
+the full text of every license above that does not have a file of its own:
+OFL-1.1, FTL, IJG, the libjpeg-turbo BSD license, libpng, Unicode-3.0,
+HarfBuzz, PCRE2, X11 and HPND, HPND-sell-variant, MIT-open-group, Imlib2,
+the ICC profile license, LCS/Telegraphics, the SHA-1 notice, libwebp, MIT,
+BSD-3-Clause, BSD-2-Clause, ISC, zlib, libtiff and CC0-1.0.
+
+
+3. Required acknowledgements
+----------------------------
+
+Portions of this software are copyright (c) 1996-2026 The FreeType Project
+(https://freetype.org). All rights reserved.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+This software uses code derived from Imlib2 (the smooth image scaling in
+Qt GUI).
+
+This product includes software developed at The Apache Software Foundation
+(https://www.apache.org/): the Apache Tika MIME type definitions.
+
+
+4. Source code, and using pdfNote with modified libraries
+---------------------------------------------------------
+
+The complete corresponding source code of pdfNote is at the location given in
+section 2.3 of the pdfNote Terms of Use. The source code
+of the components, for the exact versions in this build, is published here:
+
+  PyMuPDF 1.28.2
+    https://files.pythonhosted.org/packages/a3/fb/b6761fa2d5266f2cdb24c3b91f4023070ab7848381417678e7a289a1d52a/pymupdf-1.28.2.tar.gz
+    SHA-256 5e0be7908a715aa20333caddd73f1d6f01e4cd0c26e869fa2dd0b7f344da2249
+  MuPDF 1.28.2
+    https://mupdf.com/downloads/archive/mupdf-1.28.2-source.tar.gz
+  Qt 6.11.1 (qtbase, qtsvg, qtimageformats and qttranslations)
+    https://download.qt.io/official_releases/qt/6.11/6.11.1/submodules/
+    qtbase-everywhere-src-6.11.1.tar.xz          MD5 755fcf3251b577d8f920d5782c54c186
+    qtsvg-everywhere-src-6.11.1.tar.xz           MD5 5cc3030ff8fb6c27442efb0d7939f420
+    qtimageformats-everywhere-src-6.11.1.tar.xz  MD5 9158950f772a7ba49598657be71655ad
+    qttranslations-everywhere-src-6.11.1.tar.xz  MD5 0bc2ae29b2369d2f99e01b1997c4d79a
+  PySide6 and Shiboken6 6.11.1
+    https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz
+  Python 3.12.10
+    https://www.python.org/ftp/python/3.12.10/Python-3.12.10.tar.xz
+  PyInstaller 6.22.0 (including the bootloader source)
+    https://files.pythonhosted.org/packages/05/03/669d06735cf57d7e2e5dfc3c2e1643554b34c559eff21449c58172ca0335/pyinstaller-6.22.0.tar.gz
+    SHA-256 8b0166fff4583b374bbe7fa044bf03ddc33cab0f792a665807d96048e63f060e
+
+Copies of these archives are also published with each pdfNote release, at
+the location of pdfNote's source code.
+
+Qt and PySide6 are inside pdfNote.exe as separate libraries (DLLs), packed
+together by PyInstaller. To use pdfNote with a modified version of them, as
+the GNU LGPL permits:
+
+  1. Get pdfNote's source code, install Python 3.12, and install the packages
+     listed in requirements.txt.
+  2. Put your modified Qt or PySide6 libraries in place of the ones in the
+     installed PySide6 package (or build PySide6 from source against your
+     modified Qt).
+  3. Either run pdfNote from source ("python app.py"), or build a new
+     executable in the source folder with
+     "python -m PyInstaller --noconfirm --clean pdfNote.spec".

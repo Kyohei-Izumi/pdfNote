@@ -1,0 +1,8 @@
+{
+  "_comment": "The Product identity values from Partner Center (pdfNote > Product management > Product identity), copied exactly, including case and spaces. build_msix.ps1 writes them into the package manifest.",
+  "identity_name": "KyoheiIzumi.pdfNoteforWindows",
+  "identity_publisher": "CN=CC2038A6-4CC4-4975-B371-39DC161CAE88",
+  "publisher_display_name": "Kyohei Izumi",
+  "reserved_name": "pdfNote for Windows",
+  "short_description": "A Windows PDF reader and editor with document tabs, annotations and OCR."
+}

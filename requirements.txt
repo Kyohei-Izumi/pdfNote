@@ -1,0 +1,13 @@
+PyMuPDF==1.28.2
+PySide6==6.11.1
+PyInstaller==6.22.0
+# Only for tools/make_icons.py, which makes the icon and the Store images;
+# pdfNote.spec keeps it out of the exe.
+Pillow==12.3.0
+# The Microsoft Store edition's purchases (Windows.Services.Store). Windows
+# only; elsewhere pdfNote runs without them and cannot buy premium.
+winrt-runtime==3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation==3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation.Collections==3.2.1; sys_platform == "win32"
+winrt-Windows.Services.Store==3.2.1; sys_platform == "win32"
+typing_extensions==4.15.0; sys_platform == "win32"
