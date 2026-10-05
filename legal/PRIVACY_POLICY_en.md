@@ -1,6 +1,6 @@
 # pdfNote Privacy Policy
 
-Last updated: September 25, 2026
+Last updated: October 4, 2026
 
 This Privacy Policy explains how personal information is handled in connection with pdfNote as published by Kyohei Izumi in the Microsoft Store (the "Store Edition") and in connection with communications that you send to us. Terms defined in the pdfNote Terms of Use have the same meanings in this Policy.
 
@@ -9,6 +9,7 @@ This Privacy Policy explains how personal information is handled in connection w
 This summary is provided for convenience. The full text of this Policy governs.
 
 - The Store Edition does not send your documents, their contents, their file names or information about how you use it to us or to any third party. Information leaves the Store Edition only in the cases described in Section 6, such as when you print or open a link.
+- The only connection the Store Edition makes to the internet itself is to download OCR language data that you agree to download (Section 6(g)). If it stops because of an unexpected error, Windows may send an error report to Microsoft, as your Windows settings allow (Section 6(h)).
 - The Store Edition contains no advertising, analytics or telemetry, and it does not use an advertising identifier or location information.
 - Your settings and the working files described in Section 4 are stored on your device, where we have no access to them.
 - We receive personal information only when you contact us (Section 8), and we see only aggregated or de-identified reports that Microsoft makes available to publishers (Section 7).
@@ -51,8 +52,8 @@ The Store Edition stores the following information on your device. It is not sen
 |---|---|---|
 | Settings | Display language, color theme, the paths of up to ten recently opened files, the folder last opened, the time the free trial started and the time the Store Edition last checked it, and the version of the Terms of Use and this Policy that the Store Edition presented to you and when it did so | When you uninstall the Store Edition |
 | Recovery copies | The contents of documents that have unsaved changes, with the path and title of each document, the time the copy was made and the process number and start time of the pdfNote process that made it, kept so that your work can be restored after an unexpected shutdown | When you save or close the document; after an unexpected shutdown, when you restore or discard it at the next start |
-| Error log | Technical details recorded when the Store Edition stops because of an unexpected error, which may include the paths and names of files | When you uninstall the Store Edition |
-| OCR language data | Files that you place in the OCR language data folder | When you delete them or uninstall the Store Edition |
+| Error log | Technical details recorded when the Store Edition stops because of an unexpected error (the type of error, where in the program it occurred and a number identifying that place), which may include the paths and names of files | When you uninstall the Store Edition |
+| OCR language data | Files that you place in the OCR language data folder, and files that the Store Edition downloads with your agreement | When you delete them or uninstall the Store Edition |
 | Temporary files | A file created in the destination folder while a document is being saved, and a temporary folder that holds the components of the program while it runs | When the save completes, and when the program exits |
 
 For the Store Edition, Windows keeps the settings, recovery copies, error log and OCR language data in a location reserved for the app package and removes them when you uninstall it. You may delete any of these files at any time. After you have handled confidential documents, you may wish to delete the recovery copies.
@@ -81,13 +82,17 @@ Information leaves the Store Edition only in the following cases. Apart from the
 
 (f) **Windows and other services.** File dialogs, File Explorer, updates delivered by the Microsoft Store and diagnostic data collected by Windows are functions of Windows and are governed by Microsoft's terms and privacy statement. If you open or save documents in a folder that OneDrive or another cloud storage service synchronizes, that service transmits them under its own terms.
 
+(g) **Downloading OCR language data.** If the language data that OCR needs is not on your device, the Store Edition asks you whether to download it. Only if you agree does it connect to GitHub (raw.githubusercontent.com), operated by GitHub, Inc., and download language data files published by the Tesseract OCR project. GitHub receives the information that any internet request carries, such as your IP address, together with the names of the files requested and the name and version of the Store Edition. Your documents, their contents, their file names and information about how you use the Store Edition are not sent. GitHub handles this information under its privacy statement. The downloaded files are stored as the OCR language data described in Section 4.
+
+(h) **Reports of unexpected errors.** If the Store Edition stops because of an unexpected error, Windows Error Reporting may send an error report to Microsoft, as your Windows diagnostic data settings allow. The report contains technical information such as the name and version of the Store Edition, the type of error and where in the program it occurred, and, depending on your Windows settings, may include part of the memory contents at that moment, which can include parts of open documents. The report is sent by Windows, not by the Store Edition, and the Microsoft Privacy Statement applies. As described in Section 7.2, we see the information that Microsoft makes available in Partner Center.
+
 The Store Edition does not otherwise connect to the internet. Text recognition (OCR) is performed on your device.
 
 ## 7. Information That Microsoft Makes Available to Us
 
 7.1 Microsoft operates the Microsoft Store and handles acquisitions, payments, refunds and subscriptions. Under the arrangements in effect at the date of this Policy, Microsoft does not provide us with your name, email address or payment details in connection with a purchase.
 
-7.2 Microsoft makes reports available to publishers in Partner Center, such as aggregated or de-identified information about acquisitions, installations, usage, ratings and reviews, and crashes. Crash information depends on your Windows diagnostic data settings and is collected by Microsoft under the Microsoft Privacy Statement. We use these reports to understand how the Store Edition is acquired and used and to find and fix defects.
+7.2 Microsoft makes reports available to publishers in Partner Center, such as aggregated or de-identified information about acquisitions, installations, usage, ratings and reviews, and crashes. Crash information depends on your Windows diagnostic data settings and is collected by Microsoft under the Microsoft Privacy Statement (Section 6(h)). We use these reports to understand how the Store Edition is acquired and used and to find and fix defects.
 
 7.3 Ratings and reviews that you post in the Microsoft Store are public and are shown with the name you choose. We may read them and respond to them publicly.
 

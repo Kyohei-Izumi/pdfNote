@@ -119,7 +119,9 @@ if (-not (Test-Path $output)) { New-Item -ItemType Directory -Path $output | Out
 # that did have one would show that single image, scaled, on a plate
 # (Microsoft Learn, "Generating MSIX package components").
 $priConfig = Join-Path $output 'priconfig.xml'
-& $MakePri createconfig /cf $priConfig /dq ja-JP /o | Out-Null
+# The default language is the manifest's first, Japanese ("ja": one tag a
+# language, 6.4).
+& $MakePri createconfig /cf $priConfig /dq ja /o | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "makepri createconfig failed ($LASTEXITCODE)" }
 # The default configuration splits the index by scale and language
 # (resources.scale-200.pri, ...) for the resource packages of a bundle.

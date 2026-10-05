@@ -32,15 +32,28 @@
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
+  <!-- One tag per language, not per country (6.4): "ar" is listed for every
+       Arabic speaker, where "ar-SA" was Saudi Arabia's alone. Portuguese has
+       no such tag in the Store: "pt-BR" is Brazil's and "pt" Portugal's (and
+       the other countries that write as Portugal does). Latin, Ancient Greek
+       and Sanskrit, which pdfNote also speaks, are not languages the Store
+       takes, so they are not declared. The first is the default language.
+       Kept the same as STORE_LANGUAGE_TAGS in app.py. -->
   <Resources>
-    <Resource Language="ja-JP" />
-    <Resource Language="en-US" />
-    <Resource Language="zh-Hans-CN" />
-    <Resource Language="ko-KR" />
-    <Resource Language="es-ES" />
-    <Resource Language="fr-FR" />
-    <Resource Language="ru-RU" />
-    <Resource Language="ar-SA" />
+    <Resource Language="ja" />
+    <Resource Language="en" />
+    <Resource Language="zh-Hans" />
+    <Resource Language="ko" />
+    <Resource Language="es" />
+    <Resource Language="fr" />
+    <Resource Language="ru" />
+    <Resource Language="ar" />
+    <Resource Language="de" />
+    <Resource Language="pt-BR" />
+    <Resource Language="pt" />
+    <Resource Language="hi" />
+    <Resource Language="bn" />
+    <Resource Language="ur" />
   </Resources>
 
   <Applications>
@@ -74,6 +87,10 @@
   </Applications>
 
   <Capabilities>
+    <!-- The OCR language data download (6.5): the only connection pdfNote
+         opens itself, after the user agrees. Declared so the Store page
+         says the app uses the internet. -->
+    <Capability Name="internetClient" />
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
 </Package>

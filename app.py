@@ -16,6 +16,7 @@ import itertools
 import atexit
 import math
 import getpass
+import hashlib
 import json
 import os
 import platform
@@ -30,10 +31,11 @@ import time
 import traceback
 import uuid
 import weakref
+import zlib
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from dataclasses import dataclass, field
 
 import pymupdf as fitz
@@ -52,6 +54,7 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     QSizeF,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
@@ -64,7 +67,7 @@ from PySide6.QtCore import (
     qVersion,
 )
 from PySide6 import __version__ as PYSIDE_VERSION
-from PySide6.QtCore import QSharedMemory
+from PySide6.QtCore import QProcess, QProcessEnvironment, QSharedMemory
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QPageLayout,
@@ -78,6 +81,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QFontDatabase,
     QFontMetrics,
     QGuiApplication,
     QIcon,
@@ -101,6 +105,7 @@ from PySide6.QtGui import (
     QTransform,
 )
 from PySide6.QtWidgets import (
+    QProgressDialog,
     QGridLayout,
     QButtonGroup,
     QAbstractItemView,
@@ -159,7 +164,7 @@ from PySide6.QtPrintSupport import (
 
 
 APP_NAME = "pdfNote"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 # The catchphrase. Its initials spell PDF, so it stays in English in every
 # language: translated, the joke is gone.
 APP_TAGLINE = "Passion Drives Future"
@@ -196,7 +201,7 @@ LEGAL_PRIVACY_FILES = {"ja": "PRIVACY_POLICY_ja.md", "en": "PRIVACY_POLICY_en.md
 # notice presents. Change it with a change to either document worth
 # presenting again (Terms of Use 17.2): everyone then sees the notice
 # again at their next start.
-TERMS_VERSION = "2026-09-25"
+TERMS_VERSION = "2026-10-04"
 # The bootloader is linked in at build time, so the frozen program cannot
 # ask for its version; functional_qa compares this with the installed one.
 PYINSTALLER_VERSION = "6.22.0"
@@ -222,6 +227,13 @@ WINDOW_FILTERED_EVENTS = frozenset({
 CONTINUOUS_PASS_SECONDS = 0.04
 MAX_HISTORY_STEPS = 8
 MAX_HISTORY_BYTES = 64 * 1024 * 1024
+# A journal is looked at after this many steps, or when the process has
+# grown by JOURNAL_CHECK_GROWTH since the last look; and moved onto a copy
+# (rebase_journal) once the steps no undo can reach hold JOURNAL_SLACK_BYTES,
+# or as much as the file itself when that is more (6.3).
+JOURNAL_CHECK_STEPS = MAX_HISTORY_STEPS
+JOURNAL_CHECK_GROWTH = 64 * 1024 * 1024
+JOURNAL_SLACK_BYTES = 32 * 1024 * 1024
 # A single undo snapshot is a full serialisation of the document, so one
 # snapshot of a very large PDF can exceed the whole history budget on its
 # own. Such documents get no history at all (and are told so) rather than
@@ -437,9 +449,9 @@ def apply_theme(choice: str) -> str:
 
 WINDOW_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 OPEN_WINDOWS: list[Any] = []
-# OCR threads still inside a page when their window closed. The window is
-# deleted; a thread it still owned would be torn down running.
-ORPHANED_OCR_THREADS: list[Any] = []
+# The OCR child process reads the password of a protected document from here
+# rather than from a file next to the copy it is given (6.2).
+OCR_PASSWORD_VARIABLE = "PDFNOTE_OCR_PASSWORD"
 
 
 def resource_path(name: str) -> str:
@@ -558,12 +570,28 @@ def is_remote_path(path: str) -> bool:
 
 
 class RecentFiles:
+    _shared: dict[bool, "RecentFiles"] = {}
+
     def __init__(self, disabled: bool = False) -> None:
         self.disabled = disabled
         self.path = app_data_dir() / "settings.json"
         self.data: dict[str, Any] = {"recent": [], "last_folder": ""}
         if not disabled:
             self.load()
+
+    @classmethod
+    def shared(cls, disabled: bool = False) -> "RecentFiles":
+        """The settings of this process, one object for every window (one
+        more for test windows).
+
+        Each window read settings.json when it opened and wrote its whole
+        copy back on every change: a theme or language chosen in one window
+        was put back by the next file another window opened, and recent
+        files added in one were dropped by the other (6.2)."""
+        settings = cls._shared.get(disabled)
+        if settings is None:
+            settings = cls._shared[disabled] = cls(disabled=disabled)
+        return settings
 
     def load(self) -> None:
         try:
@@ -670,6 +698,92 @@ def current_package_family_name() -> str | None:
         return buffer.value or None
     except Exception:
         return None
+
+
+# ---- PDF の既定のアプリ (6.3) ------------------------------------------------
+#
+# Windows 10 and 11 do not let an app make itself the default for a file
+# type: only the user can, in Settings (the choice is protected so that an
+# installer cannot take it). pdfNote asks at each start when PDFs open with
+# something else, and "Make default" opens its own page of the Default apps
+# settings; the question can be turned off for good.
+
+ASSOCSTR_EXECUTABLE = 2
+ASSOCSTR_APPID = 21
+
+
+def _pdf_association(kind: int) -> str | None:
+    """What Windows says of the app that opens .pdf files: its executable
+    (ASSOCSTR_EXECUTABLE) or its AppUserModelID (ASSOCSTR_APPID)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        query = ctypes.WinDLL("shlwapi").AssocQueryStringW
+        query.argtypes = (
+            ctypes.c_uint, ctypes.c_uint, wintypes.LPCWSTR, wintypes.LPCWSTR,
+            wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        )
+        query.restype = ctypes.c_long
+        size = wintypes.DWORD(0)
+        query(0, kind, ".pdf", None, None, ctypes.byref(size))
+        if not size.value:
+            return None
+        buffer = ctypes.create_unicode_buffer(size.value + 1)
+        if query(0, kind, ".pdf", None, buffer, ctypes.byref(size)) != 0:
+            return None
+        return buffer.value or None
+    except Exception:
+        return None
+
+
+def current_app_user_model_id() -> str | None:
+    """This app's AppUserModelID (package family!application) when it runs
+    from its MSIX package; None otherwise."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        length = ctypes.c_uint32(0)
+        if kernel32.GetCurrentApplicationUserModelId(ctypes.byref(length), None) != 122:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        if kernel32.GetCurrentApplicationUserModelId(ctypes.byref(length), buffer) != 0:
+            return None
+        return buffer.value or None
+    except Exception:
+        return None
+
+
+def pdfnote_is_default_pdf_app() -> bool | None:
+    """Does Windows open PDFs with this pdfNote? None when that cannot be
+    told: not Windows, or pdfNote run from its source code."""
+    if sys.platform != "win32":
+        return None
+    app_id = current_app_user_model_id()
+    if app_id:
+        handler = _pdf_association(ASSOCSTR_APPID)
+        if handler:
+            return handler.casefold() == app_id.casefold()
+    if not getattr(sys, "frozen", False):
+        return None
+    executable = _pdf_association(ASSOCSTR_EXECUTABLE)
+    if not executable:
+        return False
+    return os.path.normcase(os.path.abspath(executable)) == os.path.normcase(
+        os.path.abspath(sys.executable)
+    )
+
+
+def open_default_apps_settings() -> bool:
+    """Open Windows Settings at pdfNote's own Default apps page (Windows
+    11), or at Default apps."""
+    app_id = current_app_user_model_id()
+    if app_id and QDesktopServices.openUrl(
+        QUrl("ms-settings:defaultapps?registeredAUMID=" + app_id)
+    ):
+        return True
+    return QDesktopServices.openUrl(QUrl("ms-settings:defaultapps"))
 
 
 class LicenseState:
@@ -1394,12 +1508,37 @@ LANGUAGES: list[tuple[str, str]] = [
     ("fr", "Fran\u00e7ais"),
     ("ru", "\u0420\u0443\u0441\u0441\u043a\u0438\u0439"),
     ("ar", "\u0627\u0644\u0639\u0631\u0628\u064a\u0629"),
+    # 6.4: the languages added since, each in its own file under i18n/.
+    ("de", "Deutsch"),
+    ("pt_BR", "Português (Brasil)"),
+    ("pt_PT", "Português (Portugal)"),
+    ("hi", "हिन्दी"),
+    ("bn", "বাংলা"),
+    ("ur", "اردو"),
+    ("la", "Lingua Latina"),
+    ("grc", "Ἀρχαία Ἑλληνική"),
+    ("sa", "संस्कृतम्"),
 ]
+# The languages whose translations live in i18n/<code>.json rather than in
+# TRANSLATIONS below: one file a language, for whoever checks them.
+LANGUAGE_FILES = ("de", "pt_BR", "pt_PT", "hi", "bn", "ur", "la", "grc", "sa")
+# Written right to left: Qt mirrors the layout for them.
+RIGHT_TO_LEFT_LANGUAGES = frozenset({"ar", "ur"})
+# The language tags the Microsoft Store package declares, one per language
+# rather than one per country (6.4): "ar", not "ar-SA", reaches every Arabic
+# speaker. Portuguese has no such tag in the Store: "pt" is Portugal's and
+# Brazil has its own. Latin, Ancient Greek and Sanskrit are not languages
+# the Store takes; the app speaks them, the package does not declare them.
+STORE_LANGUAGE_TAGS = {
+    "ja": "ja", "en": "en", "zh_CN": "zh-Hans", "ko": "ko", "es": "es", "fr": "fr",
+    "ru": "ru", "ar": "ar", "de": "de", "pt_BR": "pt-BR", "pt_PT": "pt", "hi": "hi",
+    "bn": "bn", "ur": "ur",
+}
 
 TRANSLATIONS = {
 # ---- File / tabs / recent ----
 "ファイル": {"en": "File", "zh_CN": "文件", "ko": "파일", "es": "Archivo", "fr": "Fichier", "ru": "Файл", "ar": "ملف"},
-"ファイル操作メニューを開く": {"en": "Open the File menu", "zh_CN": "打开文件菜单", "ko": "파일 메뉴 열기", "es": "Abrir el menú Archivo", "fr": "Ouvrir le menu Fichier", "ru": "Открыть меню «Файл»", "ar": "فتح قائمة الملف"},
+"ファイル メニューを開く": {"en": "Open the File menu", "zh_CN": "打开文件菜单", "ko": "파일 메뉴 열기", "es": "Abrir el menú Archivo", "fr": "Ouvrir le menu Fichier", "ru": "Открыть меню «Файл»", "ar": "فتح قائمة الملف"},
 "最近使ったファイル": {"en": "Recent Files", "zh_CN": "最近使用的文件", "ko": "최근 파일", "es": "Archivos recientes", "fr": "Fichiers récents", "ru": "Последние файлы", "ar": "الملفات الأخيرة"},
 "ページ": {"en": "Page", "zh_CN": "页面", "ko": "페이지", "es": "Página", "fr": "Page", "ru": "Страница", "ar": "الصفحة"},
 "文書タブ": {"en": "Document Tabs", "zh_CN": "文档标签页", "ko": "문서 탭", "es": "Pestañas de documento", "fr": "Onglets de document", "ru": "Вкладки документов", "ar": "علامات تبويب المستندات"},
@@ -1412,21 +1551,19 @@ TRANSLATIONS = {
 "PDFファイルを開く": {"en": "Open a PDF file", "zh_CN": "打开 PDF 文件", "ko": "PDF 파일 열기", "es": "Abrir un archivo PDF", "fr": "Ouvrir un fichier PDF", "ru": "Открыть файл PDF", "ar": "فتح ملف PDF"},
 "新しいタブでPDFを開く": {"en": "Open a PDF in a new tab", "zh_CN": "在新标签页中打开 PDF", "ko": "새 탭에서 PDF 열기", "es": "Abrir un PDF en una pestaña nueva", "fr": "Ouvrir un PDF dans un nouvel onglet", "ru": "Открыть PDF в новой вкладке", "ar": "فتح PDF في علامة تبويب جديدة"},
 "上書き保存": {"en": "Save", "zh_CN": "保存", "ko": "저장", "es": "Guardar", "fr": "Enregistrer", "ru": "Сохранить", "ar": "حفظ"},
-"編集内容を保存": {"en": "Save your changes", "zh_CN": "保存编辑内容", "ko": "편집 내용 저장", "es": "Guardar los cambios", "fr": "Enregistrer les modifications", "ru": "Сохранить изменения", "ar": "حفظ التغييرات"},
+"編集内容を保存": {"en": "Save your changes", "zh_CN": "保存更改", "ko": "편집 내용 저장", "es": "Guardar los cambios", "fr": "Enregistrer les modifications", "ru": "Сохранить изменения", "ar": "حفظ التغييرات"},
 "名前を付けて保存...": {"en": "Save As...", "zh_CN": "另存为...", "ko": "다른 이름으로 저장...", "es": "Guardar como...", "fr": "Enregistrer sous...", "ru": "Сохранить как...", "ar": "حفظ باسم..."},
 "印刷...": {"en": "Print...", "zh_CN": "打印...", "ko": "인쇄...", "es": "Imprimir...", "fr": "Imprimer...", "ru": "Печать...", "ar": "طباعة..."},
 "プロパティ": {"en": "Properties", "zh_CN": "属性", "ko": "속성", "es": "Propiedades", "fr": "Propriétés", "ru": "Свойства", "ar": "خصائص"},
 "文書を閉じる": {"en": "Close Document", "zh_CN": "关闭文档", "ko": "문서 닫기", "es": "Cerrar documento", "fr": "Fermer le document", "ru": "Закрыть документ", "ar": "إغلاق المستند"},
 "終了": {"en": "Exit", "zh_CN": "退出", "ko": "끝내기", "es": "Salir", "fr": "Quitter", "ru": "Выход", "ar": "إنهاء"},
-"選択中の内容をコピー": {"en": "Copy the current selection", "zh_CN": "复制所选内容", "ko": "선택 항목 복사", "es": "Copiar la selección actual", "fr": "Copier la sélection actuelle", "ru": "Копировать выделенное", "ar": "نسخ التحديد الحالي"},
 "切り取り": {"en": "Cut", "zh_CN": "剪切", "ko": "잘라내기", "es": "Cortar", "fr": "Couper", "ru": "Вырезать", "ar": "قص"},
-"選択中の内容を切り取り": {"en": "Cut the current selection", "zh_CN": "剪切所选内容", "ko": "선택 항목 잘라내기", "es": "Cortar la selección actual", "fr": "Couper la sélection actuelle", "ru": "Вырезать выделенное", "ar": "قص التحديد الحالي"},
 "検索": {"en": "Find", "zh_CN": "查找", "ko": "찾기", "es": "Buscar", "fr": "Rechercher", "ru": "Найти", "ar": "بحث"},
 "元に戻す": {"en": "Undo", "zh_CN": "撤消", "ko": "실행 취소", "es": "Deshacer", "fr": "Annuler", "ru": "Отменить", "ar": "تراجع"},"やり直す": {"en": "Redo", "zh_CN": "恢复", "ko": "다시 실행", "es": "Rehacer", "fr": "Rétablir", "ru": "Повторить", "ar": "إعادة"},"前のページ": {"en": "Previous Page", "zh_CN": "上一页", "ko": "이전 페이지", "es": "Página anterior", "fr": "Page précédente", "ru": "Предыдущая страница", "ar": "الصفحة السابقة"},"次のページ": {"en": "Next Page", "zh_CN": "下一页", "ko": "다음 페이지", "es": "Página siguiente", "fr": "Page suivante", "ru": "Следующая страница", "ar": "الصفحة التالية"},"拡大": {"en": "Zoom In", "zh_CN": "放大", "ko": "확대", "es": "Acercar", "fr": "Zoom avant", "ru": "Увеличить", "ar": "تكبير"},
 "縮小": {"en": "Zoom Out", "zh_CN": "缩小", "ko": "축소", "es": "Alejar", "fr": "Zoom arrière", "ru": "Уменьшить", "ar": "تصغير"},
 "ページに合わせる": {"en": "Fit Page", "zh_CN": "适合页面", "ko": "페이지에 맞춤", "es": "Ajustar a la página", "fr": "Ajuster à la page", "ru": "По размеру страницы", "ar": "ملاءمة الصفحة"},
 "幅に合わせる": {"en": "Fit Width", "zh_CN": "适合宽度", "ko": "너비에 맞춤", "es": "Ajustar al ancho", "fr": "Ajuster à la largeur", "ru": "По ширине страницы", "ar": "ملاءمة العرض"},
-"サイドバーを表示/非表示": {"en": "Show/Hide Sidebar", "zh_CN": "显示/隐藏侧边栏", "ko": "사이드바 표시/숨김", "es": "Mostrar/ocultar barra lateral", "fr": "Afficher/masquer la barre latérale", "ru": "Показать/скрыть боковую панель", "ar": "إظهار/إخفاء الشريط الجانبي"},
+"サイド バーを表示/非表示": {"en": "Show/Hide Sidebar", "zh_CN": "显示/隐藏侧边栏", "ko": "사이드바 표시/숨김", "es": "Mostrar/ocultar barra lateral", "fr": "Afficher/masquer la barre latérale", "ru": "Показать/скрыть боковую панель", "ar": "إظهار/إخفاء الشريط الجانبي"},
 "最初のページ": {"en": "First Page", "zh_CN": "首页", "ko": "첫 페이지", "es": "Primera página", "fr": "Première page", "ru": "Первая страница", "ar": "الصفحة الأولى"},
 "最後のページ": {"en": "Last Page", "zh_CN": "末页", "ko": "마지막 페이지", "es": "Última página", "fr": "Dernière page", "ru": "Последняя страница", "ar": "الصفحة الأخيرة"},
 "次の検索結果": {"en": "Next Result", "zh_CN": "下一个结果", "ko": "다음 검색 결과", "es": "Resultado siguiente", "fr": "Résultat suivant", "ru": "Следующий результат", "ar": "النتيجة التالية"},
@@ -1439,20 +1576,19 @@ TRANSLATIONS = {
 "ハイライトの色を選択": {"en": "Select Highlight Color", "zh_CN": "选择突出显示颜色", "ko": "강조 표시 색 선택", "es": "Seleccionar color de resaltado", "fr": "Sélectionner la couleur de surlignage", "ru": "Выбрать цвет выделения", "ar": "اختيار لون التمييز"},
 "下線の色を選択": {"en": "Select Underline Color", "zh_CN": "选择下划线颜色", "ko": "밑줄 색 선택", "es": "Seleccionar color de subrayado", "fr": "Sélectionner la couleur de soulignement", "ru": "Выбрать цвет подчеркивания", "ar": "اختيار لون التسطير"},
 "取り消し線の色を選択": {"en": "Select Strikethrough Color", "zh_CN": "选择删除线颜色", "ko": "취소선 색 선택", "es": "Seleccionar color de tachado", "fr": "Sélectionner la couleur du barré", "ru": "Выбрать цвет зачеркивания", "ar": "اختيار لون الخط الذي يتوسط النص"},
-"図形・手書き色を選択": {"en": "Select Shape/Ink Color", "zh_CN": "选择图形/手写颜色", "ko": "도형/손글씨 색 선택", "es": "Seleccionar color de forma/dibujo", "fr": "Sélectionner la couleur des formes/dessin", "ru": "Выбрать цвет фигур/рисования", "ar": "اختيار لون الأشكال/الرسم"},
+"図形・手書きの色を選択": {"en": "Select Shape/Ink Color", "zh_CN": "选择图形/墨迹颜色", "ko": "도형/잉크 색 선택", "es": "Seleccionar color de forma/entrada de lápiz", "fr": "Sélectionner la couleur des formes/de l'encre", "ru": "Выбрать цвет фигур/рукописного ввода", "ar": "اختيار لون الأشكال/الحبر"},
 "選択": {"en": "Select", "zh_CN": "选择", "ko": "선택", "es": "Seleccionar", "fr": "Sélectionner", "ru": "Выделить", "ar": "تحديد"},
-"ハイライト": {"en": "Highlight", "zh_CN": "突出显示", "ko": "강조 표시", "es": "Resaltar", "fr": "Surligner", "ru": "Выделение цветом", "ar": "تمييز"},
+"ハイライト": {"en": "Highlight", "zh_CN": "突出显示", "ko": "강조 표시", "es": "Resaltar", "fr": "Surlignage", "ru": "Выделение цветом", "ar": "تمييز"},
 "下線": {"en": "Underline", "zh_CN": "下划线", "ko": "밑줄", "es": "Subrayado", "fr": "Souligné", "ru": "Подчеркнутый", "ar": "تسطير"},
 "取り消し線": {"en": "Strikethrough", "zh_CN": "删除线", "ko": "취소선", "es": "Tachado", "fr": "Barré", "ru": "Зачеркнутый", "ar": "خط يتوسط النص"},
 "太字": {"en": "Bold", "zh_CN": "加粗", "ko": "굵게", "es": "Negrita", "fr": "Gras", "ru": "Полужирный", "ar": "غامق"},
-"付箋": {"en": "Sticky Note", "zh_CN": "便笺", "ko": "메모", "es": "Nota adhesiva", "fr": "Note autocollante", "ru": "Заметка", "ar": "ملاحظة ملصقة"},
-"テキスト": {"en": "Text", "zh_CN": "文本", "ko": "텍스트", "es": "Texto", "fr": "Texte", "ru": "Текст", "ar": "نص"},
-"手書き": {"en": "Ink", "zh_CN": "手写", "ko": "손글씨", "es": "Dibujo a mano", "fr": "Dessin à main levée", "ru": "Рисование", "ar": "رسم حر"},
+"付箋": {"en": "Sticky Note", "zh_CN": "便笺", "ko": "스티커 메모", "es": "Nota adhesiva", "fr": "Pense-bête", "ru": "Записка", "ar": "ملاحظة ملصقة"},
+"手書き": {"en": "Ink", "zh_CN": "墨迹", "ko": "잉크", "es": "Entrada de lápiz", "fr": "Encre", "ru": "Рукописный ввод", "ar": "حبر"},
 "四角形": {"en": "Rectangle", "zh_CN": "矩形", "ko": "사각형", "es": "Rectángulo", "fr": "Rectangle", "ru": "Прямоугольник", "ar": "مستطيل"},
 "矢印": {"en": "Arrow", "zh_CN": "箭头", "ko": "화살표", "es": "Flecha", "fr": "Flèche", "ru": "Стрелка", "ar": "سهم"},
 "直線": {"en": "Line", "zh_CN": "直线", "ko": "직선", "es": "Línea", "fr": "Ligne", "ru": "Линия", "ar": "خط مستقيم"},
 "画像を追加...": {"en": "Add Image...", "zh_CN": "添加图片...", "ko": "이미지 추가...", "es": "Añadir imagen...", "fr": "Ajouter une image...", "ru": "Добавить изображение...", "ar": "إضافة صورة..."},
-"クリップボード画像を貼り付け": {"en": "Paste Clipboard Image", "zh_CN": "粘贴剪贴板图片", "ko": "클립보드 이미지 붙여넣기", "es": "Pegar imagen del portapapeles", "fr": "Coller l'image du presse-papiers", "ru": "Вставить изображение из буфера обмена", "ar": "لصق صورة من الحافظة"},
+"クリップボードの画像を貼り付け": {"en": "Paste Clipboard Image", "zh_CN": "粘贴剪贴板图片", "ko": "클립보드 이미지 붙여넣기", "es": "Pegar imagen del portapapeles", "fr": "Coller l'image du Presse-papiers", "ru": "Вставить изображение из буфера обмена", "ar": "لصق صورة من الحافظة"},
 "空白ページを挿入": {"en": "Insert Blank Page", "zh_CN": "插入空白页", "ko": "빈 페이지 삽입", "es": "Insertar página en blanco", "fr": "Insérer une page vierge", "ru": "Вставить пустую страницу", "ar": "إدراج صفحة فارغة"},
 "別のPDFからページを追加...": {"en": "Add Pages from Another PDF...", "zh_CN": "从其他 PDF 添加页面...", "ko": "다른 PDF에서 페이지 추가...", "es": "Añadir páginas de otro PDF...", "fr": "Ajouter des pages d'un autre PDF...", "ru": "Добавить страницы из другого PDF...", "ar": "إضافة صفحات من ملف PDF آخر..."},
 "現在のページを削除": {"en": "Delete Current Page", "zh_CN": "删除当前页", "ko": "현재 페이지 삭제", "es": "Eliminar página actual", "fr": "Supprimer la page actuelle", "ru": "Удалить текущую страницу", "ar": "حذف الصفحة الحالية"},
@@ -1461,9 +1597,9 @@ TRANSLATIONS = {
 "現在のページを書き出し...": {"en": "Export Current Page...", "zh_CN": "导出当前页...", "ko": "현재 페이지 내보내기...", "es": "Exportar página actual...", "fr": "Exporter la page actuelle...", "ru": "Экспортировать текущую страницу...", "ar": "تصدير الصفحة الحالية..."},
 "単ページ表示": {"en": "Single Page", "zh_CN": "单页显示", "ko": "단일 페이지", "es": "Página única", "fr": "Page unique", "ru": "Одна страница", "ar": "صفحة واحدة"},
 "見開き表示": {"en": "Facing Pages", "zh_CN": "双页视图", "ko": "펼침면 보기", "es": "Páginas enfrentadas", "fr": "Pages en vis-à-vis", "ru": "Разворот", "ar": "صفحات متقابلة"},
-"連続スクロール": {"en": "Continuous Scroll", "zh_CN": "连续滚动", "ko": "연속 스크롤", "es": "Desplazamiento continuo", "fr": "Défilement continu", "ru": "Непрерывная прокрутка", "ar": "تمرير متواصل"},"ズーム率を数値で入力": {"en": "Enter zoom level as a number", "zh_CN": "输入缩放百分比", "ko": "확대/축소 비율을 숫자로 입력", "es": "Introducir el nivel de zoom como número", "fr": "Saisir le niveau de zoom sous forme de nombre", "ru": "Введите масштаб числом", "ar": "أدخل مستوى التكبير كرقم"},
-"メインツールバー": {"en": "Main Toolbar", "zh_CN": "主工具栏", "ko": "기본 도구 모음", "es": "Barra de herramientas principal", "fr": "Barre d'outils principale", "ru": "Основная панель инструментов", "ar": "شريط الأدوات الرئيسي"},
-"テキスト確定": {"en": "Commit Text", "zh_CN": "确认文本", "ko": "텍스트 확정", "es": "Confirmar texto", "fr": "Valider le texte", "ru": "Подтвердить текст", "ar": "تأكيد النص"},"その他の色...": {"en": "More Colors...", "zh_CN": "更多颜色...", "ko": "다른 색...", "es": "Más colores...", "fr": "Autres couleurs...", "ru": "Другие цвета...", "ar": "ألوان أخرى..."},
+"ズーム率を数値で入力": {"en": "Enter zoom level as a number", "zh_CN": "输入缩放百分比", "ko": "확대/축소 비율을 숫자로 입력", "es": "Introducir el nivel de zoom como número", "fr": "Saisir le niveau de zoom sous forme de nombre", "ru": "Введите масштаб числом", "ar": "أدخل مستوى التكبير كرقم"},
+"メイン ツール バー": {"en": "Main Toolbar", "zh_CN": "主工具栏", "ko": "기본 도구 모음", "es": "Barra de herramientas principal", "fr": "Barre d'outils principale", "ru": "Основная панель инструментов", "ar": "شريط الأدوات الرئيسي"},
+"入力を確定": {"en": "Finish Typing", "zh_CN": "确认文本", "ko": "텍스트 확정", "es": "Confirmar texto", "fr": "Valider le texte", "ru": "Подтвердить текст", "ar": "تأكيد النص"},"その他の色...": {"en": "More Colors...", "zh_CN": "更多颜色...", "ko": "다른 색...", "es": "Más colores...", "fr": "Autres couleurs...", "ru": "Другие цвета...", "ar": "ألوان أخرى..."},
 "フォント": {"en": "Font", "zh_CN": "字体", "ko": "글꼴", "es": "Fuente", "fr": "Police", "ru": "Шрифт", "ar": "الخط"},
 "書式": {"en": "Format", "zh_CN": "格式", "ko": "서식", "es": "Formato", "fr": "Format", "ru": "Формат", "ar": "التنسيق"},
 "フォントの色...": {"en": "Font Color...", "zh_CN": "字体颜色...", "ko": "글꼴 색...", "es": "Color de fuente...", "fr": "Couleur de police...", "ru": "Цвет шрифта...", "ar": "لون الخط..."},
@@ -1474,36 +1610,34 @@ TRANSLATIONS = {
 "回転": {"en": "Rotation", "zh_CN": "旋转", "ko": "회전", "es": "Rotación", "fr": "Rotation", "ru": "Поворот", "ar": "الدوران"},
 "画像": {"en": "Image", "zh_CN": "图片", "ko": "이미지", "es": "Imagen", "fr": "Image", "ru": "Изображение", "ar": "صورة"},
 "コピー": {"en": "Copy", "zh_CN": "复制", "ko": "복사", "es": "Copiar", "fr": "Copier", "ru": "Копировать", "ar": "نسخ"},
-"表紙を単独": {"en": "Cover as Single", "zh_CN": "封面单独显示", "ko": "표지 단독 표시", "es": "Portada individual", "fr": "Couverture seule", "ru": "Обложка отдельно", "ar": "الغلاف بمفرده"},
-"選択中の図形へ描画色を設定しました": {"en": "Applied the drawing color to the selected shape", "zh_CN": "已将绘图颜色应用于所选图形", "ko": "선택한 도형에 그리기 색을 설정했습니다", "es": "Se aplicó el color de dibujo a la forma seleccionada", "fr": "Couleur de dessin appliquée à la forme sélectionnée", "ru": "Цвет рисования применен к выбранной фигуре", "ar": "تم تطبيق لون الرسم على الشكل المحدد"},
-"黒": {"en": "Black", "zh_CN": "黑色", "ko": "검정", "es": "Negro", "fr": "Noir", "ru": "Черный", "ar": "أسود"},
+"表紙を分ける": {"en": "Separate Cover", "zh_CN": "封面单独显示", "ko": "표지 단독 표시", "es": "Portada individual", "fr": "Couverture seule", "ru": "Обложка отдельно", "ar": "الغلاف بمفرده"},
+"選択中の図形の色を変更しました": {"en": "Applied the drawing color to the selected shape", "zh_CN": "已将绘图颜色应用于所选图形", "ko": "선택한 도형에 그리기 색을 설정했습니다", "es": "Se aplicó el color de dibujo a la forma seleccionada", "fr": "Couleur de dessin appliquée à la forme sélectionnée", "ru": "Цвет рисования применен к выбранной фигуре", "ar": "تم تطبيق لون الرسم على الشكل المحدد"},
+"黒": {"en": "Black", "zh_CN": "黑色", "ko": "검은색", "es": "Negro", "fr": "Noir", "ru": "Черный", "ar": "أسود"},
 "赤": {"en": "Red", "zh_CN": "红色", "ko": "빨간색", "es": "Rojo", "fr": "Rouge", "ru": "Красный", "ar": "أحمر"},
 "青": {"en": "Blue", "zh_CN": "蓝色", "ko": "파란색", "es": "Azul", "fr": "Bleu", "ru": "Синий", "ar": "أزرق"},
 "緑": {"en": "Green", "zh_CN": "绿色", "ko": "녹색", "es": "Verde", "fr": "Vert", "ru": "Зеленый", "ar": "أخضر"},
 "オレンジ": {"en": "Orange", "zh_CN": "橙色", "ko": "주황색", "es": "Naranja", "fr": "Orange", "ru": "Оранжевый", "ar": "برتقالي"},
-"紫": {"en": "Purple", "zh_CN": "紫色", "ko": "자주", "es": "Púrpura", "fr": "Violet", "ru": "Фиолетовый", "ar": "أرجواني"},
+"紫": {"en": "Purple", "zh_CN": "紫色", "ko": "보라색", "es": "Púrpura", "fr": "Violet", "ru": "Фиолетовый", "ar": "أرجواني"},
 "白": {"en": "White", "zh_CN": "白色", "ko": "흰색", "es": "Blanco", "fr": "Blanc", "ru": "Белый", "ar": "أبيض"},
 "黄": {"en": "Yellow", "zh_CN": "黄色", "ko": "노란색", "es": "Amarillo", "fr": "Jaune", "ru": "Желтый", "ar": "أصفر"},
 "ピンク": {"en": "Pink", "zh_CN": "粉红色", "ko": "분홍색", "es": "Rosa", "fr": "Rose", "ru": "Розовый", "ar": "وردي"},
 "ナビゲーション": {"en": "Navigation", "zh_CN": "导航", "ko": "탐색", "es": "Navegación", "fr": "Navigation", "ru": "Навигация", "ar": "التنقل"},
 "ナビゲーションを閉じる ({key}で再表示)": {"en": "Close Navigation ({key} to show again)", "zh_CN": "关闭导航（{key} 重新显示）", "ko": "탐색 닫기({key}로 다시 표시)", "es": "Cerrar navegación ({key} para mostrarla de nuevo)", "fr": "Fermer la navigation ({key} pour la réafficher)", "ru": "Закрыть панель навигации ({key}, чтобы показать снова)", "ar": "إغلاق التنقل ({key} لإظهاره مجددًا)"},
 "文書内を検索": {"en": "Search in Document", "zh_CN": "在文档中搜索", "ko": "문서 내 검색", "es": "Buscar en el documento", "fr": "Rechercher dans le document", "ru": "Поиск в документе", "ar": "البحث في المستند"},
-"目次": {"en": "Table of Contents", "zh_CN": "目录", "ko": "목차", "es": "Índice", "fr": "Sommaire", "ru": "Оглавление", "ar": "جدول المحتويات"},
+"目次": {"en": "Table of Contents", "zh_CN": "目录", "ko": "목차", "es": "Tabla de contenido", "fr": "Sommaire", "ru": "Оглавление", "ar": "جدول المحتويات"},
 "検索結果": {"en": "Search Results", "zh_CN": "搜索结果", "ko": "검색 결과", "es": "Resultados de la búsqueda", "fr": "Résultats de la recherche", "ru": "Результаты поиска", "ar": "نتائج البحث"},
-"この文書には目次がありません": {"en": "This document has no table of contents", "zh_CN": "此文档没有目录", "ko": "이 문서에는 목차가 없습니다", "es": "Este documento no tiene índice", "fr": "Ce document ne comporte pas de sommaire", "ru": "В этом документе нет оглавления", "ar": "لا يحتوي هذا المستند على جدول محتويات"},
+"この文書には目次がありません": {"en": "This document has no table of contents", "zh_CN": "此文档没有目录", "ko": "이 문서에는 목차가 없습니다", "es": "Este documento no tiene tabla de contenido", "fr": "Ce document ne comporte pas de sommaire", "ru": "В этом документе нет оглавления", "ar": "لا يحتوي هذا المستند على جدول محتويات"},
 "(無題)": {"en": "(Untitled)", "zh_CN": "（无标题）", "ko": "(제목 없음)", "es": "(Sin título)", "fr": "(Sans titre)", "ru": "(Без названия)", "ar": "(بدون عنوان)"},
-"付箋はありません": {"en": "No sticky notes", "zh_CN": "没有便笺", "ko": "메모가 없습니다", "es": "No hay notas adhesivas", "fr": "Aucune note autocollante", "ru": "Нет заметок", "ar": "لا توجد ملاحظات ملصقة"},
-"（空の付箋）": {"en": "(Empty note)", "zh_CN": "（空便笺）", "ko": "(빈 메모)", "es": "(Nota vacía)", "fr": "(Note vide)", "ru": "(Пустая заметка)", "ar": "(ملاحظة فارغة)"},
-"空の付箋": {"en": "Empty note", "zh_CN": "空便笺", "ko": "빈 메모", "es": "Nota vacía", "fr": "Note vide", "ru": "Пустая заметка", "ar": "ملاحظة فارغة"},
+"（空の付箋）": {"en": "(Empty note)", "zh_CN": "（空便笺）", "ko": "(빈 스티커 메모)", "es": "(Nota vacía)", "fr": "(Pense-bête vide)", "ru": "(Пустая записка)", "ar": "(ملاحظة فارغة)"},
 # ---- Keyboard-first (v5.15) ----
 "注釈": {"en": "Annotations", "zh_CN": "注释", "ko": "주석", "es": "Anotaciones", "fr": "Annotations", "ru": "Аннотации", "ar": "التعليقات التوضيحية"},
 "注釈はありません": {"en": "No annotations", "zh_CN": "没有注释", "ko": "주석이 없습니다", "es": "No hay anotaciones", "fr": "Aucune annotation", "ru": "Нет аннотаций", "ar": "لا توجد تعليقات توضيحية"},
-"このページには文字がありません": {"en": "This page has no text", "zh_CN": "此页面没有文本", "ko": "이 페이지에는 텍스트가 없습니다", "es": "Esta página no tiene texto", "fr": "Cette page ne contient pas de texte", "ru": "На этой странице нет текста", "ar": "لا تحتوي هذه الصفحة على نص"},
+"このページにはテキストがありません": {"en": "This page has no text", "zh_CN": "此页面没有文本", "ko": "이 페이지에는 텍스트가 없습니다", "es": "Esta página no tiene texto", "fr": "Cette page ne contient pas de texte", "ru": "На этой странице нет текста", "ar": "لا تحتوي هذه الصفحة على نص"},
 "フォント サイズの拡大": {"en": "Increase Font Size", "zh_CN": "增大字号", "ko": "글꼴 크기 크게", "es": "Aumentar tamaño de fuente", "fr": "Augmenter la taille de police", "ru": "Увеличить размер шрифта", "ar": "تكبير حجم الخط"},
 "フォント サイズの縮小": {"en": "Decrease Font Size", "zh_CN": "减小字号", "ko": "글꼴 크기 작게", "es": "Disminuir tamaño de fuente", "fr": "Réduire la taille de police", "ru": "Уменьшить размер шрифта", "ar": "تصغير حجم الخط"},
 "カーソルを表示/非表示": {"en": "Show/Hide Cursor", "zh_CN": "显示/隐藏光标", "ko": "커서 표시/숨김", "es": "Mostrar/ocultar cursor", "fr": "Afficher/masquer le curseur", "ru": "Показать/скрыть курсор", "ar": "إظهار/إخفاء المؤشر"},
 "ウィンドウ": {"en": "Window", "zh_CN": "窗口", "ko": "창", "es": "Ventana", "fr": "Fenêtre", "ru": "Окно", "ar": "النافذة"},
-"ページの文字": {"en": "Page Text", "zh_CN": "页面文本", "ko": "페이지 텍스트", "es": "Texto de la página", "fr": "Texte de la page", "ru": "Текст страницы", "ar": "نص الصفحة"},
+"ページのテキスト": {"en": "Page Text", "zh_CN": "页面文本", "ko": "페이지 텍스트", "es": "Texto de la página", "fr": "Texte de la page", "ru": "Текст страницы", "ar": "نص الصفحة"},
 "ナビゲーションとページを切り替え": {"en": "Switch between Navigation and Page", "zh_CN": "在导航和页面之间切换", "ko": "탐색과 페이지 간 전환", "es": "Cambiar entre navegación y página", "fr": "Basculer entre la navigation et la page", "ru": "Переключение между навигацией и страницей", "ar": "التبديل بين التنقل والصفحة"},
 "ウィンドウ枠の切り替え": {"en": "Switch Panes", "zh_CN": "切换窗格", "ko": "창 전환", "es": "Cambiar de panel", "fr": "Changer de volet", "ru": "Переключение областей", "ar": "التبديل بين الأجزاء"},
 "アプリケーション キー": {"en": "Menu key", "zh_CN": "应用程序键", "ko": "애플리케이션 키", "es": "tecla de aplicación", "fr": "touche Application", "ru": "клавиша контекстного меню", "ar": "مفتاح التطبيق"},
@@ -1521,53 +1655,52 @@ TRANSLATIONS = {
 "ページの切り取り・コピー・貼り付け": {"en": "Cut / Copy / Paste Page", "zh_CN": "剪切 / 复制 / 粘贴页面", "ko": "페이지 잘라내기 / 복사 / 붙여넣기", "es": "Cortar / copiar / pegar página", "fr": "Couper / copier / coller la page", "ru": "Вырезать / копировать / вставить страницу", "ar": "قص / نسخ / لصق الصفحة"},
 "カーソル位置に挿入": {"en": "Insert at Cursor", "zh_CN": "在光标处插入", "ko": "커서 위치에 삽입", "es": "Insertar en el cursor", "fr": "Insérer au curseur", "ru": "Вставить в позиции курсора", "ar": "إدراج عند المؤشر"},"復旧用データを保存できませんでした: {error}": {"en": "Couldn't save recovery data: {error}", "zh_CN": "无法保存恢复数据: {error}", "ko": "복구 데이터를 저장할 수 없습니다: {error}", "es": "No se pudieron guardar los datos de recuperación: {error}", "fr": "Impossible d'enregistrer les données de récupération : {error}", "ru": "Не удалось сохранить данные восстановления: {error}", "ar": "تعذّر حفظ بيانات الاسترداد: {error}"},
 "タブに移動": {"en": "Go to Tab", "zh_CN": "转到标签页", "ko": "탭으로 이동", "es": "Ir a la pestaña", "fr": "Atteindre l'onglet", "ru": "Перейти к вкладке", "ar": "الانتقال إلى علامة التبويب"},
-"付箋を編集": {"en": "Edit Sticky Note", "zh_CN": "编辑便笺", "ko": "메모 편집", "es": "Editar nota adhesiva", "fr": "Modifier la note", "ru": "Изменить заметку", "ar": "تعديل الملاحظة الملصقة"},
+"付箋を編集": {"en": "Edit Sticky Note", "zh_CN": "编辑便笺", "ko": "스티커 메모 편집", "es": "Editar nota adhesiva", "fr": "Modifier le pense-bête", "ru": "Изменить записку", "ar": "تعديل الملاحظة الملصقة"},
 "ユーザー": {"en": "User", "zh_CN": "用户", "ko": "사용자", "es": "Usuario", "fr": "Utilisateur", "ru": "Пользователь", "ar": "المستخدم"},
 "検索を終了しました": {"en": "Search closed", "zh_CN": "已关闭搜索", "ko": "검색을 닫았습니다", "es": "Búsqueda finalizada", "fr": "Recherche terminée", "ru": "Поиск завершен", "ar": "تم إنهاء البحث"},
 "検索中…": {"en": "Searching…", "zh_CN": "搜索中…", "ko": "검색 중…", "es": "Buscando…", "fr": "Recherche en cours…", "ru": "Поиск…", "ar": "جارٍ البحث…"},
 "{keys}で切り替え": {"en": "{keys} to switch", "zh_CN": "{keys} 切换", "ko": "{keys}로 전환", "es": "{keys} para cambiar", "fr": "{keys} pour changer", "ru": "{keys} для переключения", "ar": "{keys} للتبديل"},
-"前回、正常に終了せずに閉じられた未保存の変更が見つかりました。復元しますか？\n\n{names}": {"en": "Unsaved changes were found from a previous session that didn't close normally. Restore them?\n\n{names}", "zh_CN": "发现上次未正常关闭时留下的未保存更改。是否恢复？\n\n{names}", "ko": "이전에 정상적으로 종료되지 않아 저장되지 않은 변경 사항이 발견되었습니다. 복원하시겠습니까?\n\n{names}", "es": "Se encontraron cambios sin guardar de una sesión anterior que no se cerró correctamente. ¿Desea restaurarlos?\n\n{names}", "fr": "Des modifications non enregistrées d'une session précédente qui ne s'est pas terminée normalement ont été trouvées. Les restaurer ?\n\n{names}", "ru": "Обнаружены несохраненные изменения из предыдущего сеанса, который завершился не в обычном порядке. Восстановить их?\n\n{names}", "ar": "تم العثور على تغييرات غير محفوظة من جلسة سابقة لم تُغلق بشكل طبيعي. هل تريد استعادتها؟\n\n{names}"},
+"前回 pdfNote が正常に終了しなかったため、保存されていない変更が残っています。復元しますか？\n\n{names}": {"en": "pdfNote didn't close properly last time, and there are unsaved changes. Restore them?\n\n{names}", "zh_CN": "pdfNote 上次未正常关闭，有未保存的更改。是否恢复？\n\n{names}", "ko": "pdfNote가 지난번에 정상적으로 종료되지 않아 저장되지 않은 변경 사항이 남아 있습니다. 복원하시겠습니까?\n\n{names}", "es": "pdfNote no se cerró correctamente la última vez y hay cambios sin guardar. ¿Quieres restaurarlos?\n\n{names}", "fr": "pdfNote ne s'est pas fermé correctement la dernière fois et des modifications n'ont pas été enregistrées. Voulez-vous les restaurer ?\n\n{names}", "ru": "В прошлый раз pdfNote завершил работу некорректно, и остались несохраненные изменения. Восстановить их?\n\n{names}", "ar": "لم يُغلق pdfNote بشكل صحيح في المرة الماضية، وهناك تغييرات غير محفوظة. هل تريد استعادتها؟\n\n{names}"},
 "表示テーマ": {"en": "Appearance", "zh_CN": "外观", "ko": "모양", "es": "Apariencia", "fr": "Apparence", "ru": "Внешний вид", "ar": "المظهر"},
 "システムの設定に従う": {"en": "Use system setting", "zh_CN": "使用系统设置", "ko": "시스템 설정 사용", "es": "Usar la configuración del sistema", "fr": "Utiliser le paramètre système", "ru": "Использовать системную настройку", "ar": "استخدام إعداد النظام"},
 "ライト": {"en": "Light", "zh_CN": "浅色", "ko": "밝게", "es": "Claro", "fr": "Clair", "ru": "Светлая", "ar": "فاتح"},
 "ダーク": {"en": "Dark", "zh_CN": "深色", "ko": "어둡게", "es": "Oscuro", "fr": "Sombre", "ru": "Темная", "ar": "داكن"},
 "テキスト ボックスの挿入": {"en": "Insert Text Box", "zh_CN": "插入文本框", "ko": "텍스트 상자 삽입", "es": "Insertar cuadro de texto", "fr": "Insérer une zone de texte", "ru": "Вставить текстовое поле", "ar": "إدراج مربع نص"},
-"付箋の挿入": {"en": "Insert Sticky Note", "zh_CN": "插入便笺", "ko": "메모 삽입", "es": "Insertar nota adhesiva", "fr": "Insérer une note autocollante", "ru": "Вставить заметку", "ar": "إدراج ملاحظة ملصقة"},
+"付箋の挿入": {"en": "Insert Sticky Note", "zh_CN": "插入便笺", "ko": "스티커 메모 삽입", "es": "Insertar nota adhesiva", "fr": "Insérer un pense-bête", "ru": "Вставить записку", "ar": "إدراج ملاحظة ملصقة"},
 "四角形の挿入": {"en": "Insert Rectangle", "zh_CN": "插入矩形", "ko": "사각형 삽입", "es": "Insertar rectángulo", "fr": "Insérer un rectangle", "ru": "Вставить прямоугольник", "ar": "إدراج مستطيل"},
 "矢印の挿入": {"en": "Insert Arrow", "zh_CN": "插入箭头", "ko": "화살표 삽입", "es": "Insertar flecha", "fr": "Insérer une flèche", "ru": "Вставить стрелку", "ar": "إدراج سهم"},
 "直線の挿入": {"en": "Insert Line", "zh_CN": "插入直线", "ko": "직선 삽입", "es": "Insertar línea", "fr": "Insérer une ligne", "ru": "Вставить линию", "ar": "إدراج خط مستقيم"},
-"ズーム率へ移動": {"en": "Go to Zoom Level", "zh_CN": "转到缩放比例", "ko": "확대/축소 비율로 이동", "es": "Ir al nivel de zoom", "fr": "Aller au niveau de zoom", "ru": "Перейти к масштабу", "ar": "الانتقال إلى مستوى التكبير"},
+"ズーム率を入力": {"en": "Go to Zoom Level", "zh_CN": "转到缩放比例", "ko": "확대/축소 비율로 이동", "es": "Ir al nivel de zoom", "fr": "Aller au niveau de zoom", "ru": "Перейти к масштабу", "ar": "الانتقال إلى مستوى التكبير"},
 "言語": {"en": "Language", "zh_CN": "语言", "ko": "언어", "es": "Idioma", "fr": "Langue", "ru": "Язык", "ar": "اللغة"},
-"PDFを結合...": {"en": "Merge PDFs...", "zh_CN": "合并 PDF...", "ko": "PDF 결합...", "es": "Combinar PDF...", "fr": "Fusionner des PDF...", "ru": "Объединить PDF...", "ar": "دمج ملفات PDF..."},
-"複数のPDFファイルを1つに結合": {"en": "Merge multiple PDF files into one", "zh_CN": "将多个 PDF 文件合并为一个", "ko": "여러 PDF 파일을 하나로 결합", "es": "Combinar varios archivos PDF en uno", "fr": "Fusionner plusieurs fichiers PDF en un seul", "ru": "Объединить несколько файлов PDF в один", "ar": "دمج عدة ملفات PDF في ملف واحد"},
-"結合するPDFを選択（2つ以上、複数選択可）": {"en": "Select PDFs to Merge (2 or more)", "zh_CN": "选择要合并的 PDF（至少 2 个）", "ko": "결합할 PDF 선택(2개 이상)", "es": "Seleccionar PDF para combinar (2 o más)", "fr": "Sélectionner les PDF à fusionner (2 ou plus)", "ru": "Выберите файлы PDF для объединения (2 и более)", "ar": "اختر ملفات PDF للدمج (2 أو أكثر)"},
-"パスワード保護されたPDFは結合に使用できません: {name}": {"en": "Password-protected PDFs can't be merged: {name}", "zh_CN": "受密码保护的 PDF 无法用于合并：{name}", "ko": "암호로 보호된 PDF는 결합할 수 없습니다: {name}", "es": "Los PDF protegidos con contraseña no se pueden combinar: {name}", "fr": "Les PDF protégés par mot de passe ne peuvent pas être fusionnés : {name}", "ru": "PDF, защищенные паролем, нельзя объединить: {name}", "ar": "لا يمكن دمج ملفات PDF المحمية بكلمة مرور: {name}"},
-"PDFを結合できませんでした。\n\n{error}": {"en": "Couldn't merge the PDFs.\n\n{error}", "zh_CN": "无法合并 PDF。\n\n{error}", "ko": "PDF를 결합할 수 없습니다.\n\n{error}", "es": "No se pudieron combinar los PDF.\n\n{error}", "fr": "Impossible de fusionner les PDF.\n\n{error}", "ru": "Не удалось объединить файлы PDF.\n\n{error}", "ar": "تعذر دمج ملفات PDF.\n\n{error}"},
+"PDFを結合...": {"en": "Merge PDFs...", "zh_CN": "合并 PDF...", "ko": "PDF 병합...", "es": "Combinar PDF...", "fr": "Fusionner des PDF...", "ru": "Объединить PDF...", "ar": "دمج ملفات PDF..."},
+"複数のPDFファイルを1つに結合": {"en": "Merge multiple PDF files into one", "zh_CN": "将多个 PDF 文件合并为一个", "ko": "여러 PDF 파일을 하나로 병합", "es": "Combinar varios archivos PDF en uno", "fr": "Fusionner plusieurs fichiers PDF en un seul", "ru": "Объединить несколько файлов PDF в один", "ar": "دمج عدة ملفات PDF في ملف واحد"},
+"結合するPDFを選択（2つ以上）": {"en": "Select PDFs to Merge (2 or more)", "zh_CN": "选择要合并的 PDF（至少 2 个）", "ko": "병합할 PDF 선택(2개 이상)", "es": "Seleccionar PDF para combinar (2 o más)", "fr": "Sélectionner les PDF à fusionner (2 ou plus)", "ru": "Выберите файлы PDF для объединения (2 и более)", "ar": "اختر ملفات PDF للدمج (2 أو أكثر)"},
+"パスワードで保護されたPDFは結合できません: {name}": {"en": "Password-protected PDFs can't be merged: {name}", "zh_CN": "无法合并受密码保护的 PDF：{name}", "ko": "암호로 보호된 PDF는 병합할 수 없습니다: {name}", "es": "Los PDF protegidos con contraseña no se pueden combinar: {name}", "fr": "Les PDF protégés par mot de passe ne peuvent pas être fusionnés : {name}", "ru": "PDF, защищенные паролем, нельзя объединить: {name}", "ar": "لا يمكن دمج ملفات PDF المحمية بكلمة مرور: {name}"},
+"PDFを結合できませんでした。\n\n{error}": {"en": "Couldn't merge the PDFs.\n\n{error}", "zh_CN": "无法合并 PDF。\n\n{error}", "ko": "PDF를 병합할 수 없습니다.\n\n{error}", "es": "No se pudieron combinar los PDF.\n\n{error}", "fr": "Impossible de fusionner les PDF.\n\n{error}", "ru": "Не удалось объединить файлы PDF.\n\n{error}", "ar": "تعذر دمج ملفات PDF.\n\n{error}"},
 "PDFを分割...": {"en": "Split PDF...", "zh_CN": "拆分 PDF...", "ko": "PDF 분할...", "es": "Dividir PDF...", "fr": "Fractionner le PDF...", "ru": "Разделить PDF...", "ar": "تقسيم PDF..."},
 "現在のPDFをページ単位またはページ範囲で分割": {"en": "Split the current PDF by page or page range", "zh_CN": "按页面或页面范围拆分当前 PDF", "ko": "현재 PDF를 페이지 또는 페이지 범위로 분할", "es": "Dividir el PDF actual por página o rango de páginas", "fr": "Fractionner le PDF actuel par page ou par plage de pages", "ru": "Разделить текущий PDF по страницам или диапазонам страниц", "ar": "تقسيم ملف PDF الحالي حسب الصفحة أو نطاق الصفحات"},
 "PDFを分割": {"en": "Split PDF", "zh_CN": "拆分 PDF", "ko": "PDF 분할", "es": "Dividir PDF", "fr": "Fractionner le PDF", "ru": "Разделить PDF", "ar": "تقسيم PDF"},
 "1ページごとに分割": {"en": "One file per page", "zh_CN": "每页拆分为一个文件", "ko": "페이지마다 파일 분리", "es": "Un archivo por página", "fr": "Un fichier par page", "ru": "По одному файлу на страницу", "ar": "ملف واحد لكل صفحة"},
 "ページ範囲を指定（例: 1-3, 4-6, 7-10）": {"en": "Specify page ranges (e.g. 1-3, 4-6, 7-10)", "zh_CN": "指定页面范围（例如：1-3, 4-6, 7-10）", "ko": "페이지 범위 지정(예: 1-3, 4-6, 7-10)", "es": "Especificar rangos de páginas (p. ej., 1-3, 4-6, 7-10)", "fr": "Spécifier des plages de pages (ex. : 1-3, 4-6, 7-10)", "ru": "Укажите диапазоны страниц (например, 1-3, 4-6, 7-10)", "ar": "حدد نطاقات الصفحات (مثال: 1-3, 4-6, 7-10)"},
-"分割したファイルの保存先フォルダを選択": {"en": "Choose a Folder for the Split Files", "zh_CN": "选择拆分文件的保存文件夹", "ko": "분할된 파일을 저장할 폴더 선택", "es": "Elegir una carpeta para los archivos divididos", "fr": "Choisir un dossier pour les fichiers divisés", "ru": "Выберите папку для разделенных файлов", "ar": "اختر مجلدًا للملفات المقسّمة"},
-"無効なページ範囲です: {range}": {"en": "Invalid page range: {range}", "zh_CN": "无效的页面范围：{range}", "ko": "잘못된 페이지 범위입니다: {range}", "es": "Rango de páginas no válido: {range}", "fr": "Plage de pages non valide : {range}", "ru": "Недопустимый диапазон страниц: {range}", "ar": "نطاق صفحات غير صالح: {range}"},
+"分割したファイルの保存先フォルダーを選択": {"en": "Choose a Folder for the Split Files", "zh_CN": "选择拆分文件的保存文件夹", "ko": "분할된 파일을 저장할 폴더 선택", "es": "Elegir una carpeta para los archivos divididos", "fr": "Choisir un dossier pour les fichiers fractionnés", "ru": "Выберите папку для разделенных файлов", "ar": "اختر مجلدًا للملفات المقسّمة"},
+"ページ範囲が正しくありません: {range}": {"en": "Invalid page range: {range}", "zh_CN": "无效的页面范围：{range}", "ko": "잘못된 페이지 범위입니다: {range}", "es": "Rango de páginas no válido: {range}", "fr": "Plage de pages non valide : {range}", "ru": "Недопустимый диапазон страниц: {range}", "ar": "نطاق صفحات غير صالح: {range}"},
 "{count}個のファイルに分割しました: {folder}": {"en": "Split into {count} files: {folder}", "zh_CN": "已拆分为 {count} 个文件：{folder}", "ko": "{count}개의 파일로 분할했습니다: {folder}", "es": "Dividido en {count} archivos: {folder}", "fr": "Fractionné en {count} fichiers : {folder}", "ru": "Создано файлов: {count}. Папка: {folder}", "ar": "تم التقسيم إلى {count} ملفًا: {folder}"},
-"PDFを分割できませんでした。\n\n{error}": {"en": "Couldn't split the PDF.\n\n{error}", "zh_CN": "无法拆分 PDF。\n\n{error}", "ko": "PDF를 분할할 수 없습니다.\n\n{error}", "es": "No se pudo dividir el PDF.\n\n{error}", "fr": "Impossible de diviser le PDF.\n\n{error}", "ru": "Не удалось разделить PDF.\n\n{error}", "ar": "تعذر تقسيم ملف PDF.\n\n{error}"},
-"結合": {"en": "Merge", "zh_CN": "合并", "ko": "결합", "es": "Combinar", "fr": "Fusionner", "ru": "Объединить", "ar": "دمج"},
+"PDFを分割できませんでした。\n\n{error}": {"en": "Couldn't split the PDF.\n\n{error}", "zh_CN": "无法拆分 PDF。\n\n{error}", "ko": "PDF를 분할할 수 없습니다.\n\n{error}", "es": "No se pudo dividir el PDF.\n\n{error}", "fr": "Impossible de fractionner le PDF.\n\n{error}", "ru": "Не удалось разделить PDF.\n\n{error}", "ar": "تعذر تقسيم ملف PDF.\n\n{error}"},
 "⋮⋮  テキスト ボックス": {"en": "⋮⋮  Text Box", "zh_CN": "⋮⋮  文本框", "ko": "⋮⋮  텍스트 상자", "es": "⋮⋮  Cuadro de texto", "fr": "⋮⋮  Zone de texte", "ru": "⋮⋮  Текстовое поле", "ar": "⋮⋮  مربع نص"},
 "⋮⋮  図形": {"en": "⋮⋮  Shape", "zh_CN": "⋮⋮  图形", "ko": "⋮⋮  도형", "es": "⋮⋮  Forma", "fr": "⋮⋮  Forme", "ru": "⋮⋮  Фигура", "ar": "⋮⋮  شكل"},
 "⋮⋮  画像": {"en": "⋮⋮  Image", "zh_CN": "⋮⋮  图片", "ko": "⋮⋮  이미지", "es": "⋮⋮  Imagen", "fr": "⋮⋮  Image", "ru": "⋮⋮  Изображение", "ar": "⋮⋮  صورة"},
 "⋮⋮  矢印": {"en": "⋮⋮  Arrow", "zh_CN": "⋮⋮  箭头", "ko": "⋮⋮  화살표", "es": "⋮⋮  Flecha", "fr": "⋮⋮  Flèche", "ru": "⋮⋮  Стрелка", "ar": "⋮⋮  سهم"},
 "⋮⋮  直線": {"en": "⋮⋮  Line", "zh_CN": "⋮⋮  直线", "ko": "⋮⋮  직선", "es": "⋮⋮  Línea", "fr": "⋮⋮  Ligne", "ru": "⋮⋮  Линия", "ar": "⋮⋮  خط مستقيم"},
-"⋮⋮  手書き": {"en": "⋮⋮  Ink", "zh_CN": "⋮⋮  手写", "ko": "⋮⋮  손글씨", "es": "⋮⋮  Dibujo a mano", "fr": "⋮⋮  Dessin à main levée", "ru": "⋮⋮  Рисование", "ar": "⋮⋮  رسم حر"},
+"⋮⋮  手書き": {"en": "⋮⋮  Ink", "zh_CN": "⋮⋮  墨迹", "ko": "⋮⋮  잉크", "es": "⋮⋮  Entrada de lápiz", "fr": "⋮⋮  Encre", "ru": "⋮⋮  Рукописный ввод", "ar": "⋮⋮  حبر"},
 "⋮⋮  四角形": {"en": "⋮⋮  Rectangle", "zh_CN": "⋮⋮  矩形", "ko": "⋮⋮  사각형", "es": "⋮⋮  Rectángulo", "fr": "⋮⋮  Rectangle", "ru": "⋮⋮  Прямоугольник", "ar": "⋮⋮  مستطيل"},
-"矢印の先端を360度自由に移動": {"en": "Drag freely to move the arrowhead through 360°", "zh_CN": "自由拖动箭头前端，360度移动", "ko": "화살표 끝을 360도 자유롭게 이동", "es": "Arrastra libremente la punta de la flecha en 360°", "fr": "Déplacez librement la pointe de la flèche sur 360°", "ru": "Свободно перемещайте наконечник стрелки на 360°", "ar": "اسحب بحرية لتحريك رأس السهم بزاوية 360 درجة"},
-"線の始点を自由に移動": {"en": "Drag freely to move the line's start point", "zh_CN": "自由拖动直线起点", "ko": "선의 시작점을 자유롭게 이동", "es": "Arrastra libremente el punto inicial de la línea", "fr": "Déplacez librement le point de départ de la ligne", "ru": "Свободно перемещайте начальную точку линии", "ar": "اسحب بحرية لتحريك نقطة بداية الخط"},
+"ドラッグして矢印の先端を移動": {"en": "Drag to move the arrowhead", "zh_CN": "拖动以移动箭头前端", "ko": "드래그하여 화살표 끝 이동", "es": "Arrastra para mover la punta de la flecha", "fr": "Faites glisser pour déplacer la pointe de la flèche", "ru": "Перетащите, чтобы переместить наконечник стрелки", "ar": "اسحب لتحريك رأس السهم"},
+"ドラッグして線の始点を移動": {"en": "Drag to move the line's start point", "zh_CN": "拖动以移动直线起点", "ko": "드래그하여 선의 시작점 이동", "es": "Arrastra para mover el punto inicial de la línea", "fr": "Faites glisser pour déplacer le point de départ de la ligne", "ru": "Перетащите, чтобы переместить начальную точку линии", "ar": "اسحب لتحريك نقطة بداية الخط"},
 "ドラッグして図形を回転": {"en": "Drag to rotate the shape", "zh_CN": "拖动以旋转图形", "ko": "드래그하여 도형 회전", "es": "Arrastra para girar la forma", "fr": "Faites glisser pour faire pivoter la forme", "ru": "Перетащите, чтобы повернуть фигуру", "ar": "اسحب لتدوير الشكل"},
 "テキスト ボックスを削除": {"en": "Delete Text Box", "zh_CN": "删除文本框", "ko": "텍스트 상자 삭제", "es": "Eliminar cuadro de texto", "fr": "Supprimer la zone de texte", "ru": "Удалить текстовое поле", "ar": "حذف مربع النص"},
 "削除": {"en": "Delete", "zh_CN": "删除", "ko": "삭제", "es": "Eliminar", "fr": "Supprimer", "ru": "Удалить", "ar": "حذف"},
 "トリミング": {"en": "Crop", "zh_CN": "裁剪", "ko": "자르기", "es": "Recortar", "fr": "Rogner", "ru": "Обрезать", "ar": "اقتصاص الصورة"},
-"8方向のハンドルで切り抜き範囲を指定": {"en": "Set the crop area with the eight handles", "zh_CN": "使用 8 个方向的手柄设置裁剪范围", "ko": "8방향 핸들로 자르기 범위 지정", "es": "Define el área de recorte con los 8 controladores", "fr": "Définissez la zone de recadrage avec les 8 poignées", "ru": "Задайте область обрезки с помощью 8 маркеров", "ar": "حدد منطقة الاقتصاص باستخدام 8 مقابض"},
-"直線の端点を360度自由に移動": {"en": "Drag freely to move the line's endpoint through 360°", "zh_CN": "自由拖动直线端点，360度移动", "ko": "선의 끝점을 360도 자유롭게 이동", "es": "Arrastra libremente el punto final de la línea en 360°", "fr": "Déplacez librement l'extrémité de la ligne sur 360°", "ru": "Свободно перемещайте конечную точку линии на 360°", "ar": "اسحب بحرية لتحريك نهاية الخط بزاوية 360 درجة"},
+"ハンドルをドラッグしてトリミングの範囲を指定": {"en": "Set the crop area with the eight handles", "zh_CN": "拖动控点以设置裁剪范围", "ko": "핸들을 드래그하여 자르기 범위 지정", "es": "Define el área de recorte con los 8 controladores", "fr": "Définissez la zone de recadrage avec les 8 poignées", "ru": "Задайте область обрезки с помощью 8 маркеров", "ar": "حدد منطقة الاقتصاص باستخدام 8 مقابض"},
+"ドラッグして線の終点を移動": {"en": "Drag to move the line's end point", "zh_CN": "拖动以移动直线终点", "ko": "드래그하여 선의 끝점 이동", "es": "Arrastra para mover el punto final de la línea", "fr": "Faites glisser pour déplacer l'extrémité de la ligne", "ru": "Перетащите, чтобы переместить конечную точку линии", "ar": "اسحب لتحريك نقطة نهاية الخط"},
 "「{document_title}」の変更を保存しますか？": {"en": "Save changes to \"{document_title}\"?", "zh_CN": "是否保存对“{document_title}”的更改？", "ko": "\"{document_title}\"의 변경 사항을 저장하시겠습니까?", "es": "¿Guardar los cambios en \"{document_title}\"?", "fr": "Enregistrer les modifications de « {document_title} » ?", "ru": "Сохранить изменения в «{document_title}»?", "ar": "هل تريد حفظ التغييرات في \"{document_title}\"؟"},
 "保存（&S）": {"en": "&Save", "zh_CN": "保存(&S)", "ko": "저장(&S)", "es": "&Guardar", "fr": "&Enregistrer", "ru": "&Сохранить", "ar": "&حفظ"},
 "保存しない（&N）": {"en": "Do&n't Save", "zh_CN": "不保存(&N)", "ko": "저장 안 함(&N)", "es": "&No guardar", "fr": "&Ne pas enregistrer", "ru": "&Не сохранять", "ar": "عدم الحفظ (&N)"},
@@ -1578,78 +1711,76 @@ TRANSLATIONS = {
 "表示・ページ移動": {"en": "View & Navigation", "zh_CN": "查看与导航", "ko": "보기 및 탐색", "es": "Vista y navegación", "fr": "Affichage et navigation", "ru": "Просмотр и навигация", "ar": "العرض والتنقل"},
 "ページ管理": {"en": "Page Management", "zh_CN": "页面管理", "ko": "페이지 관리", "es": "Gestión de páginas", "fr": "Gestion des pages", "ru": "Управление страницами", "ar": "إدارة الصفحات"},
 "描画・注釈ツール": {"en": "Drawing & Annotation Tools", "zh_CN": "绘图与注释工具", "ko": "그리기 및 주석 도구", "es": "Herramientas de dibujo y anotación", "fr": "Outils de dessin et d'annotation", "ru": "Инструменты рисования и аннотирования", "ar": "أدوات الرسم والتعليقات التوضيحية"},
-"ショートカット": {"en": "Shortcut", "zh_CN": "快捷键", "ko": "바로 가기 키", "es": "Método abreviado", "fr": "Raccourci", "ru": "Сочетание клавиш", "ar": "الاختصار"},
-"操作": {"en": "Action", "zh_CN": "操作", "ko": "동작", "es": "Acción", "fr": "Action", "ru": "Действие", "ar": "الإجراء"},
 "選択中の図形を回転": {"en": "Rotate the selected shape", "zh_CN": "旋转所选图形", "ko": "선택한 도형 회전", "es": "Girar la forma seleccionada", "fr": "Faire pivoter la forme sélectionnée", "ru": "Повернуть выбранную фигуру", "ar": "تدوير الشكل المحدد"},
 "矢印キー": {"en": "Arrow keys", "zh_CN": "方向键", "ko": "화살표 키", "es": "Teclas de flecha", "fr": "Touches fléchées", "ru": "Клавиши со стрелками", "ar": "مفاتيح الأسهم"},
-"マウスホイール": {"en": "Mouse wheel", "zh_CN": "鼠标滚轮", "ko": "마우스 휠", "es": "rueda del ratón", "fr": "molette de la souris", "ru": "колесо мыши", "ar": "عجلة الفأرة"},
+"マウス ホイール": {"en": "Mouse wheel", "zh_CN": "鼠标滚轮", "ko": "마우스 휠", "es": "rueda del ratón", "fr": "roulette de la souris", "ru": "колесико мыши", "ar": "عجلة الماوس"},
 "連続ズーム": {"en": "Continuous zoom", "zh_CN": "连续缩放", "ko": "연속 확대/축소", "es": "Zoom continuo", "fr": "Zoom continu", "ru": "Непрерывный масштаб", "ar": "تكبير مستمر"},
-"{description}\nショートカット: {shortcut}": {"en": "{description}\nShortcut: {shortcut}", "zh_CN": "{description}\n快捷键：{shortcut}", "ko": "{description}\n바로 가기 키: {shortcut}", "es": "{description}\nMétodo abreviado: {shortcut}", "fr": "{description}\nRaccourci : {shortcut}", "ru": "{description}\nСочетание клавиш: {shortcut}", "ar": "{description}\nالاختصار: {shortcut}"},"{count}件": {"en": "{count} matches", "zh_CN": "{count} 项", "ko": "{count}건", "es": "{count} coincidencias", "fr": "{count} résultats", "ru": "Совпадений: {count}", "ar": "{count} نتيجة"},
+"{count}件": {"en": "{count} matches", "zh_CN": "{count} 项", "ko": "{count}건", "es": "{count} coincidencias", "fr": "{count} résultats", "ru": "Совпадений: {count}", "ar": "{count} نتيجة"},
 "PDFファイル (*.pdf);;すべてのファイル (*.*)": {"en": "PDF Files (*.pdf);;All Files (*.*)", "zh_CN": "PDF 文件 (*.pdf);;所有文件 (*.*)", "ko": "PDF 파일 (*.pdf);;모든 파일 (*.*)", "es": "Archivos PDF (*.pdf);;Todos los archivos (*.*)", "fr": "Fichiers PDF (*.pdf);;Tous les fichiers (*.*)", "ru": "Файлы PDF (*.pdf);;Все файлы (*.*)", "ar": "ملفات PDF (*.pdf);;جميع الملفات (*.*)"},
-"ファイルのパスが長すぎます（260文字まで）。フォルダー名を短くするか、浅い場所へ移してください。": {"en": "The file path is too long (the limit is 260 characters). Shorten a folder name, or move the file somewhere less deep.", "zh_CN": "文件路径过长（上限为 260 个字符）。请缩短文件夹名称，或将文件移动到层级较浅的位置。", "ko": "파일 경로가 너무 깁니다(최대 260자). 폴더 이름을 줄이거나 파일을 상위 폴더로 옮기세요.", "es": "La ruta del archivo es demasiado larga (el límite es de 260 caracteres). Acorte un nombre de carpeta o mueva el archivo a una ubicación menos profunda.", "fr": "Le chemin d'accès du fichier est trop long (la limite est de 260 caractères). Raccourcissez un nom de dossier ou déplacez le fichier à un emplacement moins profond.", "ru": "Слишком длинный путь к файлу (предел — 260 знаков). Сократите имя папки или переместите файл в папку выше.", "ar": "مسار الملف طويل جدًا (الحد هو 260 حرفًا). اختصر اسم مجلد أو انقل الملف إلى موقع أقل عمقًا."},
-"指定されたファイルが見つかりません。": {"en": "The specified file could not be found.", "zh_CN": "找不到指定的文件。", "ko": "지정한 파일을 찾을 수 없습니다.", "es": "No se encontró el archivo especificado.", "fr": "Le fichier spécifié est introuvable.", "ru": "Указанный файл не найден.", "ar": "تعذر العثور على الملف المحدد."},
+"ファイルのパスが長すぎます（260文字まで）。フォルダー名を短くするか、ファイルを上の階層のフォルダーへ移動してください。": {"en": "The file path is too long (the limit is 260 characters). Shorten a folder name, or move the file to a folder higher up.", "zh_CN": "文件路径过长（上限为 260 个字符）。请缩短文件夹名称，或将文件移动到层级较浅的位置。", "ko": "파일 경로가 너무 깁니다(최대 260자). 폴더 이름을 줄이거나 파일을 상위 폴더로 옮기세요.", "es": "La ruta del archivo es demasiado larga (el límite es de 260 caracteres). Acorta el nombre de alguna carpeta o mueve el archivo a una carpeta de un nivel superior.", "fr": "Le chemin d'accès du fichier est trop long (la limite est de 260 caractères). Raccourcissez un nom de dossier ou déplacez le fichier dans un dossier de niveau supérieur.", "ru": "Слишком длинный путь к файлу (предел — 260 знаков). Сократите имя папки или переместите файл в папку выше.", "ar": "مسار الملف طويل جدًا (الحد هو 260 حرفًا). اختصر اسم مجلد أو انقل الملف إلى مجلد في مستوى أعلى."},
+"指定されたファイルが見つかりません。": {"en": "The specified file couldn't be found.", "zh_CN": "找不到指定的文件。", "ko": "지정한 파일을 찾을 수 없습니다.", "es": "No se encontró el archivo especificado.", "fr": "Le fichier spécifié est introuvable.", "ru": "Указанный файл не найден.", "ar": "تعذر العثور على الملف المحدد."},
 "PDFを開けませんでした。\n\n{error}": {"en": "Couldn't open the PDF.\n\n{error}", "zh_CN": "无法打开该 PDF。\n\n{error}", "ko": "PDF를 열 수 없습니다.\n\n{error}", "es": "No se pudo abrir el PDF.\n\n{error}", "fr": "Impossible d'ouvrir le PDF.\n\n{error}", "ru": "Не удалось открыть PDF.\n\n{error}", "ar": "تعذر فتح ملف PDF.\n\n{error}"},
 "パスワードが必要です": {"en": "Password Required", "zh_CN": "需要密码", "ko": "암호가 필요합니다", "es": "Se requiere contraseña", "fr": "Mot de passe requis", "ru": "Требуется пароль", "ar": "كلمة المرور مطلوبة"},
 "このPDFを開くためのパスワードを入力してください。": {"en": "Enter the password to open this PDF.", "zh_CN": "请输入打开此 PDF 所需的密码。", "ko": "이 PDF를 열려면 암호를 입력하세요.", "es": "Escribe la contraseña para abrir este PDF.", "fr": "Saisissez le mot de passe pour ouvrir ce PDF.", "ru": "Введите пароль для открытия этого PDF.", "ar": "أدخل كلمة المرور لفتح ملف PDF هذا."},
 "パスワードが正しくありません。": {"en": "The password is incorrect.", "zh_CN": "密码不正确。", "ko": "암호가 올바르지 않습니다.", "es": "La contraseña es incorrecta.", "fr": "Le mot de passe est incorrect.", "ru": "Неверный пароль.", "ar": "كلمة المرور غير صحيحة."},
 "このPDFにはページがありません。": {"en": "This PDF has no pages.", "zh_CN": "此 PDF 没有页面。", "ko": "이 PDF에는 페이지가 없습니다.", "es": "Este PDF no tiene páginas.", "fr": "Ce PDF ne contient aucune page.", "ru": "В этом PDF нет страниц.", "ar": "لا يحتوي ملف PDF هذا على صفحات."},
 "{name}  •  {count}ページ": {"en": "{name}  •  {count} pages", "zh_CN": "{name}  •  {count} 页", "ko": "{name}  •  {count}페이지", "es": "{name}  •  {count} páginas", "fr": "{name}  •  {count} pages", "ru": "{name}  •  {count} стр.", "ar": "{name}  •  {count} صفحة"},
-"ページ画像の作成に失敗しました": {"en": "Failed to generate the page image", "zh_CN": "生成页面图像失败", "ko": "페이지 이미지 생성에 실패했습니다", "es": "Error al generar la imagen de la página", "fr": "Échec de la génération de l'image de la page", "ru": "Не удалось создать изображение страницы", "ar": "فشل إنشاء صورة الصفحة"},
-"PDFページを描画できません": {"en": "Can't render this PDF page", "zh_CN": "无法渲染此 PDF 页面", "ko": "PDF 페이지를 렌더링할 수 없습니다", "es": "No se puede renderizar esta página del PDF", "fr": "Impossible d'afficher cette page du PDF", "ru": "Не удалось отрисовать эту страницу PDF", "ar": "تعذر عرض صفحة PDF هذه"},
-"空のページ画像が返されました": {"en": "An empty page image was returned", "zh_CN": "返回了空白页面图像", "ko": "빈 페이지 이미지가 반환되었습니다", "es": "Se devolvió una imagen de página vacía", "fr": "Une image de page vide a été renvoyée", "ru": "Возвращено пустое изображение страницы", "ar": "تم إرجاع صورة صفحة فارغة"},
-"描画エラー": {"en": "Rendering error", "zh_CN": "渲染错误", "ko": "렌더링 오류", "es": "Error de renderizado", "fr": "Erreur d'affichage", "ru": "Ошибка отрисовки", "ar": "خطأ في العرض"},
+"ページの画像を作成できませんでした": {"en": "Couldn't create the page image", "zh_CN": "生成页面图像失败", "ko": "페이지 이미지 생성에 실패했습니다", "es": "Error al generar la imagen de la página", "fr": "Échec de la génération de l'image de la page", "ru": "Не удалось создать изображение страницы", "ar": "فشل إنشاء صورة الصفحة"},
+"PDFページを描画できません": {"en": "Can't render this PDF page", "zh_CN": "无法渲染此 PDF 页面", "ko": "PDF 페이지를 렌더링할 수 없습니다", "es": "No se puede mostrar esta página del PDF", "fr": "Impossible d'afficher cette page du PDF", "ru": "Не удалось отрисовать эту страницу PDF", "ar": "تعذر عرض صفحة PDF هذه"},
+"ページの画像が空でした": {"en": "The page image came back empty", "zh_CN": "页面图像为空", "ko": "페이지 이미지가 비어 있습니다", "es": "La imagen de la página quedó vacía", "fr": "L'image de la page est vide", "ru": "Изображение страницы оказалось пустым", "ar": "صورة الصفحة فارغة"},
+"描画エラー": {"en": "Rendering error", "zh_CN": "渲染错误", "ko": "렌더링 오류", "es": "Error al mostrar la página", "fr": "Erreur d'affichage", "ru": "Ошибка отрисовки", "ar": "خطأ في العرض"},
 "ページを表示できませんでした。\n\n{error}": {"en": "Couldn't display the page.\n\n{error}", "zh_CN": "无法显示页面。\n\n{error}", "ko": "페이지를 표시할 수 없습니다.\n\n{error}", "es": "No se pudo mostrar la página.\n\n{error}", "fr": "Impossible d'afficher la page.\n\n{error}", "ru": "Не удалось отобразить страницу.\n\n{error}", "ar": "تعذر عرض الصفحة.\n\n{error}"},
-"表示用画像を確保できませんでした": {"en": "Couldn't allocate the display image", "zh_CN": "无法分配显示图像", "ko": "표시용 이미지를 확보할 수 없습니다", "es": "No se pudo reservar la imagen de visualización", "fr": "Impossible d'allouer l'image d'affichage", "ru": "Не удалось выделить изображение для отображения", "ar": "تعذر تخصيص صورة العرض"},
+"表示用の画像のメモリーを確保できませんでした": {"en": "Not enough memory for the page image", "zh_CN": "内存不足，无法生成页面图像", "ko": "메모리가 부족하여 페이지 이미지를 만들 수 없습니다", "es": "No hay memoria suficiente para la imagen de la página", "fr": "Mémoire insuffisante pour l'image de la page", "ru": "Недостаточно памяти для изображения страницы", "ar": "لا تكفي الذاكرة لصورة الصفحة"},
 "ページ {start}-{end}/{total}": {"en": "Page {start}-{end}/{total}", "zh_CN": "第 {start}-{end} 页，共 {total} 页", "ko": "페이지 {start}-{end}/{total}", "es": "Página {start}-{end}/{total}", "fr": "Page {start}-{end}/{total}", "ru": "Стр. {start}-{end}/{total}", "ar": "الصفحة {start}-{end}/{total}"},
 "ページ {page}/{total}": {"en": "Page {page}/{total}", "zh_CN": "第 {page} 页，共 {total} 页", "ko": "페이지 {page}/{total}", "es": "Página {page}/{total}", "fr": "Page {page}/{total}", "ru": "Стр. {page}/{total}", "ar": "الصفحة {page}/{total}"},
 "ページ {page}\n読み込み中…": {"en": "Page {page}\nLoading…", "zh_CN": "第 {page} 页\n加载中…", "ko": "페이지 {page}\n로드 중…", "es": "Página {page}\nCargando…", "fr": "Page {page}\nChargement…", "ru": "Стр. {page}\nЗагрузка…", "ar": "الصفحة {page}\nجارٍ التحميل…"},
 "{name}  •  連続スクロール  •  {count}ページ": {"en": "{name}  •  Continuous Scroll  •  {count} pages", "zh_CN": "{name}  •  连续滚动  •  {count} 页", "ko": "{name}  •  연속 스크롤  •  {count}페이지", "es": "{name}  •  Desplazamiento continuo  •  {count} páginas", "fr": "{name}  •  Défilement continu  •  {count} pages", "ru": "{name}  •  Непрерывная прокрутка  •  {count} стр.", "ar": "{name}  •  تمرير متواصل  •  {count} صفحة"},
 "ページ {page}\n表示できません": {"en": "Page {page}\nCan't display", "zh_CN": "第 {page} 页\n无法显示", "ko": "페이지 {page}\n표시할 수 없습니다", "es": "Página {page}\nNo se puede mostrar", "fr": "Page {page}\nAffichage impossible", "ru": "Стр. {page}\nНе удается отобразить", "ar": "الصفحة {page}\nتعذر العرض"},
-"ページ {page} の付箋へ移動しました": {"en": "Moved to the sticky note on page {page}", "zh_CN": "已跳转到第 {page} 页的便笺", "ko": "페이지 {page}의 메모로 이동했습니다", "es": "Se movió a la nota adhesiva de la página {page}", "fr": "Déplacé vers la note de la page {page}", "ru": "Переход к заметке на стр. {page}", "ar": "تم الانتقال إلى الملاحظة الملصقة في الصفحة {page}"},
-"付箋を更新できませんでした。\n\n{error}": {"en": "Couldn't update the sticky note.\n\n{error}", "zh_CN": "无法更新便笺。\n\n{error}", "ko": "메모를 업데이트할 수 없습니다.\n\n{error}", "es": "No se pudo actualizar la nota adhesiva.\n\n{error}", "fr": "Impossible de mettre à jour la note.\n\n{error}", "ru": "Не удалось обновить заметку.\n\n{error}", "ar": "تعذر تحديث الملاحظة الملصقة.\n\n{error}"},
+"ページ {page} の付箋へ移動しました": {"en": "Moved to the sticky note on page {page}", "zh_CN": "已跳转到第 {page} 页的便笺", "ko": "페이지 {page}의 스티커 메모로 이동했습니다", "es": "En la nota adhesiva de la página {page}", "fr": "Accès au pense-bête de la page {page}", "ru": "Переход к записке на стр. {page}", "ar": "تم الانتقال إلى الملاحظة الملصقة في الصفحة {page}"},
+"付箋を更新できませんでした。\n\n{error}": {"en": "Couldn't update the sticky note.\n\n{error}", "zh_CN": "无法更新便笺。\n\n{error}", "ko": "스티커 메모를 업데이트할 수 없습니다.\n\n{error}", "es": "No se pudo actualizar la nota adhesiva.\n\n{error}", "fr": "Impossible de mettre à jour le pense-bête.\n\n{error}", "ru": "Не удалось обновить записку.\n\n{error}", "ar": "تعذر تحديث الملاحظة الملصقة.\n\n{error}"},
 "「{query}」を検索しています…": {"en": "Searching for \"{query}\"…", "zh_CN": "正在搜索“{query}”…", "ko": "\"{query}\" 검색 중…", "es": "Buscando \"{query}\"…", "fr": "Recherche de « {query} »…", "ru": "Поиск «{query}»…", "ar": "جارٍ البحث عن \"{query}\"…"},
 "「{query}」: {count}件見つかりました": {"en": "\"{query}\": {count} matches found", "zh_CN": "“{query}”：找到 {count} 项", "ko": "\"{query}\": {count}건 찾음", "es": "\"{query}\": {count} coincidencias encontradas", "fr": "« {query} » : {count} résultats trouvés", "ru": "«{query}»: найдено совпадений: {count}", "ar": "\"{query}\": تم العثور على {count} نتيجة"},
 "編集履歴を復元できませんでした。\n\n{error}": {"en": "Couldn't restore the edit history.\n\n{error}", "zh_CN": "无法恢复编辑历史。\n\n{error}", "ko": "편집 기록을 복원할 수 없습니다.\n\n{error}", "es": "No se pudo restaurar el historial de ediciones.\n\n{error}", "fr": "Impossible de restaurer l'historique des modifications.\n\n{error}", "ru": "Не удалось восстановить историю изменений.\n\n{error}", "ar": "تعذر استعادة سجل التعديلات.\n\n{error}"},
-"ページ上をクリックして付箋を追加": {"en": "Click on the page to add a sticky note", "zh_CN": "点击页面添加便笺", "ko": "페이지를 클릭하여 메모 추가", "es": "Haz clic en la página para añadir una nota adhesiva", "fr": "Cliquez sur la page pour ajouter une note", "ru": "Щелкните на странице, чтобы добавить заметку", "ar": "انقر على الصفحة لإضافة ملاحظة ملصقة"},
-"ページ上をドラッグして手書き": {"en": "Drag on the page to draw freehand", "zh_CN": "在页面上拖动进行手写", "ko": "페이지 위에서 드래그하여 손글씨 작성", "es": "Arrastra en la página para dibujar a mano alzada", "fr": "Faites glisser sur la page pour dessiner à main levée", "ru": "Проведите по странице, чтобы рисовать от руки", "ar": "اسحب على الصفحة للرسم اليدوي الحر"},
+"ページをクリックして付箋を追加": {"en": "Click on the page to add a sticky note", "zh_CN": "单击页面以添加便笺", "ko": "페이지를 클릭하여 스티커 메모 추가", "es": "Haz clic en la página para añadir una nota adhesiva", "fr": "Cliquez sur la page pour ajouter un pense-bête", "ru": "Щелкните на странице, чтобы добавить записку", "ar": "انقر على الصفحة لإضافة ملاحظة ملصقة"},
+"ページ上をドラッグして手書き": {"en": "Drag on the page to draw freehand", "zh_CN": "在页面上拖动以书写或绘制墨迹", "ko": "페이지 위에서 드래그하여 잉크로 쓰거나 그리기", "es": "Arrastra en la página para escribir o dibujar con el lápiz", "fr": "Faites glisser sur la page pour écrire ou dessiner à l'encre", "ru": "Проведите по странице для рукописного ввода", "ar": "اسحب على الصفحة للكتابة أو الرسم بالحبر"},
 "ドラッグして四角形を追加": {"en": "Drag to add a rectangle", "zh_CN": "拖动以添加矩形", "ko": "드래그하여 사각형 추가", "es": "Arrastra para añadir un rectángulo", "fr": "Faites glisser pour ajouter un rectangle", "ru": "Перетащите, чтобы добавить прямоугольник", "ar": "اسحب لإضافة مستطيل"},
 "ドラッグして矢印を追加": {"en": "Drag to add an arrow", "zh_CN": "拖动以添加箭头", "ko": "드래그하여 화살표 추가", "es": "Arrastra para añadir una flecha", "fr": "Faites glisser pour ajouter une flèche", "ru": "Перетащите, чтобы добавить стрелку", "ar": "اسحب لإضافة سهم"},
 "ドラッグして直線を追加": {"en": "Drag to add a line", "zh_CN": "拖动以添加直线", "ko": "드래그하여 직선 추가", "es": "Arrastra para añadir una línea", "fr": "Faites glisser pour ajouter une ligne", "ru": "Перетащите, чтобы добавить линию", "ar": "اسحب لإضافة خط"},
-"クリック位置に編集できるテキスト ボックスがありません": {"en": "There's no editable text box at the clicked position", "zh_CN": "点击位置没有可编辑的文本框", "ko": "클릭한 위치에 편집 가능한 텍스트 상자가 없습니다", "es": "No hay un cuadro de texto editable en la posición donde hizo clic", "fr": "Il n'y a pas de zone de texte modifiable à l'endroit cliqué", "ru": "В месте щелчка нет редактируемого текстового поля", "ar": "لا يوجد مربع نص قابل للتعديل عند موضع النقر"},
+"クリックした位置に編集できるテキスト ボックスがありません": {"en": "There's no editable text box where you clicked", "zh_CN": "单击的位置没有可编辑的文本框", "ko": "클릭한 위치에 편집 가능한 텍스트 상자가 없습니다", "es": "No hay ningún cuadro de texto editable donde hiciste clic", "fr": "Il n'y a pas de zone de texte modifiable à l'endroit où vous avez cliqué", "ru": "В месте щелчка нет редактируемого текстового поля", "ar": "لا يوجد مربع نص قابل للتعديل في المكان الذي نقرت عليه"},
 "テキスト ボックスを保存できませんでした。\n\n{error}": {"en": "Couldn't save the text box.\n\n{error}", "zh_CN": "无法保存文本框。\n\n{error}", "ko": "텍스트 상자를 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar el cuadro de texto.\n\n{error}", "fr": "Impossible d'enregistrer la zone de texte.\n\n{error}", "ru": "Не удалось сохранить текстовое поле.\n\n{error}", "ar": "تعذر حفظ مربع النص.\n\n{error}"},
 "画像データを読み取れません": {"en": "Can't read the image data", "zh_CN": "无法读取图片数据", "ko": "이미지 데이터를 읽을 수 없습니다", "es": "No se pueden leer los datos de la imagen", "fr": "Impossible de lire les données de l'image", "ru": "Не удается прочитать данные изображения", "ar": "تعذرت قراءة بيانات الصورة"},
-"画像の再生成に失敗しました": {"en": "Failed to regenerate the image", "zh_CN": "重新生成图片失败", "ko": "이미지 재생성에 실패했습니다", "es": "Error al regenerar la imagen", "fr": "Échec de la régénération de l'image", "ru": "Не удалось повторно создать изображение", "ar": "فشل إعادة إنشاء الصورة"},
-"画像編集を保存できませんでした。\n\n{error}": {"en": "Couldn't save the image edit.\n\n{error}", "zh_CN": "无法保存图片编辑。\n\n{error}", "ko": "이미지 편집을 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar la edición de la imagen.\n\n{error}", "fr": "Impossible d'enregistrer la modification de l'image.\n\n{error}", "ru": "Не удалось сохранить изменения изображения.\n\n{error}", "ar": "تعذر حفظ تعديل الصورة.\n\n{error}"},
-"{count}個の注釈を範囲選択": {"en": "{count} annotations selected", "zh_CN": "已选择 {count} 个注释", "ko": "주석 {count}개 선택됨", "es": "{count} anotaciones seleccionadas", "fr": "{count} annotations sélectionnées", "ru": "Выбрано аннотаций: {count}", "ar": "تم تحديد {count} تعليقًا توضيحيًا"},
-"付箋を追加": {"en": "Add Sticky Note", "zh_CN": "添加便笺", "ko": "메모 추가", "es": "Añadir nota adhesiva", "fr": "Ajouter une note", "ru": "Добавить заметку", "ar": "إضافة ملاحظة ملصقة"},
-"{count}文字を選択して{operation}を追加しました": {"en": "Selected {count} characters and added {operation}", "zh_CN": "已选择 {count} 个字符并添加了{operation}", "ko": "{count}자를 선택하여 {operation}을(를) 추가했습니다", "es": "Se seleccionaron {count} caracteres y se añadió {operation}", "fr": "{count} caractères sélectionnés et {operation} ajouté", "ru": "Выбрано символов: {count}, добавлено: {operation}", "ar": "تم تحديد {count} حرفًا وإضافة {operation}"},
+"画像を作り直せませんでした": {"en": "Couldn't re-create the image", "zh_CN": "重新生成图片失败", "ko": "이미지 재생성에 실패했습니다", "es": "Error al regenerar la imagen", "fr": "Échec de la régénération de l'image", "ru": "Не удалось повторно создать изображение", "ar": "فشل إعادة إنشاء الصورة"},
+"画像の変更を保存できませんでした。\n\n{error}": {"en": "Couldn't save the image edit.\n\n{error}", "zh_CN": "无法保存图片编辑。\n\n{error}", "ko": "이미지 편집을 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar la edición de la imagen.\n\n{error}", "fr": "Impossible d'enregistrer la modification de l'image.\n\n{error}", "ru": "Не удалось сохранить изменения изображения.\n\n{error}", "ar": "تعذر حفظ تعديل الصورة.\n\n{error}"},
+"{count}個の注釈を選択中": {"en": "{count} annotations selected", "zh_CN": "已选择 {count} 个注释", "ko": "주석 {count}개 선택됨", "es": "{count} anotaciones seleccionadas", "fr": "{count} annotations sélectionnées", "ru": "Выбрано аннотаций: {count}", "ar": "تم تحديد {count} تعليقًا توضيحيًا"},
+"付箋を追加": {"en": "Add Sticky Note", "zh_CN": "添加便笺", "ko": "스티커 메모 추가", "es": "Añadir nota adhesiva", "fr": "Ajouter un pense-bête", "ru": "Добавить записку", "ar": "إضافة ملاحظة ملصقة"},
+"{count}文字に{operation}を追加しました": {"en": "Added {operation} to {count} characters", "zh_CN": "已为 {count} 个字符添加{operation}", "ko": "{count}자에 {operation}을(를) 추가했습니다", "es": "Se añadió {operation} a {count} caracteres", "fr": "{operation} ajouté à {count} caractères", "ru": "Применено «{operation}» к символам: {count}", "ar": "تمت إضافة {operation} إلى {count} حرفًا"},
 "{operation}を解除しました": {"en": "Removed {operation}", "zh_CN": "已移除{operation}", "ko": "{operation}을(를) 해제했습니다", "es": "Se quitó {operation}", "fr": "{operation} supprimé", "ru": "Удалено: {operation}", "ar": "تمت إزالة {operation}"},
-"付箋を追加しました。挿入モードを終了しました": {"en": "Sticky note added. Insert mode ended", "zh_CN": "已添加便笺。已退出插入模式", "ko": "메모를 추가했습니다. 삽입 모드를 종료했습니다", "es": "Nota adhesiva agregada. Se salió del modo de inserción", "fr": "Pense-bête ajouté. Mode Insertion quitté", "ru": "Заметка добавлена. Режим вставки завершен", "ar": "تمت إضافة ملاحظة ملصقة. تم إنهاء وضع الإدراج"},
-"図形を追加しました。挿入モードを終了しました": {"en": "Shape added. Exited insert mode", "zh_CN": "已添加图形，已退出插入模式", "ko": "도형을 추가했습니다. 삽입 모드를 종료했습니다", "es": "Forma añadida. Se salió del modo de inserción", "fr": "Forme ajoutée. Mode d'insertion quitté", "ru": "Фигура добавлена. Режим вставки завершен", "ar": "تمت إضافة الشكل. تم إنهاء وضع الإدراج"},
+"付箋を追加しました。挿入モードを終了しました": {"en": "Sticky note added. Insert mode ended", "zh_CN": "已添加便笺。已退出插入模式", "ko": "스티커 메모를 추가했습니다. 삽입 모드를 종료했습니다", "es": "Nota adhesiva añadida. Modo de inserción finalizado", "fr": "Pense-bête ajouté. Mode insertion terminé", "ru": "Записка добавлена. Режим вставки завершен", "ar": "تمت إضافة ملاحظة ملصقة. انتهى وضع الإدراج"},
+"図形を追加しました。挿入モードを終了しました": {"en": "Shape added. Insert mode ended", "zh_CN": "已添加图形。已退出插入模式", "ko": "도형을 추가했습니다. 삽입 모드를 종료했습니다", "es": "Forma añadida. Modo de inserción finalizado", "fr": "Forme ajoutée. Mode insertion terminé", "ru": "Фигура добавлена. Режим вставки завершен", "ar": "تمت إضافة الشكل. انتهى وضع الإدراج"},
 "編集を適用できませんでした。\n\n{error}": {"en": "Couldn't apply the edit.\n\n{error}", "zh_CN": "无法应用编辑。\n\n{error}", "ko": "편집을 적용할 수 없습니다.\n\n{error}", "es": "No se pudo aplicar la edición.\n\n{error}", "fr": "Impossible d'appliquer la modification.\n\n{error}", "ru": "Не удалось применить изменение.\n\n{error}", "ar": "تعذر تطبيق التعديل.\n\n{error}"},
 "{count}個の注釈を削除しました": {"en": "Deleted {count} annotations", "zh_CN": "已删除 {count} 个注释", "ko": "{count}개의 주석을 삭제했습니다", "es": "Se eliminaron {count} anotaciones", "fr": "{count} annotations supprimées", "ru": "Удалено аннотаций: {count}", "ar": "تم حذف {count} تعليقًا توضيحيًا"},
-"テキスト ボックスの文字をコピーしました": {"en": "Copied the text box's text", "zh_CN": "已复制文本框中的文字", "ko": "텍스트 상자의 문자를 복사했습니다", "es": "Se copió el texto del cuadro de texto", "fr": "Texte de la zone de texte copié", "ru": "Текст текстового поля скопирован", "ar": "تم نسخ نص مربع النص"},
+"テキスト ボックスの文字をコピーしました": {"en": "Copied the text box's text", "zh_CN": "已复制文本框中的文字", "ko": "텍스트 상자의 텍스트를 복사했습니다", "es": "Se copió el texto del cuadro de texto", "fr": "Texte de la zone de texte copié", "ru": "Текст текстового поля скопирован", "ar": "تم نسخ نص مربع النص"},
 "テキスト注釈をコピーしました": {"en": "Copied the text annotation", "zh_CN": "已复制文字注释", "ko": "텍스트 주석을 복사했습니다", "es": "Se copió la anotación de texto", "fr": "Annotation de texte copiée", "ru": "Текстовая аннотация скопирована", "ar": "تم نسخ التعليق التوضيحي النصي"},
-"画像をクリップボードへコピーしました": {"en": "Copied the image to the clipboard", "zh_CN": "已将图片复制到剪贴板", "ko": "이미지를 클립보드에 복사했습니다", "es": "Se copió la imagen al portapapeles", "fr": "Image copiée dans le presse-papiers", "ru": "Изображение скопировано в буфер обмена", "ar": "تم نسخ الصورة إلى الحافظة"},
+"画像をクリップボードへコピーしました": {"en": "Copied the image to the clipboard", "zh_CN": "已将图片复制到剪贴板", "ko": "이미지를 클립보드에 복사했습니다", "es": "Se copió la imagen al portapapeles", "fr": "Image copiée dans le Presse-papiers", "ru": "Изображение скопировано в буфер обмена", "ar": "تم نسخ الصورة إلى الحافظة"},
 "選択内容を画像としてコピーしました": {"en": "Copied the selection as an image", "zh_CN": "已将所选内容复制为图片", "ko": "선택 항목을 이미지로 복사했습니다", "es": "Se copió la selección como imagen", "fr": "Sélection copiée en tant qu'image", "ru": "Выделение скопировано как изображение", "ar": "تم نسخ التحديد كصورة"},
 "選択したテキストをコピーしました": {"en": "Copied the selected text", "zh_CN": "已复制所选文本", "ko": "선택한 텍스트를 복사했습니다", "es": "Se copió el texto seleccionado", "fr": "Texte sélectionné copié", "ru": "Выделенный текст скопирован", "ar": "تم نسخ النص المحدد"},
-"切り取り対象を選択してください": {"en": "Select something to cut first", "zh_CN": "请先选择要剪切的对象", "ko": "잘라낼 대상을 먼저 선택하세요", "es": "Selecciona primero lo que quieras cortar", "fr": "Sélectionnez d'abord un élément à couper", "ru": "Сначала выберите объект для вырезания", "ar": "حدد عنصرًا لقصه أولًا"},
+"切り取るものを選択してください": {"en": "Select something to cut first", "zh_CN": "请先选择要剪切的对象", "ko": "잘라낼 대상을 먼저 선택하세요", "es": "Selecciona primero lo que quieras cortar", "fr": "Sélectionnez d'abord un élément à couper", "ru": "Сначала выберите объект для вырезания", "ar": "حدد عنصرًا لقصه أولًا"},
 "{count}個の注釈を貼り付けました": {"en": "Pasted {count} annotations", "zh_CN": "已粘贴 {count} 个注释", "ko": "{count}개의 주석을 붙여넣었습니다", "es": "Se pegaron {count} anotaciones", "fr": "{count} annotations collées", "ru": "Вставлено аннотаций: {count}", "ar": "تم لصق {count} تعليقًا توضيحيًا"},
-"この図形は別のPDFへは貼り付けられません": {"en": "This shape cannot be pasted into a different PDF", "zh_CN": "此形状无法粘贴到其他 PDF 中", "ko": "이 도형은 다른 PDF에 붙여넣을 수 없습니다", "es": "Esta forma no se puede pegar en otro PDF", "fr": "Cette forme ne peut pas être collée dans un autre PDF", "ru": "Эту фигуру нельзя вставить в другой PDF-файл", "ar": "لا يمكن لصق هذا الشكل في ملف PDF آخر"},
+"この図形は別のPDFへは貼り付けられません": {"en": "This shape can't be pasted into a different PDF", "zh_CN": "此图形无法粘贴到其他 PDF 中", "ko": "이 도형은 다른 PDF에 붙여넣을 수 없습니다", "es": "Esta forma no se puede pegar en otro PDF", "fr": "Cette forme ne peut pas être collée dans un autre PDF", "ru": "Эту фигуру нельзя вставить в другой PDF-файл", "ar": "لا يمكن لصق هذا الشكل في ملف PDF آخر"},
 "選択内容をコピーしました": {"en": "Copied the selection", "zh_CN": "已复制所选内容", "ko": "선택 항목을 복사했습니다", "es": "Se copió la selección", "fr": "Sélection copiée", "ru": "Выделение скопировано", "ar": "تم نسخ التحديد"},
 "選択内容を切り取りました": {"en": "Cut the selection", "zh_CN": "已剪切所选内容", "ko": "선택 항목을 잘라냈습니다", "es": "Se cortó la selección", "fr": "Sélection coupée", "ru": "Выделение вырезано", "ar": "تم قص التحديد"},
 "追加する画像を選択": {"en": "Select an Image to Add", "zh_CN": "选择要添加的图片", "ko": "추가할 이미지 선택", "es": "Seleccionar una imagen para añadir", "fr": "Sélectionner une image à ajouter", "ru": "Выберите изображение для добавления", "ar": "اختر صورة للإضافة"},
 "画像 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)": {"en": "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "zh_CN": "图片 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "ko": "이미지 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "es": "Imágenes (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "fr": "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "ru": "Изображения (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)", "ar": "صور (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"},
-"クリップボードに貼り付け可能な画像がありません": {"en": "There's no image on the clipboard to paste", "zh_CN": "剪贴板中没有可粘贴的图片", "ko": "붙여넣을 수 있는 이미지가 클립보드에 없습니다", "es": "No hay ninguna imagen en el portapapeles para pegar", "fr": "Aucune image à coller dans le presse-papiers", "ru": "В буфере обмена нет изображения для вставки", "ar": "لا توجد صورة في الحافظة يمكن لصقها"},
-"クリップボード画像を読み取れませんでした": {"en": "Couldn't read the clipboard image", "zh_CN": "无法读取剪贴板图片", "ko": "클립보드 이미지를 읽을 수 없습니다", "es": "No se pudo leer la imagen del portapapeles", "fr": "Impossible de lire l'image du presse-papiers", "ru": "Не удалось прочитать изображение из буфера обмена", "ar": "تعذرت قراءة صورة الحافظة"},
-"クリップボード画像": {"en": "Clipboard Image", "zh_CN": "剪贴板图片", "ko": "클립보드 이미지", "es": "Imagen del portapapeles", "fr": "Image du presse-papiers", "ru": "Изображение из буфера обмена", "ar": "صورة الحافظة"},
+"クリップボードに画像がありません": {"en": "There's no image on the clipboard to paste", "zh_CN": "剪贴板中没有可粘贴的图片", "ko": "붙여넣을 수 있는 이미지가 클립보드에 없습니다", "es": "No hay ninguna imagen en el portapapeles para pegar", "fr": "Le Presse-papiers ne contient pas d'image", "ru": "В буфере обмена нет изображения для вставки", "ar": "لا توجد صورة في الحافظة يمكن لصقها"},
+"クリップボードの画像を読み取れませんでした": {"en": "Couldn't read the clipboard image", "zh_CN": "无法读取剪贴板图片", "ko": "클립보드 이미지를 읽을 수 없습니다", "es": "No se pudo leer la imagen del portapapeles", "fr": "Impossible de lire l'image du Presse-papiers", "ru": "Не удалось прочитать изображение из буфера обмена", "ar": "تعذرت قراءة صورة الحافظة"},
+"クリップボード画像": {"en": "Clipboard Image", "zh_CN": "剪贴板图片", "ko": "클립보드 이미지", "es": "Imagen del portapapeles", "fr": "Image du Presse-papiers", "ru": "Изображение из буфера обмена", "ar": "صورة الحافظة"},
 "{name}を現在のページへ貼り付けました": {"en": "Pasted {name} onto the current page", "zh_CN": "已将{name}粘贴到当前页面", "ko": "{name}을(를) 현재 페이지에 붙여넣었습니다", "es": "Se pegó {name} en la página actual", "fr": "{name} collé sur la page actuelle", "ru": "{name} вставлено на текущую страницу", "ar": "تم لصق {name} في الصفحة الحالية"},
 "画像を追加できませんでした。\n\n{error}": {"en": "Couldn't add the image.\n\n{error}", "zh_CN": "无法添加图片。\n\n{error}", "ko": "이미지를 추가할 수 없습니다.\n\n{error}", "es": "No se pudo añadir la imagen.\n\n{error}", "fr": "Impossible d'ajouter l'image.\n\n{error}", "ru": "Не удалось добавить изображение.\n\n{error}", "ar": "تعذر إضافة الصورة.\n\n{error}"},
 "追加するPDFを選択": {"en": "Select a PDF to Add", "zh_CN": "选择要添加的 PDF", "ko": "추가할 PDF 선택", "es": "Seleccionar un PDF para añadir", "fr": "Sélectionner un PDF à ajouter", "ru": "Выберите PDF для добавления", "ar": "اختر ملف PDF للإضافة"},
 "PDFファイル (*.pdf)": {"en": "PDF Files (*.pdf)", "zh_CN": "PDF 文件 (*.pdf)", "ko": "PDF 파일 (*.pdf)", "es": "Archivos PDF (*.pdf)", "fr": "Fichiers PDF (*.pdf)", "ru": "Файлы PDF (*.pdf)", "ar": "ملفات PDF (*.pdf)"},
-"パスワード保護されたPDFのページ追加には対応していません。": {"en": "Adding pages from a password-protected PDF isn't supported.", "zh_CN": "不支持从受密码保护的 PDF 添加页面。", "ko": "암호로 보호된 PDF에서는 페이지 추가를 지원하지 않습니다.", "es": "No se admite añadir páginas desde un PDF protegido con contraseña.", "fr": "L'ajout de pages depuis un PDF protégé par mot de passe n'est pas pris en charge.", "ru": "Добавление страниц из PDF, защищенного паролем, не поддерживается.", "ar": "إضافة صفحات من ملف PDF محمي بكلمة مرور غير مدعومة."},
+"パスワードで保護されたPDFからはページを追加できません。": {"en": "Adding pages from a password-protected PDF isn't supported.", "zh_CN": "不支持从受密码保护的 PDF 添加页面。", "ko": "암호로 보호된 PDF에서는 페이지 추가를 지원하지 않습니다.", "es": "No se admite añadir páginas desde un PDF protegido con contraseña.", "fr": "L'ajout de pages depuis un PDF protégé par mot de passe n'est pas pris en charge.", "ru": "Добавление страниц из PDF, защищенного паролем, не поддерживается.", "ar": "إضافة صفحات من ملف PDF محمي بكلمة مرور غير مدعومة."},
 "PDFページを追加できませんでした。\n\n{error}": {"en": "Couldn't add the PDF pages.\n\n{error}", "zh_CN": "无法添加 PDF 页面。\n\n{error}", "ko": "PDF 페이지를 추가할 수 없습니다.\n\n{error}", "es": "No se pudieron añadir las páginas del PDF.\n\n{error}", "fr": "Impossible d'ajouter les pages du PDF.\n\n{error}", "ru": "Не удалось добавить страницы PDF.\n\n{error}", "ar": "تعذرت إضافة صفحات PDF.\n\n{error}"},
-"PDFには最低1ページ必要です。": {"en": "A PDF needs at least one page.", "zh_CN": "PDF 至少需要 1 页。", "ko": "PDF에는 최소 1페이지가 필요합니다.", "es": "Un PDF necesita al menos una página.", "fr": "Un PDF doit contenir au moins une page.", "ru": "В PDF должна быть хотя бы одна страница.", "ar": "يجب أن يحتوي ملف PDF على صفحة واحدة على الأقل."},
+"PDFには1ページ以上必要です。": {"en": "A PDF needs at least one page.", "zh_CN": "PDF 至少需要 1 页。", "ko": "PDF에는 최소 1페이지가 필요합니다.", "es": "Un PDF necesita al menos una página.", "fr": "Un PDF doit contenir au moins une page.", "ru": "В PDF должна быть хотя бы одна страница.", "ar": "يجب أن يحتوي ملف PDF على صفحة واحدة على الأقل."},
 "現在のページを書き出し": {"en": "Export Current Page", "zh_CN": "导出当前页", "ko": "현재 페이지 내보내기", "es": "Exportar página actual", "fr": "Exporter la page actuelle", "ru": "Экспортировать текущую страницу", "ar": "تصدير الصفحة الحالية"},
 "ページを書き出しました: {path}": {"en": "Exported the page: {path}", "zh_CN": "已导出页面：{path}", "ko": "페이지를 내보냈습니다: {path}", "es": "Página exportada: {path}", "fr": "Page exportée : {path}", "ru": "Страница экспортирована: {path}", "ar": "تم تصدير الصفحة: {path}"},
 "ページの順序を変更しました": {"en": "Changed the page order", "zh_CN": "已更改页面顺序", "ko": "페이지 순서를 변경했습니다", "es": "Se cambió el orden de las páginas", "fr": "Ordre des pages modifié", "ru": "Порядок страниц изменен", "ar": "تم تغيير ترتيب الصفحات"},
@@ -1681,18 +1812,18 @@ TRANSLATIONS = {
 "キーボード ショートカット": {"en": "Keyboard Shortcuts", "zh_CN": "键盘快捷方式", "ko": "바로 가기 키", "es": "Métodos abreviados de teclado", "fr": "Raccourcis clavier", "ru": "Сочетания клавиш", "ar": "اختصارات لوحة المفاتيح"},
 "{app} について": {"en": "About {app}", "zh_CN": "关于 {app}", "ko": "{app} 정보", "es": "Acerca de {app}", "fr": "À propos de {app}", "ru": "О программе {app}", "ar": "حول {app}"},
 "バージョン {version}": {"en": "Version {version}", "zh_CN": "版本 {version}", "ko": "버전 {version}", "es": "Versión {version}", "fr": "Version {version}", "ru": "Версия {version}", "ar": "الإصدار {version}"},
-"マウスは猫に、あなたの手はキーボードに。あなたの情熱で未来を動かすショートカット志向のPDFエディターです。": {"en": "Mouse to the cat, hands to the keys, passion to the future. {app}, the shortcut-oriented PDF editor, lends a hand.", "zh_CN": "鼠标交给猫，双手交给键盘，激情交给未来。{app} 是一款以键盘快捷方式为核心的 PDF 编辑器，助你一臂之力。", "ko": "마우스는 고양이에게, 손은 키보드에, 열정은 미래에. 바로 가기 키 중심의 PDF 편집기 {app}이(가) 손을 보탭니다.", "es": "El ratón, para el gato; las manos, para el teclado; la pasión, para el futuro. {app}, el editor de PDF orientado a los métodos abreviados de teclado, te echa una mano.", "fr": "La souris au chat, les mains au clavier, la passion à l'avenir. {app}, l'éditeur PDF orienté raccourcis clavier, vous prête main-forte.", "ru": "Мышь — кошке, руки — клавиатуре, страсть — будущему. {app}, редактор PDF, ориентированный на сочетания клавиш, протянет вам руку помощи.", "ar": "الفأرة للقطة، واليدان للوحة المفاتيح، والشغف للمستقبل. أما {app}، محرر PDF الموجّه نحو اختصارات لوحة المفاتيح، فيمدّ لك يد العون."},
+"マウスはにゃんこに、あなたの手はキーボードに。情熱で未来を動かすショートカット志向のPDFエディターです。": {"en": "Mouse to the cat, hands to the keys, passion to the future. {app}, the shortcut-oriented PDF editor, lends a hand.", "zh_CN": "鼠标交给猫，双手交给键盘，激情交给未来。{app} 是一款以键盘快捷方式为核心的 PDF 编辑器，助你一臂之力。", "ko": "마우스는 고양이에게, 손은 키보드에, 열정은 미래에. 바로 가기 키 중심의 PDF 편집기 {app}이(가) 손을 보탭니다.", "es": "El ratón, para el gato; las manos, para el teclado; la pasión, para el futuro. {app}, el editor de PDF que se maneja con atajos, te echa una mano.", "fr": "La souris au chat, les mains au clavier, la passion à l'avenir. {app}, l'éditeur PDF orienté raccourcis clavier, vous prête main-forte.", "ru": "Мышь — кошке, руки — клавиатуре, страсть — будущему. {app}, редактор PDF, ориентированный на сочетания клавиш, протянет вам руку помощи.", "ar": "الفأرة للقطة، واليدان للوحة المفاتيح، والشغف للمستقبل. أما {app}، محرر PDF الموجّه نحو اختصارات لوحة المفاتيح، فيمدّ لك يد العون."},
 "PDFエンジン: PyMuPDF (MuPDF)": {"en": "PDF engine: PyMuPDF (MuPDF)", "zh_CN": "PDF 引擎：PyMuPDF (MuPDF)", "ko": "PDF 엔진: PyMuPDF (MuPDF)", "es": "Motor de PDF: PyMuPDF (MuPDF)", "fr": "Moteur PDF : PyMuPDF (MuPDF)", "ru": "PDF-движок: PyMuPDF (MuPDF)", "ar": "محرك PDF: PyMuPDF (MuPDF)"},
 "開く": {"en": "Open", "zh_CN": "打开", "ko": "열기", "es": "Abrir", "fr": "Ouvrir", "ru": "Открыть", "ar": "فتح"},
 "印刷": {"en": "Print", "zh_CN": "打印", "ko": "인쇄", "es": "Imprimir", "fr": "Imprimer", "ru": "Печать", "ar": "طباعة"},
 "印刷を準備しています…": {"en": "Preparing to print…", "zh_CN": "正在准备打印…", "ko": "인쇄를 준비하고 있습니다…", "es": "Preparando la impresión…", "fr": "Préparation de l'impression…", "ru": "Подготовка к печати…", "ar": "جارٍ التحضير للطباعة…"},
-"印刷を送信しました": {"en": "Sent to print", "zh_CN": "已发送打印", "ko": "인쇄로 전송했습니다", "es": "Enviado a imprimir", "fr": "Envoyé à l'impression", "ru": "Отправлено на печать", "ar": "تم الإرسال للطباعة"},
+"プリンターに送信しました": {"en": "Sent to the printer", "zh_CN": "已发送打印", "ko": "프린터로 전송했습니다", "es": "Enviado a imprimir", "fr": "Envoyé à l'impression", "ru": "Отправлено на печать", "ar": "تم الإرسال للطباعة"},
 "更新": {"en": "Refresh", "zh_CN": "刷新", "ko": "새로 고침", "es": "Actualizar", "fr": "Actualiser", "ru": "Обновить", "ar": "تحديث"},
-"画面を更新しました": {"en": "Refreshed the view", "zh_CN": "已刷新视图", "ko": "화면을 새로 고쳤습니다", "es": "Se actualizó la vista", "fr": "Affichage actualisé", "ru": "Представление обновлено", "ar": "تم تحديث العرض"},
-"選択中の文字列に下線を追加": {"en": "Underline the selected text", "zh_CN": "为所选文字添加下划线", "ko": "선택한 텍스트에 밑줄 긋기", "es": "Subrayar el texto seleccionado", "fr": "Souligner le texte sélectionné", "ru": "Подчеркнуть выделенный текст", "ar": "تسطير النص المحدد"},
-"選択中の文字列に取り消し線を追加": {"en": "Strike through the selected text", "zh_CN": "为所选文字添加删除线", "ko": "선택한 텍스트에 취소선 긋기", "es": "Tachar el texto seleccionado", "fr": "Barrer le texte sélectionné", "ru": "Зачеркнуть выделенный текст", "ar": "شطب النص المحدد"},
-"選択中の文字列をハイライト": {"en": "Highlight the selected text", "zh_CN": "突出显示所选文字", "ko": "선택한 텍스트 강조 표시", "es": "Resaltar el texto seleccionado", "fr": "Surligner le texte sélectionné", "ru": "Выделить цветом выделенный текст", "ar": "تمييز النص المحدد"},
-"手書きの挿入": {"en": "Insert Ink", "zh_CN": "插入手写", "ko": "손글씨 삽입", "es": "Insertar dibujo a mano", "fr": "Insérer un dessin à main levée", "ru": "Вставить рисунок", "ar": "إدراج رسم حر"},
+"表示を更新しました": {"en": "Refreshed the view", "zh_CN": "已刷新视图", "ko": "화면을 새로 고쳤습니다", "es": "Se actualizó la vista", "fr": "Affichage actualisé", "ru": "Представление обновлено", "ar": "تم تحديث العرض"},
+"選択中の文字列に下線を引く": {"en": "Underline the selected text", "zh_CN": "为所选文字添加下划线", "ko": "선택한 텍스트에 밑줄 긋기", "es": "Subrayar el texto seleccionado", "fr": "Souligner le texte sélectionné", "ru": "Подчеркнуть выделенный текст", "ar": "تسطير النص المحدد"},
+"選択中の文字列に取り消し線を引く": {"en": "Strike through the selected text", "zh_CN": "为所选文字添加删除线", "ko": "선택한 텍스트에 취소선 긋기", "es": "Tachar el texto seleccionado", "fr": "Barrer le texte sélectionné", "ru": "Зачеркнуть выделенный текст", "ar": "شطب النص المحدد"},
+"選択中の文字列をハイライト": {"en": "Highlight the selected text", "zh_CN": "突出显示所选文字", "ko": "선택한 텍스트 강조 표시", "es": "Resaltar el texto seleccionado", "fr": "Surligner le texte sélectionné", "ru": "Выделить цветом выбранный текст", "ar": "تمييز النص المحدد"},
+"手書きの挿入": {"en": "Insert Ink", "zh_CN": "插入墨迹", "ko": "잉크 삽입", "es": "Insertar entrada de lápiz", "fr": "Insérer de l'encre", "ru": "Вставить рукописный фрагмент", "ar": "إدراج حبر"},
 "{description}：{shortcut}": {"en": "{description}: {shortcut}", "zh_CN": "{description}：{shortcut}", "ko": "{description}: {shortcut}", "es": "{description}: {shortcut}", "fr": "{description} : {shortcut}", "ru": "{description}: {shortcut}", "ar": "{description}: {shortcut}"},
 "貼り付け": {"en": "Paste", "zh_CN": "粘贴", "ko": "붙여넣기", "es": "Pegar", "fr": "Coller", "ru": "Вставить", "ar": "لصق"},
 "移動": {"en": "Move", "zh_CN": "移动", "ko": "이동", "es": "Mover", "fr": "Déplacer", "ru": "Переместить", "ar": "نقل"},
@@ -1700,15 +1831,14 @@ TRANSLATIONS = {
 "ページ指定": {"en": "Go to Page", "zh_CN": "转到页面", "ko": "페이지 이동", "es": "Ir a la página", "fr": "Aller à la page", "ru": "Перейти к странице", "ar": "الانتقال إلى الصفحة"},
 "単ページ": {"en": "Single Page", "zh_CN": "单页", "ko": "단일 페이지", "es": "Página única", "fr": "Page unique", "ru": "Одна страница", "ar": "صفحة واحدة"},
 "見開き": {"en": "Facing Pages", "zh_CN": "双页视图", "ko": "펼침 페이지", "es": "Páginas enfrentadas", "fr": "Pages en vis-à-vis", "ru": "Разворот", "ar": "صفحات متقابلة"},
-"ナビゲーションのタブ切替": {"en": "Switch Navigation Tab", "zh_CN": "切换导航标签页", "ko": "탐색 탭 전환", "es": "Cambiar pestaña de navegación", "fr": "Changer d'onglet de navigation", "ru": "Переключить вкладку навигации", "ar": "تبديل علامة تبويب التنقل"},
-"空白ページ挿入": {"en": "Insert Blank Page", "zh_CN": "插入空白页", "ko": "빈 페이지 삽입", "es": "Insertar página en blanco", "fr": "Insérer une page vierge", "ru": "Вставить пустую страницу", "ar": "إدراج صفحة فارغة"},
+"ナビゲーションのタブを切り替え": {"en": "Switch Navigation Tab", "zh_CN": "切换导航标签页", "ko": "탐색 탭 전환", "es": "Cambiar pestaña de navegación", "fr": "Changer d'onglet de navigation", "ru": "Переключить вкладку навигации", "ar": "تبديل علامة تبويب التنقل"},
 "ページを追加": {"en": "Add Pages", "zh_CN": "添加页面", "ko": "페이지 추가", "es": "Añadir páginas", "fr": "Ajouter des pages", "ru": "Добавить страницы", "ar": "إضافة صفحات"},
-"ページ複製": {"en": "Duplicate Page", "zh_CN": "复制页面", "ko": "페이지 복제", "es": "Duplicar página", "fr": "Dupliquer la page", "ru": "Дублировать страницу", "ar": "تكرار الصفحة"},
-"ページ回転": {"en": "Rotate Page", "zh_CN": "旋转页面", "ko": "페이지 회전", "es": "Girar página", "fr": "Faire pivoter la page", "ru": "Повернуть страницу", "ar": "تدوير الصفحة"},
-"ページ削除": {"en": "Delete Page", "zh_CN": "删除页面", "ko": "페이지 삭제", "es": "Eliminar página", "fr": "Supprimer la page", "ru": "Удалить страницу", "ar": "حذف الصفحة"},
-"編集⇔選択切替": {"en": "Toggle Edit / Select", "zh_CN": "切换编辑/选择", "ko": "편집/선택 전환", "es": "Alternar edición/selección", "fr": "Basculer édition/sélection", "ru": "Переключить редактирование/выбор", "ar": "تبديل التحرير/التحديد"},
+"ページを複製": {"en": "Duplicate Page", "zh_CN": "复制页面", "ko": "페이지 복제", "es": "Duplicar página", "fr": "Dupliquer la page", "ru": "Дублировать страницу", "ar": "تكرار الصفحة"},
+"ページを回転": {"en": "Rotate Page", "zh_CN": "旋转页面", "ko": "페이지 회전", "es": "Girar página", "fr": "Faire pivoter la page", "ru": "Повернуть страницу", "ar": "تدوير الصفحة"},
+"ページを削除": {"en": "Delete Page", "zh_CN": "删除页面", "ko": "페이지 삭제", "es": "Eliminar página", "fr": "Supprimer la page", "ru": "Удалить страницу", "ar": "حذف الصفحة"},
+"編集と選択を切り替え": {"en": "Toggle Edit / Select", "zh_CN": "切换编辑/选择", "ko": "편집/선택 전환", "es": "Alternar edición/selección", "fr": "Basculer édition/sélection", "ru": "Переключить редактирование/выбор", "ar": "تبديل التحرير/التحديد"},
 "編集を終了": {"en": "Exit Editing", "zh_CN": "退出编辑", "ko": "편집 종료", "es": "Salir de la edición", "fr": "Quitter l'édition", "ru": "Выйти из редактирования", "ar": "إنهاء التحرير"},
-"検索終了": {"en": "Close Search", "zh_CN": "关闭搜索", "ko": "검색 닫기", "es": "Cerrar búsqueda", "fr": "Fermer la recherche", "ru": "Закрыть поиск", "ar": "إغلاق البحث"},
+"検索を閉じる": {"en": "Close Search", "zh_CN": "关闭搜索", "ko": "검색 닫기", "es": "Cerrar búsqueda", "fr": "Fermer la recherche", "ru": "Закрыть поиск", "ar": "إغلاق البحث"},
 "テキスト ボックス": {"en": "Text Box", "zh_CN": "文本框", "ko": "텍스트 상자", "es": "Cuadro de texto", "fr": "Zone de texte", "ru": "Текстовое поле", "ar": "مربع نص"},
 "画像を追加": {"en": "Add Image", "zh_CN": "添加图片", "ko": "이미지 추가", "es": "Añadir imagen", "fr": "Ajouter une image", "ru": "Добавить изображение", "ar": "إضافة صورة"},
 "フォント サイズ": {"en": "Font Size", "zh_CN": "字号", "ko": "글꼴 크기", "es": "Tamaño de fuente", "fr": "Taille de police", "ru": "Размер шрифта", "ar": "حجم الخط"},
@@ -1716,20 +1846,20 @@ TRANSLATIONS = {
 "ハイライトの色": {"en": "Highlight Color", "zh_CN": "突出显示颜色", "ko": "강조 표시 색", "es": "Color de resaltado", "fr": "Couleur de surlignage", "ru": "Цвет выделения", "ar": "لون التمييز"},
 "下線の色": {"en": "Underline Color", "zh_CN": "下划线颜色", "ko": "밑줄 색", "es": "Color de subrayado", "fr": "Couleur de soulignement", "ru": "Цвет подчеркивания", "ar": "لون التسطير"},
 "取り消し線の色": {"en": "Strikethrough Color", "zh_CN": "删除线颜色", "ko": "취소선 색", "es": "Color de tachado", "fr": "Couleur du barré", "ru": "Цвет зачеркивания", "ar": "لون الخط الذي يتوسط النص"},
-"図形・手書き色": {"en": "Shape/Ink Color", "zh_CN": "图形/手写颜色", "ko": "도형/손글씨 색", "es": "Color de forma/dibujo", "fr": "Couleur forme/dessin", "ru": "Цвет фигур/рисования", "ar": "لون الأشكال/الرسم"},
+"図形・手書きの色": {"en": "Shape/Ink Color", "zh_CN": "图形/墨迹颜色", "ko": "도형/잉크 색", "es": "Color de forma/entrada de lápiz", "fr": "Couleur forme/encre", "ru": "Цвет фигур/рукописного ввода", "ar": "لون الأشكال/الحبر"},
 "ページ全体": {"en": "Whole Page", "zh_CN": "整页", "ko": "전체 페이지", "es": "Página completa", "fr": "Page entière", "ru": "Вся страница", "ar": "الصفحة كاملة"},
-"ページを複製": {"en": "Duplicate Page", "zh_CN": "复制页面", "ko": "페이지 복제", "es": "Duplicar página", "fr": "Dupliquer la page", "ru": "Дублировать страницу", "ar": "تكرار الصفحة"},"ズーム": {"en": "Zoom", "zh_CN": "缩放", "ko": "확대/축소", "es": "Zoom", "fr": "Zoom", "ru": "Масштаб", "ar": "تكبير/تصغير"},
+"ズーム": {"en": "Zoom", "zh_CN": "缩放", "ko": "확대/축소", "es": "Zoom", "fr": "Zoom", "ru": "Масштаб", "ar": "تكبير/تصغير"},
 "表紙を単独表示": {"en": "Show Cover Page Separately", "zh_CN": "单独显示封面", "ko": "표지 따로 표시", "es": "Portada sola", "fr": "Afficher la couverture séparément", "ru": "Показывать обложку отдельно", "ar": "عرض الغلاف منفردًا"},
 "{key}で確定": {"en": "{key} to finish", "zh_CN": "按 {key} 完成", "ko": "{key}로 확정", "es": "{key} para terminar", "fr": "{key} pour terminer", "ru": "{key} — готово", "ar": "{key} للإنهاء"},
-"クリックで選択、ドラッグで範囲選択": {"en": "Click to select, drag to select a range", "zh_CN": "点击选择，拖动选择范围", "ko": "클릭하여 선택, 드래그하여 범위 선택", "es": "Haz clic para seleccionar o arrastra para seleccionar un rango", "fr": "Cliquer pour sélectionner, glisser pour une plage", "ru": "Щелчок — выбор, перетаскивание — диапазон", "ar": "انقر للتحديد، اسحب لتحديد نطاق"},
-"ページ上をクリックしてテキスト ボックスを追加": {"en": "Click the page to add a text box", "zh_CN": "点击页面添加文本框", "ko": "페이지를 클릭해 텍스트 상자 추가", "es": "Haz clic en la página para añadir un cuadro de texto", "fr": "Cliquez sur la page pour ajouter une zone de texte", "ru": "Щелкните страницу, чтобы добавить текстовое поле", "ar": "انقر على الصفحة لإضافة مربع نص"},
+"クリックで選択、ドラッグで範囲選択": {"en": "Click to select, drag to select a range", "zh_CN": "单击以选择，拖动以选择范围", "ko": "클릭하여 선택, 드래그하여 범위 선택", "es": "Haz clic para seleccionar o arrastra para seleccionar un rango", "fr": "Cliquer pour sélectionner, glisser pour une plage", "ru": "Щелчок — выбор, перетаскивание — диапазон", "ar": "انقر للتحديد، اسحب لتحديد نطاق"},
+"ページをクリックしてテキスト ボックスを追加": {"en": "Click the page to add a text box", "zh_CN": "单击页面以添加文本框", "ko": "페이지를 클릭해 텍스트 상자 추가", "es": "Haz clic en la página para añadir un cuadro de texto", "fr": "Cliquez sur la page pour ajouter une zone de texte", "ru": "Щелкните страницу, чтобы добавить текстовое поле", "ar": "انقر على الصفحة لإضافة مربع نص"},
 "画像を選択中": {"en": "Image selected", "zh_CN": "已选择图片", "ko": "이미지 선택됨", "es": "Imagen seleccionada", "fr": "Image sélectionnée", "ru": "Изображение выбрано", "ar": "تم تحديد صورة"},
 "注釈を選択中": {"en": "Annotation selected", "zh_CN": "已选择注释", "ko": "주석 선택됨", "es": "Anotación seleccionada", "fr": "Annotation sélectionnée", "ru": "Аннотация выбрана", "ar": "تم تحديد تعليق توضيحي"},
 "矢印を選択中": {"en": "Arrow selected", "zh_CN": "已选择箭头", "ko": "화살표 선택됨", "es": "Flecha seleccionada", "fr": "Flèche sélectionnée", "ru": "Стрелка выбрана", "ar": "تم تحديد سهم"},
 "図形を選択中": {"en": "Shape selected", "zh_CN": "已选择图形", "ko": "도형 선택됨", "es": "Forma seleccionada", "fr": "Forme sélectionnée", "ru": "Фигура выбрана", "ar": "تم تحديد شكل"},
-"文字列を選択してください": {"en": "Select some text first", "zh_CN": "请先选择文字", "ko": "먼저 문자열을 선택하세요", "es": "Selecciona texto primero", "fr": "Sélectionnez d'abord du texte", "ru": "Сначала выделите текст", "ar": "حدد نصًا أولاً"},
+"文字列を選択してください": {"en": "Select some text first", "zh_CN": "请先选择文字", "ko": "먼저 텍스트를 선택하세요", "es": "Selecciona texto primero", "fr": "Sélectionnez d'abord du texte", "ru": "Сначала выделите текст", "ar": "حدد نصًا أولاً"},
 "ドラッグ＆ドロップでも開けます": {"en": "You can also drag and drop a PDF here", "zh_CN": "也可以将 PDF 拖放到此处", "ko": "PDF를 여기로 끌어다 놓아도 됩니다", "es": "También puedes arrastrar un PDF aquí", "fr": "Vous pouvez aussi déposer un PDF ici", "ru": "Можно также перетащить PDF сюда", "ar": "يمكنك أيضًا سحب ملف PDF إلى هنا"},
-"外部アプリが起動する可能性があります。\n\n{uri}\n\n開きますか？": {"en": "This may launch another application.\n\n{uri}\n\nOpen it?", "zh_CN": "这可能会启动其他应用。\n\n{uri}\n\n要打开吗？", "ko": "다른 앱이 실행될 수 있습니다.\n\n{uri}\n\n여시겠습니까?", "es": "Esto puede abrir otra aplicación.\n\n{uri}\n\n¿Abrirlo?", "fr": "Cela peut lancer une autre application.\n\n{uri}\n\nL'ouvrir ?", "ru": "Это может запустить другое приложение.\n\n{uri}\n\nОткрыть?", "ar": "قد يؤدي هذا إلى تشغيل تطبيق آخر.\n\n{uri}\n\nهل تريد فتحه؟"},
+"別のアプリが起動することがあります。\n\n{uri}\n\n開きますか？": {"en": "This may open another app.\n\n{uri}\n\nOpen it?", "zh_CN": "这可能会启动其他应用。\n\n{uri}\n\n要打开吗？", "ko": "다른 앱이 실행될 수 있습니다.\n\n{uri}\n\n여시겠습니까?", "es": "Esto puede abrir otra aplicación.\n\n{uri}\n\n¿Abrirlo?", "fr": "Cela peut lancer une autre application.\n\n{uri}\n\nL'ouvrir ?", "ru": "Это может запустить другое приложение.\n\n{uri}\n\nОткрыть?", "ar": "قد يؤدي هذا إلى تشغيل تطبيق آخر.\n\n{uri}\n\nهل تريد فتحه؟"},
 "墨消し": {"en": "Redact", "zh_CN": "标记密文", "ko": "교정", "es": "Censurar", "fr": "Biffer", "ru": "Скрыть данные", "ar": "تنقيح"},
 "墨消しを適用": {"en": "Apply Redactions", "zh_CN": "应用密文", "ko": "교정 적용", "es": "Aplicar censura", "fr": "Appliquer les biffures", "ru": "Применить скрытие", "ar": "تطبيق التنقيح"},
 "サニタイズしたコピーを保存": {"en": "Save Sanitized Copy", "zh_CN": "保存净化副本", "ko": "정리된 사본 저장", "es": "Guardar copia saneada", "fr": "Enregistrer une copie assainie", "ru": "Сохранить очищенную копию", "ar": "حفظ نسخة منقّاة"},
@@ -1737,48 +1867,53 @@ TRANSLATIONS = {
 "保護": {"en": "Protect", "zh_CN": "保护", "ko": "보호", "es": "Proteger", "fr": "Protéger", "ru": "Защита", "ar": "الحماية"},
 "墨消しの範囲を{count}件マークしました。「墨消しを適用」で確定します": {"en": "Marked {count} areas for redaction. Use Apply Redactions to finish.", "zh_CN": "已标记 {count} 处密文，请使用“应用密文”完成。", "ko": "교정 영역 {count}개를 표시했습니다. ‘교정 적용’으로 확정하세요.", "es": "Se marcaron {count} áreas para censurar. Usa Aplicar censura para terminar.", "fr": "{count} zones marquées pour la biffure. Utilisez Appliquer les biffures pour terminer.", "ru": "Отмечено областей: {count}. Завершите командой «Применить скрытие».", "ar": "تم تحديد {count} منطقة للتنقيح. استخدم «تطبيق التنقيح» للإنهاء."},
 "適用する墨消しがありません": {"en": "No redactions to apply", "zh_CN": "没有可应用的密文", "ko": "적용할 교정이 없습니다", "es": "No hay censuras que aplicar", "fr": "Aucune biffure à appliquer", "ru": "Нет областей для скрытия", "ar": "لا توجد تنقيحات للتطبيق"},
-"{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄は完全に削除され、元に戻せません。\n\n実行しますか？": {"en": "Apply {count} redactions? The text and images underneath, and any comments or form fields overlapping them, are removed permanently.\n\nContinue?", "zh_CN": "将应用 {count} 处密文。其中的文字和图片，以及与之重叠的注释和表单字段，都会被永久删除，无法恢复。\n\n要继续吗？", "ko": "교정 {count}개를 적용합니다. 해당 문자와 이미지, 그리고 영역에 걸친 주석과 양식 필드는 완전히 삭제되어 되돌릴 수 없습니다.\n\n계속할까요?", "es": "¿Aplicar {count} censuras? El texto y las imágenes que cubren, y los comentarios o campos de formulario que las solapan, se eliminan de forma permanente.\n\n¿Continuar?", "fr": "Appliquer {count} biffures ? Le texte et les images masqués, ainsi que les commentaires et champs de formulaire qui les chevauchent, seront supprimés définitivement.\n\nContinuer ?", "ru": "Применить скрытие к областям ({count})? Текст и изображения под ними, а также перекрывающие их комментарии и поля форм будут удалены безвозвратно.\n\nПродолжить?", "ar": "تطبيق {count} تنقيح؟ سيُحذف النص والصور والتعليقات وحقول النماذج المتداخلة معها نهائيًا.\n\nهل تريد المتابعة؟"},
+"{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": {"en": "Apply {count} redactions? The text and images underneath, and any comments or form fields that overlap them, will be removed. They won't be in the saved PDF and can't be recovered from it. You can undo this while it's still in the edit history.\n\nContinue?", "zh_CN": "将应用 {count} 处密文。密文区域内的文字和图片，以及与之重叠的注释和表单字段将被删除。保存的 PDF 中不会保留这些内容，也无法从中恢复。只要此操作仍在编辑历史中，就可以用“撤消”取消。\n\n要继续吗？", "ko": "교정 {count}개를 적용합니다. 영역 안의 텍스트와 이미지, 그리고 영역에 걸친 주석과 양식 필드가 삭제됩니다. 저장한 PDF에는 남지 않으며 그 파일에서 되찾을 수 없습니다. 편집 기록에 남아 있는 동안에는 [실행 취소]로 되돌릴 수 있습니다.\n\n계속할까요?", "es": "¿Aplicar {count} censuras? Se eliminarán el texto y las imágenes que cubren, y los comentarios o campos de formulario que se superpongan. No quedarán en el PDF guardado ni podrán recuperarse de él. Puedes deshacerlo mientras siga en el historial de edición.\n\n¿Continuar?", "fr": "Appliquer {count} biffures ? Le texte et les images masqués, ainsi que les commentaires et champs de formulaire qui les chevauchent, seront supprimés. Ils ne figureront pas dans le PDF enregistré et ne pourront pas en être récupérés. Vous pouvez annuler l'opération tant qu'elle reste dans l'historique des modifications.\n\nContinuer ?", "ru": "Применить скрытие к областям ({count})? Текст и изображения под ними, а также перекрывающие их комментарии и поля форм будут удалены. В сохраненном PDF их не будет, и восстановить их из него нельзя. Пока этот шаг остается в журнале правок, его можно отменить командой «Отменить».\n\nПродолжить?", "ar": "هل تريد تطبيق {count} تنقيح؟ سيُحذف النص والصور الموجودة تحتها، والتعليقات وحقول النماذج المتداخلة معها. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير.\n\nهل تريد المتابعة؟"},
 "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": {"en": "{count} files with the same names already exist. Replace them?\n\n{names}", "zh_CN": "已存在 {count} 个同名文件。要替换吗？\n\n{names}", "ko": "같은 이름의 파일이 {count}개 있습니다. 바꾸시겠습니까?\n\n{names}", "es": "Ya existen {count} archivos con el mismo nombre. ¿Quieres reemplazarlos?\n\n{names}", "fr": "{count} fichiers portant le même nom existent déjà. Voulez-vous les remplacer ?\n\n{names}", "ru": "Файлы с такими же именами уже существуют ({count}). Заменить их?\n\n{names}", "ar": "يوجد {count} ملفًا بالأسماء نفسها. هل تريد استبدالها؟\n\n{names}"},
 "{count}件の墨消しを適用しました": {"en": "Applied {count} redactions", "zh_CN": "已应用 {count} 处密文", "ko": "교정 {count}개를 적용했습니다", "es": "Se aplicaron {count} censuras", "fr": "{count} biffures appliquées", "ru": "Скрыто областей: {count}", "ar": "تم تطبيق {count} تنقيح"},
-"墨消しを適用できませんでした。\n\n{error}": {"en": "Could not apply the redactions.\n\n{error}", "zh_CN": "无法应用密文。\n\n{error}", "ko": "교정을 적용할 수 없습니다.\n\n{error}", "es": "No se pudo aplicar la censura.\n\n{error}", "fr": "Impossible d'appliquer les biffures.\n\n{error}", "ru": "Не удалось применить скрытие.\n\n{error}", "ar": "تعذّر تطبيق التنقيح.\n\n{error}"},
-"サニタイズできませんでした。\n\n{error}": {"en": "Could not sanitize the document.\n\n{error}", "zh_CN": "无法净化文档。\n\n{error}", "ko": "문서를 정리할 수 없습니다.\n\n{error}", "es": "No se pudo sanear el documento.\n\n{error}", "fr": "Impossible d'assainir le document.\n\n{error}", "ru": "Не удалось очистить документ.\n\n{error}", "ar": "تعذّرت تنقية المستند.\n\n{error}"},
+"墨消しを適用できませんでした。\n\n{error}": {"en": "Couldn't apply the redactions.\n\n{error}", "zh_CN": "无法应用密文。\n\n{error}", "ko": "교정을 적용할 수 없습니다.\n\n{error}", "es": "No se pudo aplicar la censura.\n\n{error}", "fr": "Impossible d'appliquer les biffures.\n\n{error}", "ru": "Не удалось применить скрытие.\n\n{error}", "ar": "تعذّر تطبيق التنقيح.\n\n{error}"},
+"サニタイズできませんでした。\n\n{error}": {"en": "Couldn't sanitize the document.\n\n{error}", "zh_CN": "无法净化文档。\n\n{error}", "ko": "문서를 정리할 수 없습니다.\n\n{error}", "es": "No se pudo sanear el documento.\n\n{error}", "fr": "Impossible d'assainir le document.\n\n{error}", "ru": "Не удалось очистить документ.\n\n{error}", "ar": "تعذّرت تنقية المستند.\n\n{error}"},
 "サニタイズしたPDFを保存しました: {path}": {"en": "Saved sanitized PDF: {path}", "zh_CN": "已保存净化后的 PDF：{path}", "ko": "정리된 PDF를 저장했습니다: {path}", "es": "PDF saneado guardado: {path}", "fr": "PDF assaini enregistré : {path}", "ru": "Очищенный PDF сохранен: {path}", "ar": "تم حفظ ملف PDF المنقّى: {path}"},
-"この文字列を検索": {"en": "Search for This Text", "zh_CN": "搜索此文字", "ko": "이 문자열 검색", "es": "Buscar este texto", "fr": "Rechercher ce texte", "ru": "Найти этот текст", "ar": "البحث عن هذا النص"},
+"この文字列を検索": {"en": "Search for This Text", "zh_CN": "搜索此文字", "ko": "이 텍스트 검색", "es": "Buscar este texto", "fr": "Rechercher ce texte", "ru": "Найти этот текст", "ar": "البحث عن هذا النص"},
 "挿入": {"en": "Insert", "zh_CN": "插入", "ko": "삽입", "es": "Insertar", "fr": "Insérer", "ru": "Вставка", "ar": "إدراج"},
 "ページのテキストをコピー": {"en": "Copy Page Text", "zh_CN": "复制页面文字", "ko": "페이지 텍스트 복사", "es": "Copiar texto de la página", "fr": "Copier le texte de la page", "ru": "Копировать текст страницы", "ar": "نسخ نص الصفحة"},
 "OCR": {"en": "OCR", "zh_CN": "OCR", "ko": "OCR", "es": "OCR", "fr": "OCR", "ru": "OCR", "ar": "OCR"},
 "このページをOCR": {"en": "OCR This Page", "zh_CN": "对此页执行 OCR", "ko": "이 페이지 OCR", "es": "OCR de esta página", "fr": "OCR de cette page", "ru": "OCR этой страницы", "ar": "تعرّف ضوئي لهذه الصفحة"},
 "文書全体をOCR": {"en": "OCR Whole Document", "zh_CN": "对整个文档执行 OCR", "ko": "문서 전체 OCR", "es": "OCR de todo el documento", "fr": "OCR de tout le document", "ru": "OCR всего документа", "ar": "تعرّف ضوئي للمستند كله"},
-"OCRの言語データがありません。{folder} に言語データ (.traineddata) を置くか、Tesseract OCRをインストールしてください。": {"en": "OCR language data was not found. Put the language data (.traineddata) in {folder}, or install Tesseract OCR.", "zh_CN": "找不到 OCR 语言数据。请将语言数据 (.traineddata) 放入 {folder}，或安装 Tesseract OCR。", "ko": "OCR 언어 데이터가 없습니다. 언어 데이터(.traineddata)를 {folder}에 넣거나 Tesseract OCR을 설치하세요.", "es": "No se encontraron datos de idioma para OCR. Coloca los datos de idioma (.traineddata) en {folder} o instala Tesseract OCR.", "fr": "Données de langue OCR introuvables. Placez les données de langue (.traineddata) dans {folder} ou installez Tesseract OCR.", "ru": "Языковые данные OCR не найдены. Поместите языковые данные (.traineddata) в {folder} или установите Tesseract OCR.", "ar": "لم يتم العثور على بيانات اللغة للتعرّف الضوئي. ضع بيانات اللغة (.traineddata) في {folder} أو ثبّت Tesseract OCR."},
+"OCRの言語データがありません。{folder} に言語データ (.traineddata) を置くか、Tesseract OCRをインストールしてください。": {"en": "OCR language data wasn't found. Put the language data (.traineddata) in {folder}, or install Tesseract OCR.", "zh_CN": "找不到 OCR 语言数据。请将语言数据 (.traineddata) 放入 {folder}，或安装 Tesseract OCR。", "ko": "OCR 언어 데이터가 없습니다. 언어 데이터(.traineddata)를 {folder}에 넣거나 Tesseract OCR을 설치하세요.", "es": "No se encontraron datos de idioma para OCR. Coloca los datos de idioma (.traineddata) en {folder} o instala Tesseract OCR.", "fr": "Données de langue OCR introuvables. Placez les données de langue (.traineddata) dans {folder} ou installez Tesseract OCR.", "ru": "Языковые данные OCR не найдены. Поместите языковые данные (.traineddata) в {folder} или установите Tesseract OCR.", "ar": "لم يتم العثور على بيانات اللغة للتعرّف الضوئي. ضع بيانات اللغة (.traineddata) في {folder} أو ثبّت Tesseract OCR."},
+"OCRの言語データ": {"en": "OCR Language Data", "zh_CN": "OCR 语言数据", "ko": "OCR 언어 데이터", "es": "Datos de idioma para OCR", "fr": "Données de langue OCR", "ru": "Языковые данные OCR", "ar": "بيانات اللغة للتعرّف الضوئي"},
+"OCRには言語データが必要です。次の言語データをダウンロードしますか？\n\n{languages}（約 {size} MB）\n\nダウンロード元: GitHub（Tesseract OCR プロジェクト）。接続するのは、このダウンロードのときだけです。": {"en": "OCR needs language data. Download the following?\n\n{languages} (about {size} MB)\n\nFrom GitHub (the Tesseract OCR project). pdfNote connects only for this download.", "zh_CN": "OCR 需要语言数据。是否下载以下语言数据？\n\n{languages}（约 {size} MB）\n\n下载来源：GitHub（Tesseract OCR 项目）。仅在本次下载时联网。", "ko": "OCR에는 언어 데이터가 필요합니다. 다음 언어 데이터를 다운로드하시겠습니까?\n\n{languages}(약 {size}MB)\n\n다운로드 위치: GitHub(Tesseract OCR 프로젝트). 인터넷에는 이 다운로드 때만 연결합니다.", "es": "El OCR necesita datos de idioma. ¿Quieres descargar estos?\n\n{languages} (unos {size} MB)\n\nDesde GitHub (proyecto Tesseract OCR). Solo se conecta para esta descarga.", "fr": "L'OCR a besoin de données de langue. Voulez-vous télécharger les suivantes ?\n\n{languages} (environ {size} Mo)\n\nSource : GitHub (projet Tesseract OCR). La connexion n'a lieu que pour ce téléchargement.", "ru": "Для OCR нужны языковые данные. Скачать их?\n\n{languages} (около {size} МБ)\n\nИсточник: GitHub (проект Tesseract OCR). Подключение к интернету — только для этой загрузки.", "ar": "يحتاج التعرّف الضوئي إلى بيانات اللغة. هل تريد تنزيل البيانات التالية؟\n\n{languages} (نحو {size} ميغابايت)\n\nالمصدر: GitHub (مشروع Tesseract OCR). لا يتم الاتصال إلا لهذا التنزيل."},
+"OCRの言語データをダウンロードしています… ({done} / {total} MB)": {"en": "Downloading OCR language data… ({done} of {total} MB)", "zh_CN": "正在下载 OCR 语言数据…（{done} / {total} MB）", "ko": "OCR 언어 데이터를 다운로드하는 중…({done}/{total}MB)", "es": "Descargando datos de idioma para OCR… ({done} de {total} MB)", "fr": "Téléchargement des données de langue OCR… ({done} sur {total} Mo)", "ru": "Загрузка языковых данных OCR… ({done} из {total} МБ)", "ar": "جارٍ تنزيل بيانات اللغة للتعرّف الضوئي… ({done} من {total} ميغابايت)"},
+"ダウンロードを中止しました": {"en": "Download canceled", "zh_CN": "已取消下载", "ko": "다운로드를 취소했습니다", "es": "Descarga cancelada", "fr": "Téléchargement annulé", "ru": "Загрузка отменена", "ar": "تم إلغاء التنزيل"},
+"ダウンロードしたデータが壊れています。もう一度お試しください。": {"en": "The downloaded data is damaged. Please try again.", "zh_CN": "下载的数据已损坏。请重试。", "ko": "다운로드한 데이터가 손상되었습니다. 다시 시도하세요.", "es": "Los datos descargados están dañados. Vuelve a intentarlo.", "fr": "Les données téléchargées sont endommagées. Veuillez réessayer.", "ru": "Загруженные данные повреждены. Повторите попытку.", "ar": "البيانات التي تم تنزيلها تالفة. يُرجى المحاولة مرة أخرى."},
+"OCRの言語データをダウンロードできませんでした。\n\n{error}": {"en": "Couldn't download the OCR language data.\n\n{error}", "zh_CN": "无法下载 OCR 语言数据。\n\n{error}", "ko": "OCR 언어 데이터를 다운로드할 수 없습니다.\n\n{error}", "es": "No se pudieron descargar los datos de idioma para OCR.\n\n{error}", "fr": "Impossible de télécharger les données de langue OCR.\n\n{error}", "ru": "Не удалось скачать языковые данные OCR.\n\n{error}", "ar": "تعذّر تنزيل بيانات اللغة للتعرّف الضوئي.\n\n{error}"},
+"OCRの言語データをダウンロードしました": {"en": "OCR language data downloaded", "zh_CN": "已下载 OCR 语言数据", "ko": "OCR 언어 데이터를 다운로드했습니다", "es": "Datos de idioma para OCR descargados", "fr": "Données de langue OCR téléchargées", "ru": "Языковые данные OCR загружены", "ar": "تم تنزيل بيانات اللغة للتعرّف الضوئي"},
 "言語データのフォルダーを開く": {"en": "Open Language Data Folder", "zh_CN": "打开语言数据文件夹", "ko": "언어 데이터 폴더 열기", "es": "Abrir carpeta de datos de idioma", "fr": "Ouvrir le dossier des données de langue", "ru": "Открыть папку языковых данных", "ar": "فتح مجلد بيانات اللغة"},
-"フォルダーを開けませんでした: {folder}": {"en": "Could not open the folder: {folder}", "zh_CN": "无法打开文件夹: {folder}", "ko": "폴더를 열 수 없습니다: {folder}", "es": "No se pudo abrir la carpeta: {folder}", "fr": "Impossible d'ouvrir le dossier : {folder}", "ru": "Не удалось открыть папку: {folder}", "ar": "تعذّر فتح المجلد: {folder}"},
+"フォルダーを開けませんでした: {folder}": {"en": "Couldn't open the folder: {folder}", "zh_CN": "无法打开文件夹: {folder}", "ko": "폴더를 열 수 없습니다: {folder}", "es": "No se pudo abrir la carpeta: {folder}", "fr": "Impossible d'ouvrir le dossier : {folder}", "ru": "Не удалось открыть папку: {folder}", "ar": "تعذّر فتح المجلد: {folder}"},
 "OCR中… ({done}/{total})": {"en": "Running OCR… ({done}/{total})", "zh_CN": "正在执行 OCR…（{done}/{total}）", "ko": "OCR 진행 중… ({done}/{total})", "es": "Ejecutando OCR… ({done}/{total})", "fr": "OCR en cours… ({done}/{total})", "ru": "Выполняется OCR… ({done}/{total})", "ar": "جارٍ التعرّف الضوئي… ({done}/{total})"},
 "OCRが完了しました ({count}ページ)": {"en": "OCR finished ({count} pages)", "zh_CN": "OCR 已完成（{count} 页）", "ko": "OCR을 마쳤습니다 ({count}페이지)", "es": "OCR terminado ({count} páginas)", "fr": "OCR terminé ({count} pages)", "ru": "OCR завершен ({count} стр.)", "ar": "انتهى التعرّف الضوئي ({count} صفحة)"},
 "OCRを中止しました": {"en": "OCR canceled", "zh_CN": "已取消 OCR", "ko": "OCR을 취소했습니다", "es": "OCR cancelado", "fr": "OCR annulé", "ru": "OCR отменен", "ar": "تم إلغاء التعرّف الضوئي"},
 "OCRを中止": {"en": "Cancel OCR", "zh_CN": "取消 OCR", "ko": "OCR 취소", "es": "Cancelar OCR", "fr": "Annuler l'OCR", "ru": "Отменить OCR", "ar": "إلغاء التعرّف الضوئي"},
-"フォーム": {"en": "Form", "zh_CN": "表单", "ko": "양식", "es": "Formulario", "fr": "Formulaire", "ru": "Форма", "ar": "نموذج"},
 "フォーム入力": {"en": "Fill Form Fields", "zh_CN": "填写表单", "ko": "양식 채우기", "es": "Rellenar formulario", "fr": "Remplir le formulaire", "ru": "Заполнить форму", "ar": "تعبئة النموذج"},
 "このPDFにはフォームがありません": {"en": "This PDF has no form fields", "zh_CN": "此 PDF 没有表单字段", "ko": "이 PDF에는 양식 필드가 없습니다", "es": "Este PDF no tiene campos de formulario", "fr": "Ce PDF ne contient pas de champs de formulaire", "ru": "В этом PDF нет полей формы", "ar": "لا يحتوي هذا الملف على حقول نموذج"},
 "フォームを更新しました": {"en": "Form field updated", "zh_CN": "已更新表单字段", "ko": "양식 필드를 업데이트했습니다", "es": "Campo de formulario actualizado", "fr": "Champ de formulaire mis à jour", "ru": "Поле формы обновлено", "ar": "تم تحديث حقل النموذج"},
-"フォームを編集できませんでした。\n\n{error}": {"en": "Could not edit the form field.\n\n{error}", "zh_CN": "无法编辑表单字段。\n\n{error}", "ko": "양식 필드를 편집할 수 없습니다.\n\n{error}", "es": "No se pudo editar el campo.\n\n{error}", "fr": "Impossible de modifier le champ.\n\n{error}", "ru": "Не удалось изменить поле формы.\n\n{error}", "ar": "تعذّر تحرير حقل النموذج.\n\n{error}"},
-"値": {"en": "Value", "zh_CN": "值", "ko": "값", "es": "Valor", "fr": "Valeur", "ru": "Значение", "ar": "القيمة"},
+"フォームを編集できませんでした。\n\n{error}": {"en": "Couldn't edit the form field.\n\n{error}", "zh_CN": "无法编辑表单字段。\n\n{error}", "ko": "양식 필드를 편집할 수 없습니다.\n\n{error}", "es": "No se pudo editar el campo.\n\n{error}", "fr": "Impossible de modifier le champ.\n\n{error}", "ru": "Не удалось изменить поле формы.\n\n{error}", "ar": "تعذّر تحرير حقل النموذج.\n\n{error}"},
 "表示": {"en": "View", "zh_CN": "视图", "ko": "보기", "es": "Ver", "fr": "Affichage", "ru": "Вид", "ar": "عرض"},
-"OCRを実行できませんでした。\n\n{error}": {"en": "Could not run OCR.\n\n{error}", "zh_CN": "无法执行 OCR。\n\n{error}", "ko": "OCR을 실행할 수 없습니다.\n\n{error}", "es": "No se pudo ejecutar el OCR.\n\n{error}", "fr": "Impossible d'exécuter l'OCR.\n\n{error}", "ru": "Не удалось выполнить OCR.\n\n{error}", "ar": "تعذّر تشغيل التعرّف الضوئي.\n\n{error}"},
+"OCRを実行できませんでした。\n\n{error}": {"en": "Couldn't run OCR.\n\n{error}", "zh_CN": "无法执行 OCR。\n\n{error}", "ko": "OCR을 실행할 수 없습니다.\n\n{error}", "es": "No se pudo ejecutar el OCR.\n\n{error}", "fr": "Impossible d'exécuter l'OCR.\n\n{error}", "ru": "Не удалось выполнить OCR.\n\n{error}", "ar": "تعذّر تشغيل التعرّف الضوئي.\n\n{error}"},
 "認識できる文字がありませんでした": {"en": "No text could be recognized", "zh_CN": "未识别到文字", "ko": "인식할 수 있는 문자가 없습니다", "es": "No se reconoció ningún texto", "fr": "Aucun texte reconnu", "ru": "Текст не распознан", "ar": "لم يتم التعرّف على أي نص"},
 "OCRが必要なページはありません": {"en": "No pages need OCR", "zh_CN": "没有需要 OCR 的页面", "ko": "OCR이 필요한 페이지가 없습니다", "es": "Ninguna página necesita OCR", "fr": "Aucune page ne nécessite l'OCR", "ru": "Нет страниц, требующих OCR", "ar": "لا توجد صفحات تحتاج إلى تعرّف ضوئي"},
-"墨消しが{count}件マークされています。適用すると完全に削除されます": {"en": "{count} areas marked for redaction. Applying removes them permanently", "zh_CN": "已标记 {count} 处密文，应用后将被永久删除", "ko": "교정 {count}개가 표시되어 있습니다. 적용하면 완전히 삭제됩니다", "es": "{count} áreas marcadas para censurar. Al aplicar se eliminan de forma permanente", "fr": "{count} zones marquées pour la biffure. L'application les supprime définitivement", "ru": "Отмечено областей для скрытия: {count}. Применение удалит их безвозвратно", "ar": "تم تحديد {count} منطقة للتنقيح. التطبيق يحذفها نهائيًا"},
+"墨消しが{count}件マークされています。適用すると完全に削除されます": {"en": "{count} areas marked for redaction. Applying removes them permanently", "zh_CN": "已标记 {count} 处密文，应用后将被永久删除", "ko": "교정 {count}개가 표시되어 있습니다. 적용하면 완전히 삭제됩니다", "es": "{count} áreas marcadas para censurar. Al aplicar se eliminan de forma permanente", "fr": "{count} zones marquées pour la biffure. Une fois appliquée, la biffure est définitive", "ru": "Отмечено областей для скрытия: {count}. Применение удалит их безвозвратно", "ar": "تم تحديد {count} منطقة للتنقيح. وعند تطبيقها تُحذف نهائيًا"},
 "適用": {"en": "Apply", "zh_CN": "应用", "ko": "적용", "es": "Aplicar", "fr": "Appliquer", "ru": "Применить", "ar": "تطبيق"},
 "マークを削除": {"en": "Remove marks", "zh_CN": "删除标记", "ko": "표시 삭제", "es": "Quitar marcas", "fr": "Retirer les marques", "ru": "Убрать метки", "ar": "إزالة العلامات"},
 "墨消しのマークを削除しました": {"en": "Redaction marks removed", "zh_CN": "已删除密文标记", "ko": "교정 표시를 삭제했습니다", "es": "Marcas de censura eliminadas", "fr": "Marques de biffure retirées", "ru": "Метки скрытия убраны", "ar": "تمت إزالة علامات التنقيح"},
 "入力できるフォームがあります": {"en": "This PDF has form fields you can fill in", "zh_CN": "此 PDF 含有可填写的表单", "ko": "입력할 수 있는 양식이 있습니다", "es": "Este PDF tiene campos que puedes rellenar", "fr": "Ce PDF contient des champs à remplir", "ru": "В этом PDF есть поля для заполнения", "ar": "يحتوي هذا الملف على حقول يمكن تعبئتها"},
 "最初の欄へ": {"en": "Go to first field", "zh_CN": "转到第一个字段", "ko": "첫 번째 항목으로", "es": "Ir al primer campo", "fr": "Aller au premier champ", "ru": "К первому полю", "ar": "إلى الحقل الأول"},
-"このページには文字データがありません。OCRで検索・コピーできるようになります": {"en": "This page has no text. OCR makes it searchable and copyable", "zh_CN": "此页没有文字。OCR 之后即可搜索和复制", "ko": "이 페이지에는 문자 데이터가 없습니다. OCR을 하면 검색·복사할 수 있습니다", "es": "Esta página no tiene texto. El OCR permite buscarlo y copiarlo", "fr": "Cette page n'a pas de texte. L'OCR la rend consultable et copiable", "ru": "На этой странице нет текста. OCR сделает его доступным для поиска и копирования", "ar": "لا يوجد نص في هذه الصفحة. التعرّف الضوئي يجعلها قابلة للبحث والنسخ"},
+"このページにはテキストがありません。OCRを実行すると、検索やコピーができるようになります": {"en": "This page has no text. OCR makes it searchable and copyable", "zh_CN": "此页没有文字。OCR 之后即可搜索和复制", "ko": "이 페이지에는 텍스트가 없습니다. OCR을 실행하면 검색하고 복사할 수 있습니다", "es": "Esta página no tiene texto. Ejecuta el OCR para poder buscar y copiar su texto", "fr": "Cette page ne contient pas de texte. Lancez l'OCR pour pouvoir y rechercher et copier du texte", "ru": "На этой странице нет текста. Выполните OCR, чтобы в ней можно было искать и копировать текст", "ar": "لا يوجد نص في هذه الصفحة. التعرّف الضوئي يجعلها قابلة للبحث والنسخ"},
 "OCRを実行": {"en": "Run OCR", "zh_CN": "执行 OCR", "ko": "OCR 실행", "es": "Ejecutar OCR", "fr": "Lancer l'OCR", "ru": "Запустить OCR", "ar": "تشغيل التعرّف الضوئي"},
-"このページは画像だけです。OCRには言語データが必要です": {"en": "This page is an image only. OCR needs language data", "zh_CN": "此页仅为图像。OCR 需要语言数据", "ko": "이 페이지는 이미지뿐입니다. OCR에는 언어 데이터가 필요합니다", "es": "Esta página es solo imagen. El OCR requiere datos de idioma", "fr": "Cette page n'est qu'une image. L'OCR nécessite des données de langue", "ru": "Эта страница — только изображение. Для OCR нужны языковые данные", "ar": "هذه الصفحة صورة فقط. يتطلب التعرّف الضوئي بيانات اللغة"},
 "すべて選択": {"en": "Select All", "zh_CN": "全选", "ko": "모두 선택", "es": "Seleccionar todo", "fr": "Sélectionner tout", "ru": "Выделить все", "ar": "تحديد الكل"},
 "このタブを閉じる": {"en": "Close Tab", "zh_CN": "关闭标签页", "ko": "이 탭 닫기", "es": "Cerrar pestaña", "fr": "Fermer l'onglet", "ru": "Закрыть вкладку", "ar": "إغلاق علامة التبويب"},
 "他のタブを閉じる": {"en": "Close Other Tabs", "zh_CN": "关闭其他标签页", "ko": "다른 탭 닫기", "es": "Cerrar las demás pestañas", "fr": "Fermer les autres onglets", "ru": "Закрыть другие вкладки", "ar": "إغلاق علامات التبويب الأخرى"},
 "右側のタブを閉じる": {"en": "Close Tabs to the Right", "zh_CN": "关闭右侧标签页", "ko": "오른쪽 탭 닫기", "es": "Cerrar pestañas de la derecha", "fr": "Fermer les onglets à droite", "ru": "Закрыть вкладки справа", "ar": "إغلاق علامات التبويب على اليمين"},
+"新しいウィンドウに移動": {"en": "Move Tab to New Window", "zh_CN": "将标签页移至新窗口", "ko": "탭을 새 창으로 이동", "es": "Mover pestaña a una ventana nueva", "fr": "Déplacer l'onglet vers une nouvelle fenêtre", "ru": "Переместить вкладку в новое окно", "ar": "نقل علامة التبويب إلى نافذة جديدة"},
 "このページへ移動": {"en": "Go to This Page", "zh_CN": "转到此页", "ko": "이 페이지로 이동", "es": "Ir a esta página", "fr": "Aller à cette page", "ru": "Перейти к этой странице", "ar": "الانتقال إلى هذه الصفحة"},
 "ツール": {"en": "Tools", "zh_CN": "工具", "ko": "도구", "es": "Herramientas", "fr": "Outils", "ru": "Инструменты", "ar": "أدوات"},
 "切り替え": {"en": "Toggle", "zh_CN": "切换", "ko": "전환", "es": "Alternar", "fr": "Basculer", "ru": "Переключить", "ar": "تبديل"},
@@ -1802,7 +1937,7 @@ TRANSLATIONS = {
 "画像として保存": {"en": "Save as Picture", "zh_CN": "另存为图片", "ko": "그림으로 저장", "es": "Guardar como imagen", "fr": "Enregistrer en tant qu'image", "ru": "Сохранить как рисунок", "ar": "حفظ كصورة"},
 "画像として保存...": {"en": "Save as Picture...", "zh_CN": "另存为图片...", "ko": "그림으로 저장...", "es": "Guardar como imagen...", "fr": "Enregistrer en tant qu'image...", "ru": "Сохранить как рисунок...", "ar": "حفظ كصورة..."},
 "テキストの編集": {"en": "Edit Text", "zh_CN": "编辑文字", "ko": "텍스트 편집", "es": "Editar texto", "fr": "Modifier le texte", "ru": "Изменить текст", "ar": "تحرير النص"},
-"ここに付箋を追加": {"en": "Add Sticky Note Here", "zh_CN": "在此处添加便笺", "ko": "여기에 메모 추가", "es": "Añadir nota adhesiva aquí", "fr": "Ajouter une note ici", "ru": "Добавить заметку здесь", "ar": "إضافة ملاحظة ملصقة هنا"},
+"ここに付箋を追加": {"en": "Add Sticky Note Here", "zh_CN": "在此处添加便笺", "ko": "여기에 스티커 메모 추가", "es": "Añadir nota adhesiva aquí", "fr": "Ajouter un pense-bête ici", "ru": "Добавить записку здесь", "ar": "إضافة ملاحظة ملصقة هنا"},
 "線の太さ": {"en": "Outline Weight", "zh_CN": "线条粗细", "ko": "선 두께", "es": "Grosor del contorno", "fr": "Épaisseur du trait", "ru": "Толщина линии", "ar": "سمك الخط"},
 "細い": {"en": "Thin", "zh_CN": "细", "ko": "가늘게", "es": "Fino", "fr": "Fin", "ru": "Тонкая", "ar": "رفيع"},
 "標準": {"en": "Normal", "zh_CN": "标准", "ko": "보통", "es": "Normal", "fr": "Normal", "ru": "Обычная", "ar": "عادي"},
@@ -1810,18 +1945,18 @@ TRANSLATIONS = {
 "極太": {"en": "Extra Thick", "zh_CN": "特粗", "ko": "매우 굵게", "es": "Muy grueso", "fr": "Très épais", "ru": "Очень толстая", "ar": "سميك جدًا"},
 "画像 (*.png *.jpg *.jpeg)": {"en": "Images (*.png *.jpg *.jpeg)", "zh_CN": "图片 (*.png *.jpg *.jpeg)", "ko": "이미지 (*.png *.jpg *.jpeg)", "es": "Imágenes (*.png *.jpg *.jpeg)", "fr": "Images (*.png *.jpg *.jpeg)", "ru": "Изображения (*.png *.jpg *.jpeg)", "ar": "صور (*.png *.jpg *.jpeg)"},
 "画像を保存しました: {path}": {"en": "Image saved: {path}", "zh_CN": "已保存图片：{path}", "ko": "이미지를 저장했습니다: {path}", "es": "Imagen guardada: {path}", "fr": "Image enregistrée : {path}", "ru": "Изображение сохранено: {path}", "ar": "تم حفظ الصورة: {path}"},
-"画像を保存できませんでした。\n\n{error}": {"en": "Could not save the image.\n\n{error}", "zh_CN": "无法保存图片。\n\n{error}", "ko": "이미지를 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar la imagen.\n\n{error}", "fr": "Impossible d'enregistrer l'image.\n\n{error}", "ru": "Не удалось сохранить изображение.\n\n{error}", "ar": "تعذّر حفظ الصورة.\n\n{error}"},
-"注釈を削除できませんでした": {"en": "Could not delete the annotation", "zh_CN": "无法删除注释", "ko": "주석을 삭제할 수 없습니다", "es": "No se pudo eliminar la anotación", "fr": "Impossible de supprimer l'annotation", "ru": "Не удалось удалить аннотацию", "ar": "تعذّر حذف التعليق التوضيحي"},
+"画像を保存できませんでした。\n\n{error}": {"en": "Couldn't save the image.\n\n{error}", "zh_CN": "无法保存图片。\n\n{error}", "ko": "이미지를 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar la imagen.\n\n{error}", "fr": "Impossible d'enregistrer l'image.\n\n{error}", "ru": "Не удалось сохранить изображение.\n\n{error}", "ar": "تعذّر حفظ الصورة.\n\n{error}"},
+"注釈を削除できませんでした": {"en": "Couldn't delete the annotation", "zh_CN": "无法删除注释", "ko": "주석을 삭제할 수 없습니다", "es": "No se pudo eliminar la anotación", "fr": "Impossible de supprimer l'annotation", "ru": "Не удалось удалить аннотацию", "ar": "تعذّر حذف التعليق التوضيحي"},
 "{done}/{total}個の注釈を削除しました（一部失敗）": {"en": "Deleted {done} of {total} annotations (some failed)", "zh_CN": "已删除 {total} 个注释中的 {done} 个（部分失败）", "ko": "주석 {total}개 중 {done}개를 삭제했습니다(일부 실패)", "es": "Anotaciones eliminadas: {done} de {total} (algunas fallaron)", "fr": "Annotations supprimées : {done} sur {total} (certaines ont échoué)", "ru": "Удалено {done} из {total} аннотаций (часть не удалась)", "ar": "تم حذف {done} من أصل {total} من التعليقات التوضيحية (فشل بعضها)"},
-"注釈を変更できませんでした": {"en": "Could not change the annotation", "zh_CN": "无法修改注释", "ko": "주석을 변경할 수 없습니다", "es": "No se pudo cambiar la anotación", "fr": "Impossible de modifier l'annotation", "ru": "Не удалось изменить аннотацию", "ar": "تعذّر تغيير التعليق التوضيحي"},
+"注釈を変更できませんでした": {"en": "Couldn't change the annotation", "zh_CN": "无法修改注释", "ko": "주석을 변경할 수 없습니다", "es": "No se pudo cambiar la anotación", "fr": "Impossible de modifier l'annotation", "ru": "Не удалось изменить аннотацию", "ar": "تعذّر تغيير التعليق التوضيحي"},
 "上余白": {"en": "Top", "zh_CN": "上", "ko": "위쪽", "es": "Superior", "fr": "Haut", "ru": "Верхнее", "ar": "أعلى"},
 "下余白": {"en": "Bottom", "zh_CN": "下", "ko": "아래쪽", "es": "Inferior", "fr": "Bas", "ru": "Нижнее", "ar": "أسفل"},
 "左余白": {"en": "Left", "zh_CN": "左", "ko": "왼쪽", "es": "Izquierdo", "fr": "Gauche", "ru": "Левое", "ar": "يسار"},
 "右余白": {"en": "Right", "zh_CN": "右", "ko": "오른쪽", "es": "Derecho", "fr": "Droite", "ru": "Правое", "ar": "يمين"},
 "範囲を指定": {"en": "Custom range", "zh_CN": "自定义范围", "ko": "범위 지정", "es": "Intervalo personalizado", "fr": "Pages personnalisées", "ru": "Указать страницы", "ar": "نطاق مخصص"},
 "ページの順序": {"en": "Page order", "zh_CN": "页面顺序", "ko": "페이지 순서", "es": "Orden de las páginas", "fr": "Ordre des pages", "ru": "Порядок страниц", "ar": "ترتيب الصفحات"},
-"右へ進み、次の段へ": {"en": "Across, then down to the next row", "zh_CN": "先向右排列，再换到下一行", "ko": "오른쪽으로 채운 뒤 다음 행으로", "es": "De izquierda a derecha y luego a la fila siguiente", "fr": "Vers la droite, puis à la ligne suivante", "ru": "Слева направо, затем на следующую строку", "ar": "إلى اليمين ثم إلى الصف التالي"},
-"下へ進み、次の列へ": {"en": "Down, then across to the next column", "zh_CN": "先向下排列，再换到下一列", "ko": "아래로 채운 뒤 다음 열로", "es": "De arriba abajo y luego a la columna siguiente", "fr": "Vers le bas, puis à la colonne suivante", "ru": "Сверху вниз, затем в следующий столбец", "ar": "إلى الأسفل ثم إلى العمود التالي"},
+"左上から右へ": {"en": "Across, then down to the next row", "zh_CN": "先向右排列，再换到下一行", "ko": "오른쪽으로 채운 뒤 다음 행으로", "es": "De izquierda a derecha y luego a la fila siguiente", "fr": "Vers la droite, puis à la ligne suivante", "ru": "Слева направо, затем на следующую строку", "ar": "إلى اليمين ثم إلى الصف التالي"},
+"左上から下へ": {"en": "Down, then across to the next column", "zh_CN": "先向下排列，再换到下一列", "ko": "아래로 채운 뒤 다음 열로", "es": "De arriba abajo y luego a la columna siguiente", "fr": "Vers le bas, puis à la colonne suivante", "ru": "Сверху вниз, затем в следующий столбец", "ar": "إلى الأسفل ثم إلى العمود التالي"},
 "カスタム…": {"en": "Custom…", "zh_CN": "自定义…", "ko": "사용자 지정…", "es": "Personalizado…", "fr": "Personnalisé…", "ru": "Свой…", "ar": "مخصص…"},
 "横×縦": {"en": "Columns × rows", "zh_CN": "列 × 行", "ko": "가로 × 세로", "es": "Columnas × filas", "fr": "Colonnes × lignes", "ru": "Столбцы × строки", "ar": "أعمدة × صفوف"},
 "余白 (mm)": {"en": "Margins (mm)", "zh_CN": "页边距 (mm)", "ko": "여백 (mm)", "es": "Márgenes (mm)", "fr": "Marges (mm)", "ru": "Поля (мм)", "ar": "الهوامش (مم)"},
@@ -1833,15 +1968,15 @@ TRANSLATIONS = {
 "用紙に合わせる": {"en": "Fit to paper", "zh_CN": "适合纸张", "ko": "용지에 맞춤", "es": "Ajustar al papel", "fr": "Ajuster au papier", "ru": "По размеру бумаги", "ar": "ملاءمة الورق"},
 "実際のサイズ": {"en": "Actual size", "zh_CN": "实际大小", "ko": "실제 크기", "es": "Tamaño real", "fr": "Taille réelle", "ru": "Фактический размер", "ar": "الحجم الفعلي"},
 "倍率指定": {"en": "Custom scale", "zh_CN": "自定义比例", "ko": "배율 지정", "es": "Escala personalizada", "fr": "Échelle personnalisée", "ru": "Свой масштаб", "ar": "نسبة مخصصة"},
-"ホチキス・パンチはプリンター側の設定画面で行ってください": {"en": "Stapling and punching are set in the printer's own settings", "zh_CN": "装订和打孔请在打印机自身的设置中进行", "ko": "스테이플과 펀치는 프린터 자체 설정에서 지정하세요", "es": "El grapado y el perforado se configuran en la propia impresora", "fr": "Agrafage et perforation se règlent dans les paramètres de l'imprimante", "ru": "Скрепление и перфорация настраиваются в самом принтере", "ar": "التدبيس والتخريم يُضبطان في إعدادات الطابعة نفسها"},
+"ホチキス留めとパンチ穴あけは、プリンターの設定で指定してください": {"en": "Stapling and punching are set in the printer's own settings", "zh_CN": "装订和打孔请在打印机自身的设置中进行", "ko": "스테이플과 펀치는 프린터 자체 설정에서 지정하세요", "es": "El grapado y el perforado se configuran en la propia impresora", "fr": "Agrafage et perforation se règlent dans les paramètres de l'imprimante", "ru": "Скрепление и перфорация настраиваются в самом принтере", "ar": "التدبيس والتخريم يُضبطان في إعدادات الطابعة نفسها"},
 "両面": {"en": "Two-sided", "zh_CN": "双面", "ko": "양면", "es": "Doble cara", "fr": "Recto verso", "ru": "Двусторонняя", "ar": "على الوجهين"},
 "片面": {"en": "One-sided", "zh_CN": "单面", "ko": "단면", "es": "Una cara", "fr": "Recto", "ru": "Односторонняя", "ar": "وجه واحد"},
 "自動": {"en": "Automatic", "zh_CN": "自动", "ko": "자동", "es": "Automático", "fr": "Automatique", "ru": "Автоматически", "ar": "تلقائي"},
 "両面（長辺とじ）": {"en": "Two-sided, long edge", "zh_CN": "双面（长边装订）", "ko": "양면(긴 쪽 묶기)", "es": "Doble cara, borde largo", "fr": "Recto verso, bord long", "ru": "Двусторонняя, длинный край", "ar": "على الوجهين، الحافة الطويلة"},
 "両面（短辺とじ）": {"en": "Two-sided, short edge", "zh_CN": "双面（短边装订）", "ko": "양면(짧은 쪽 묶기)", "es": "Doble cara, borde corto", "fr": "Recto verso, bord court", "ru": "Двусторонняя, короткий край", "ar": "على الوجهين، الحافة القصيرة"},
 "用紙サイズ": {"en": "Paper size", "zh_CN": "纸张大小", "ko": "용지 크기", "es": "Tamaño de papel", "fr": "Format du papier", "ru": "Размер бумаги", "ar": "حجم الورق"},
-"給紙": {"en": "Paper source", "zh_CN": "纸张来源", "ko": "용지함", "es": "Origen del papel", "fr": "Alimentation papier", "ru": "Источник бумаги", "ar": "مصدر الورق"},
-"給紙 {number}": {"en": "Tray {number}", "zh_CN": "纸盒 {number}", "ko": "용지함 {number}", "es": "Bandeja {number}", "fr": "Bac {number}", "ru": "Лоток {number}", "ar": "الدرج {number}"},
+"給紙方法": {"en": "Paper source", "zh_CN": "纸张来源", "ko": "용지함", "es": "Origen del papel", "fr": "Alimentation papier", "ru": "Источник бумаги", "ar": "مصدر الورق"},
+"トレイ {number}": {"en": "Tray {number}", "zh_CN": "纸盒 {number}", "ko": "용지함 {number}", "es": "Bandeja {number}", "fr": "Bac {number}", "ru": "Лоток {number}", "ar": "الدرج {number}"},
 "解像度": {"en": "Resolution", "zh_CN": "分辨率", "ko": "해상도", "es": "Resolución", "fr": "Résolution", "ru": "Разрешение", "ar": "الدقة"},
 "部単位で印刷": {"en": "Collate", "zh_CN": "逐份打印", "ko": "한 부씩 인쇄", "es": "Intercalar", "fr": "Copies assemblées", "ru": "Разобрать по копиям", "ar": "ترتيب النسخ"},
 "プリンター": {"en": "Printer", "zh_CN": "打印机", "ko": "프린터", "es": "Impresora", "fr": "Imprimante", "ru": "Принтер", "ar": "الطابعة"},
@@ -1856,46 +1991,39 @@ TRANSLATIONS = {
 "グレースケール": {"en": "Grayscale", "zh_CN": "灰度", "ko": "회색조", "es": "Escala de grises", "fr": "Nuances de gris", "ru": "Оттенки серого", "ar": "تدرّج الرمادي"},
 "印刷するページがありません": {"en": "No pages to print", "zh_CN": "没有可打印的页面", "ko": "인쇄할 페이지가 없습니다", "es": "No hay páginas que imprimir", "fr": "Aucune page à imprimer", "ru": "Нет страниц для печати", "ar": "لا توجد صفحات للطباعة"},
 "{total}ページを印刷します": {"en": "Printing {total} pages", "zh_CN": "将打印 {total} 页", "ko": "{total}페이지를 인쇄합니다", "es": "Se imprimirán {total} páginas", "fr": "Impression de {total} pages", "ru": "Будет напечатано страниц: {total}", "ar": "ستتم طباعة {total} صفحة"},
-"テキスト ボックスを開けませんでした": {"en": "Could not open the text box", "zh_CN": "无法打开文本框", "ko": "텍스트 상자를 열 수 없습니다", "es": "No se pudo abrir el cuadro de texto", "fr": "Impossible d'ouvrir la zone de texte", "ru": "Не удалось открыть текстовое поле", "ar": "تعذّر فتح مربع النص"},
-"認識した文字をページに書き込めませんでした": {"en": "Recognized the text but could not write it onto the page", "zh_CN": "已识别文字，但无法写入页面", "ko": "문자를 인식했지만 페이지에 기록하지 못했습니다", "es": "Se reconoció el texto pero no se pudo escribir en la página", "fr": "Texte reconnu, mais impossible de l'écrire sur la page", "ru": "Текст распознан, но записать его на страницу не удалось", "ar": "تم التعرف على النص لكن تعذّرت كتابته في الصفحة"},
-"PDFファイルではありません。": {"en": "That is not a PDF file.", "zh_CN": "这不是 PDF 文件。", "ko": "PDF 파일이 아닙니다.", "es": "No es un archivo PDF.", "fr": "Ce n'est pas un fichier PDF.", "ru": "Это не PDF-файл.", "ar": "هذا ليس ملف PDF."},
-"編集を確定できなかったため保存を中止しました": {"en": "Save canceled: the pending edit could not be committed", "zh_CN": "已取消保存：无法确定当前编辑", "ko": "편집을 확정할 수 없어 저장을 취소했습니다", "es": "Guardado cancelado: no se pudo confirmar la edición pendiente", "fr": "Enregistrement annulé : la modification en cours n'a pas pu être validée", "ru": "Сохранение отменено: не удалось применить текущее изменение", "ar": "أُلغي الحفظ: تعذّر تثبيت التعديل الجاري"},
-"編集を確定できなかったためタブを閉じませんでした": {"en": "The tab was not closed: the edit could not be written back.", "zh_CN": "未关闭标签页：无法写回编辑内容。", "ko": "편집 내용을 저장할 수 없어 탭을 닫지 않았습니다.", "es": "No se cerró la pestaña: no se pudo aplicar la edición.", "fr": "L'onglet n'a pas été fermé : la modification n'a pas pu être appliquée.", "ru": "Вкладка не закрыта: не удалось применить изменение.", "ar": "لم يتم إغلاق علامة التبويب: تعذّر تطبيق التعديل."},
-"編集を確定できなかったため印刷を中止しました": {"en": "Printing was cancelled: the edit could not be written back.", "zh_CN": "已取消打印：无法写回编辑内容。", "ko": "편집 내용을 저장할 수 없어 인쇄를 취소했습니다.", "es": "Impresión cancelada: no se pudo aplicar la edición.", "fr": "Impression annulée : la modification n'a pas pu être appliquée.", "ru": "Печать отменена: не удалось применить изменение.", "ar": "تم إلغاء الطباعة: تعذّر تطبيق التعديل."},
-"編集を確定できなかったため中止しました": {"en": "Cancelled: the edit could not be written back.", "zh_CN": "已取消：无法写回编辑内容。", "ko": "편집 내용을 저장할 수 없어 취소했습니다.", "es": "Cancelado: no se pudo aplicar la edición.", "fr": "Annulé : la modification n'a pas pu être appliquée.", "ru": "Отменено: не удалось применить изменение.", "ar": "تم الإلغاء: تعذّر تطبيق التعديل."},
-"処理を途中まで行った状態を元に戻せませんでした。文書の一部が変更されている可能性があります。": {"en": "The partly finished change could not be undone. Part of the document may have changed.", "zh_CN": "无法撤消未完成的更改。文档的一部分可能已被更改。", "ko": "일부만 진행된 변경을 되돌릴 수 없습니다. 문서의 일부가 변경되었을 수 있습니다.", "es": "No se pudo deshacer el cambio a medio aplicar. Es posible que parte del documento haya cambiado.", "fr": "Impossible d'annuler la modification partiellement appliquée. Une partie du document a peut-être changé.", "ru": "Не удалось отменить частично выполненное изменение. Часть документа могла измениться.", "ar": "تعذّر التراجع عن التغيير الذي نُفّذ جزئيًا. ربما تغيّر جزء من المستند."},
+"テキスト ボックスを開けませんでした": {"en": "Couldn't open the text box", "zh_CN": "无法打开文本框", "ko": "텍스트 상자를 열 수 없습니다", "es": "No se pudo abrir el cuadro de texto", "fr": "Impossible d'ouvrir la zone de texte", "ru": "Не удалось открыть текстовое поле", "ar": "تعذّر فتح مربع النص"},
+"認識した文字をページに書き込めませんでした": {"en": "Recognized the text but couldn't write it onto the page", "zh_CN": "已识别文字，但无法写入页面", "ko": "문자를 인식했지만 페이지에 기록하지 못했습니다", "es": "Se reconoció el texto pero no se pudo escribir en la página", "fr": "Texte reconnu, mais impossible de l'écrire sur la page", "ru": "Текст распознан, но записать его на страницу не удалось", "ar": "تم التعرف على النص لكن تعذّرت كتابته في الصفحة"},
+"PDFファイルではありません。": {"en": "This isn't a PDF file.", "zh_CN": "这不是 PDF 文件。", "ko": "PDF 파일이 아닙니다.", "es": "No es un archivo PDF.", "fr": "Ce n'est pas un fichier PDF.", "ru": "Это не PDF-файл.", "ar": "هذا ليس ملف PDF."},
+"編集を確定できなかったため保存を中止しました": {"en": "Save canceled: the edit in progress couldn't be completed", "zh_CN": "已取消保存：无法完成当前编辑", "ko": "편집을 확정할 수 없어 저장을 취소했습니다", "es": "Guardado cancelado: no se pudo terminar la edición en curso", "fr": "Enregistrement annulé : la modification en cours n'a pas pu être validée", "ru": "Сохранение отменено: не удалось применить текущее изменение", "ar": "أُلغي الحفظ: تعذّر تثبيت التعديل الجاري"},
+"編集を確定できなかったためタブを閉じませんでした": {"en": "The tab wasn't closed: the edit in progress couldn't be completed.", "zh_CN": "未关闭标签页：无法完成当前编辑。", "ko": "편집을 확정할 수 없어 탭을 닫지 않았습니다.", "es": "No se cerró la pestaña: no se pudo terminar la edición en curso.", "fr": "L'onglet n'a pas été fermé : la modification n'a pas pu être appliquée.", "ru": "Вкладка не закрыта: не удалось применить изменение.", "ar": "لم يتم إغلاق علامة التبويب: تعذّر تطبيق التعديل."},
+"編集を確定できなかったため印刷を中止しました": {"en": "Printing canceled: the edit in progress couldn't be completed.", "zh_CN": "已取消打印：无法完成当前编辑。", "ko": "편집을 확정할 수 없어 인쇄를 취소했습니다.", "es": "Impresión cancelada: no se pudo terminar la edición en curso.", "fr": "Impression annulée : la modification n'a pas pu être appliquée.", "ru": "Печать отменена: не удалось применить изменение.", "ar": "تم إلغاء الطباعة: تعذّر تطبيق التعديل."},
+"編集を確定できなかったため中止しました": {"en": "Canceled: the edit in progress couldn't be completed.", "zh_CN": "已取消：无法完成当前编辑。", "ko": "편집을 확정할 수 없어 취소했습니다.", "es": "Cancelado: no se pudo terminar la edición en curso.", "fr": "Annulé : la modification n'a pas pu être appliquée.", "ru": "Отменено: не удалось применить изменение.", "ar": "تم الإلغاء: تعذّر تطبيق التعديل."},
+"途中まで行った処理を元に戻せませんでした。文書の一部が変更されたままになっている可能性があります。": {"en": "The change stopped partway and couldn't be undone. Part of the document may still be changed.", "zh_CN": "无法撤消未完成的更改。文档的一部分可能已被更改。", "ko": "일부만 진행된 변경을 되돌릴 수 없습니다. 문서의 일부가 변경되었을 수 있습니다.", "es": "No se pudo deshacer el cambio a medio aplicar. Es posible que parte del documento haya cambiado.", "fr": "Impossible d'annuler la modification partiellement appliquée. Une partie du document a peut-être changé.", "ru": "Не удалось отменить частично выполненное изменение. Часть документа могла измениться.", "ar": "تعذّر التراجع عن التغيير الذي نُفّذ جزئيًا. ربما تغيّر جزء من المستند."},
 "図形を保存できませんでした。\n\n{error}": {"en": "Couldn't save the shape.\n\n{error}", "zh_CN": "无法保存图形。\n\n{error}", "ko": "도형을 저장할 수 없습니다.\n\n{error}", "es": "No se pudo guardar la forma.\n\n{error}", "fr": "Impossible d'enregistrer la forme.\n\n{error}", "ru": "Не удалось сохранить фигуру.\n\n{error}", "ar": "تعذّر حفظ الشكل.\n\n{error}"},
 "{done}/{total}個の注釈を変更しました（一部失敗）": {"en": "Changed {done} of {total} annotations (some failed)", "zh_CN": "已修改 {total} 个注释中的 {done} 个（部分失败）", "ko": "주석 {total}개 중 {done}개를 변경했습니다(일부 실패)", "es": "Anotaciones cambiadas: {done} de {total} (algunas fallaron)", "fr": "Annotations modifiées : {done} sur {total} (certaines ont échoué)", "ru": "Изменено {done} из {total} аннотаций (часть не удалась)", "ar": "تم تغيير {done} من أصل {total} من التعليقات التوضيحية (فشل بعضها)"},
-"{count}個の注釈の色を変えました": {"en": "Changed the color of {count} annotations", "zh_CN": "已更改 {count} 个注释的颜色", "ko": "주석 {count}개의 색을 변경했습니다", "es": "Se cambió el color de {count} anotaciones", "fr": "Couleur modifiée pour {count} annotations", "ru": "Изменен цвет аннотаций: {count}", "ar": "تم تغيير لون {count} تعليقًا توضيحيًا"},
-"{count}個の注釈の線の太さを変えました": {"en": "Changed the outline weight of {count} annotations", "zh_CN": "已更改 {count} 个注释的线条粗细", "ko": "주석 {count}개의 선 두께를 변경했습니다", "es": "Se cambió el grosor de {count} anotaciones", "fr": "Épaisseur modifiée pour {count} annotations", "ru": "Изменена толщина линии аннотаций: {count}", "ar": "تم تغيير سُمك حدود {count} تعليقًا توضيحيًا"},
+"{count}個の注釈の色を変更しました": {"en": "Changed the color of {count} annotations", "zh_CN": "已更改 {count} 个注释的颜色", "ko": "주석 {count}개의 색을 변경했습니다", "es": "Se cambió el color de {count} anotaciones", "fr": "Couleur modifiée pour {count} annotations", "ru": "Изменен цвет аннотаций: {count}", "ar": "تم تغيير لون {count} تعليقًا توضيحيًا"},
+"{count}個の注釈の線の太さを変更しました": {"en": "Changed the outline weight of {count} annotations", "zh_CN": "已更改 {count} 个注释的线条粗细", "ko": "주석 {count}개의 선 두께를 변경했습니다", "es": "Se cambió el grosor de {count} anotaciones", "fr": "Épaisseur modifiée pour {count} annotations", "ru": "Изменена толщина линии аннотаций: {count}", "ar": "تم تغيير سُمك حدود {count} تعليقًا توضيحيًا"},
 "{count}個の注釈を複製しました": {"en": "Duplicated {count} annotations", "zh_CN": "已复制 {count} 个注释", "ko": "주석 {count}개를 복제했습니다", "es": "Se duplicaron {count} anotaciones", "fr": "{count} annotations dupliquées", "ru": "Продублировано аннотаций: {count}", "ar": "تم تكرار {count} تعليقًا توضيحيًا"},
-"重ね順を変更できませんでした": {"en": "Could not change the stacking order", "zh_CN": "无法更改叠放次序", "ko": "쌓임 순서를 변경할 수 없습니다", "es": "No se pudo cambiar el orden", "fr": "Impossible de modifier l'ordre", "ru": "Не удалось изменить порядок", "ar": "تعذّر تغيير ترتيب التراكب"},
+"重ね順を変更できませんでした": {"en": "Couldn't change the stacking order", "zh_CN": "无法更改叠放次序", "ko": "쌓임 순서를 변경할 수 없습니다", "es": "No se pudo cambiar el orden", "fr": "Impossible de modifier l'ordre", "ru": "Не удалось изменить порядок", "ar": "تعذّر تغيير ترتيب التراكب"},
 "最前面へ移動しました": {"en": "Brought to front", "zh_CN": "已置于顶层", "ko": "맨 앞으로 가져왔습니다", "es": "Traído al frente", "fr": "Mis au premier plan", "ru": "Перемещено на передний план", "ar": "تم الإحضار إلى الأمام"},
 "最背面へ移動しました": {"en": "Sent to back", "zh_CN": "已置于底层", "ko": "맨 뒤로 보냈습니다", "es": "Enviado al fondo", "fr": "Mis à l'arrière-plan", "ru": "Перемещено на задний план", "ar": "تم الإرسال إلى الخلف"},
 "前面へ移動しました": {"en": "Brought forward", "zh_CN": "已上移一层", "ko": "앞으로 가져왔습니다", "es": "Traído adelante", "fr": "Avancé", "ru": "Перемещено вперед", "ar": "تم الإحضار للأمام"},
 "背面へ移動しました": {"en": "Sent backward", "zh_CN": "已下移一层", "ko": "뒤로 보냈습니다", "es": "Enviado atrás", "fr": "Reculé", "ru": "Перемещено назад", "ar": "تم الإرسال للخلف"},
-"表示の更新に失敗しました": {"en": "Could not refresh the view", "zh_CN": "无法刷新显示", "ko": "화면을 갱신하지 못했습니다", "es": "No se pudo actualizar la vista", "fr": "Impossible d'actualiser l'affichage", "ru": "Не удалось обновить отображение", "ar": "تعذّر تحديث العرض"},
-"墨消しのマークを削除できませんでした": {"en": "Could not remove the redaction marks", "zh_CN": "无法删除密文标记", "ko": "교정 표시를 삭제할 수 없습니다", "es": "No se pudieron quitar las marcas de censura", "fr": "Impossible de retirer les marques de biffure", "ru": "Не удалось убрать метки скрытия", "ar": "تعذّرت إزالة علامات التنقيح"},
-"  •  軽量描画": {"en": "  •  Lightweight rendering", "zh_CN": "  •  轻量渲染", "ko": "  •  경량 렌더링", "es": "  •  Renderizado ligero", "fr": "  •  Rendu allégé", "ru": "  •  Облегченная отрисовка", "ar": "  •  عرض خفيف"},
-"太": {"en": "B", "zh_CN": "粗", "ko": "굵", "es": "N", "fr": "G", "ru": "Ж", "ar": "ع"},
-"下": {"en": "U", "zh_CN": "下", "ko": "밑", "es": "S", "fr": "S", "ru": "Ч", "ar": "ت"},
-"消": {"en": "S", "zh_CN": "删", "ko": "취", "es": "T", "fr": "B", "ru": "З", "ar": "ش"},
-"色": {"en": "A", "zh_CN": "色", "ko": "색", "es": "A", "fr": "A", "ru": "Ц", "ar": "ل"},
+"墨消しのマークを削除できませんでした": {"en": "Couldn't remove the redaction marks", "zh_CN": "无法删除密文标记", "ko": "교정 표시를 삭제할 수 없습니다", "es": "No se pudieron quitar las marcas de censura", "fr": "Impossible de retirer les marques de biffure", "ru": "Не удалось убрать метки скрытия", "ar": "تعذّرت إزالة علامات التنقيح"},
+"  •  軽量描画": {"en": "  •  Lightweight rendering", "zh_CN": "  •  轻量渲染", "ko": "  •  경량 렌더링", "es": "  •  Representación ligera", "fr": "  •  Rendu allégé", "ru": "  •  Облегченная отрисовка", "ar": "  •  عرض خفيف"},
 "色の変更": {"en": "Color", "zh_CN": "颜色", "ko": "색상", "es": "Color", "fr": "Couleur", "ru": "Цвет", "ar": "اللون"},
 "OK": {"en": "OK", "zh_CN": "确定", "ko": "확인", "es": "Aceptar", "fr": "OK", "ru": "ОК", "ar": "موافق"},
-"図形": {"en": "Shapes", "zh_CN": "图形", "ko": "도형", "es": "Formas", "fr": "Formes", "ru": "Фигуры", "ar": "أشكال"},
-"印刷を開始できませんでした。プリンターの状態をご確認ください。": {"en": "Could not start printing. Please check the printer.", "zh_CN": "无法开始打印。请检查打印机状态。", "ko": "인쇄를 시작할 수 없습니다. 프린터 상태를 확인하세요.", "es": "No se pudo iniciar la impresión. Comprueba la impresora.", "fr": "Impossible de lancer l'impression. Vérifiez l'imprimante.", "ru": "Не удалось начать печать. Проверьте состояние принтера.", "ar": "تعذّر بدء الطباعة. يرجى التحقق من الطابعة."},
-"ページを印刷できませんでした。\n\n{error}": {"en": "Could not print the page.\n\n{error}", "zh_CN": "无法打印页面。\n\n{error}", "ko": "페이지를 인쇄할 수 없습니다.\n\n{error}", "es": "No se pudo imprimir la página.\n\n{error}", "fr": "Impossible d'imprimer la page.\n\n{error}", "ru": "Не удалось напечатать страницу.\n\n{error}", "ar": "تعذّرت طباعة الصفحة.\n\n{error}"},
+"印刷を開始できませんでした。プリンターの状態をご確認ください。": {"en": "Couldn't start printing. Check the printer.", "zh_CN": "无法开始打印。请检查打印机状态。", "ko": "인쇄를 시작할 수 없습니다. 프린터 상태를 확인하세요.", "es": "No se pudo iniciar la impresión. Comprueba la impresora.", "fr": "Impossible de lancer l'impression. Vérifiez l'imprimante.", "ru": "Не удалось начать печать. Проверьте состояние принтера.", "ar": "تعذّر بدء الطباعة. يرجى التحقق من الطابعة."},
+"ページを印刷できませんでした。\n\n{error}": {"en": "Couldn't print the page.\n\n{error}", "zh_CN": "无法打印页面。\n\n{error}", "ko": "페이지를 인쇄할 수 없습니다.\n\n{error}", "es": "No se pudo imprimir la página.\n\n{error}", "fr": "Impossible d'imprimer la page.\n\n{error}", "ru": "Не удалось напечатать страницу.\n\n{error}", "ar": "تعذّرت طباعة الصفحة.\n\n{error}"},
 "リンクを開きませんでした": {"en": "Link not opened", "zh_CN": "未打开链接", "ko": "링크를 열지 않았습니다", "es": "Enlace no abierto", "fr": "Lien non ouvert", "ru": "Ссылка не открыта", "ar": "لم يتم فتح الرابط"},
 "「{name}」の復元にはパスワードが必要です。": {"en": "“{name}” needs its password to be restored.", "zh_CN": "恢复“{name}”需要密码。", "ko": "“{name}”을(를) 복원하려면 암호가 필요합니다.", "es": "Se necesita la contraseña para restaurar «{name}».", "fr": "Le mot de passe est requis pour restaurer « {name} ».", "ru": "Для восстановления «{name}» нужен пароль.", "ar": "استعادة «{name}» تتطلب كلمة المرور."},
 "このPDFは大きいため、元に戻す履歴を保持できません": {"en": "This PDF is too large to keep an undo history", "zh_CN": "此 PDF 过大，无法保留撤消历史", "ko": "이 PDF는 너무 커서 실행 취소 기록을 유지할 수 없습니다", "es": "Este PDF es demasiado grande para guardar el historial de deshacer", "fr": "Ce PDF est trop volumineux pour conserver un historique d'annulation", "ru": "Этот PDF слишком велик, чтобы хранить историю отмены", "ar": "هذا الملف كبير جدًا للاحتفاظ بسجل التراجع"},
 "複数部を印刷するとき、1部ずつページ順にそろえて出力します（1,2,3 → 1,2,3）。オフにすると同じページをまとめて出力します（1,1 → 2,2 → 3,3）。": {"en": "When printing more than one copy, prints each complete copy in page order (1,2,3 → 1,2,3). Turn off to print all copies of each page together (1,1 → 2,2 → 3,3).", "zh_CN": "打印多份时，按页码顺序逐份打印（1,2,3 → 1,2,3）。关闭后将同一页的所有份数一起打印（1,1 → 2,2 → 3,3）。", "ko": "여러 부를 인쇄할 때 한 부씩 페이지 순서대로 인쇄합니다(1,2,3 → 1,2,3). 끄면 같은 페이지를 모아서 인쇄합니다(1,1 → 2,2 → 3,3).", "es": "Al imprimir varias copias, imprime cada copia completa en orden de página (1,2,3 → 1,2,3). Desactívalo para imprimir juntas todas las copias de cada página (1,1 → 2,2 → 3,3).", "fr": "Lors de l'impression de plusieurs copies, imprime chaque copie complète dans l'ordre des pages (1,2,3 → 1,2,3). Désactivez cette option pour imprimer ensemble toutes les copies de chaque page (1,1 → 2,2 → 3,3).", "ru": "При печати нескольких копий каждая копия печатается целиком по порядку страниц (1,2,3 → 1,2,3). Если отключить, все копии каждой страницы печатаются подряд (1,1 → 2,2 → 3,3).", "ar": "عند طباعة أكثر من نسخة، تتم طباعة كل نسخة كاملة بترتيب الصفحات (1,2,3 → 1,2,3). أوقف تشغيله لطباعة كل نسخ الصفحة الواحدة معًا (1,1 → 2,2 → 3,3)."},
-"このPDFには作成者が設定した使用制限があります。権利者の意図に沿ってご利用ください": {"en": "The author of this PDF has set usage restrictions. Please respect the rights holder's intent.", "zh_CN": "此 PDF 的作者设置了使用限制。请按照权利人的意愿使用。", "ko": "이 PDF에는 작성자가 설정한 사용 제한이 있습니다. 권리자의 의도에 맞게 사용하세요.", "es": "El autor de este PDF ha establecido restricciones de uso. Respeta la voluntad del titular de los derechos.", "fr": "L'auteur de ce PDF a défini des restrictions d'utilisation. Respectez la volonté du titulaire des droits.", "ru": "Автор этого PDF установил ограничения на использование. Соблюдайте волю правообладателя.", "ar": "وضع مؤلف ملف PDF هذا قيودًا على الاستخدام. يرجى احترام رغبة صاحب الحقوق."},
+"このPDFには作成者が設定した使用制限があります。権利者の意図に沿ってご利用ください": {"en": "The author of this PDF has set usage restrictions. Please respect the rights holder's wishes.", "zh_CN": "此 PDF 的作者设置了使用限制。请按照权利人的意愿使用。", "ko": "이 PDF에는 작성자가 설정한 사용 제한이 있습니다. 권리자의 의도에 맞게 사용하세요.", "es": "El autor de este PDF ha establecido restricciones de uso. Respeta la voluntad del titular de los derechos.", "fr": "L'auteur de ce PDF a défini des restrictions d'utilisation. Respectez la volonté du titulaire des droits.", "ru": "Автор этого PDF установил ограничения на использование. Соблюдайте волю правообладателя.", "ar": "وضع مؤلف ملف PDF هذا قيودًا على الاستخدام. يرجى احترام رغبة صاحب الحقوق."},
 "追加したページの元のPDFには使用制限があります。この文書にはその制限は引き継がれません": {"en": "The PDF these pages came from has usage restrictions. They are not carried over to this document.", "zh_CN": "这些页面所来自的 PDF 设有使用限制。这些限制不会带到此文档中。", "ko": "추가한 페이지의 원본 PDF에는 사용 제한이 있습니다. 이 문서에는 해당 제한이 적용되지 않습니다.", "es": "El PDF del que proceden estas páginas tiene restricciones de uso. No se trasladan a este documento.", "fr": "Le PDF d'origine de ces pages comporte des restrictions d'utilisation. Elles ne sont pas reportées dans ce document.", "ru": "PDF, из которого взяты эти страницы, имеет ограничения на использование. На этот документ они не переносятся.", "ar": "ملف PDF الذي أُخذت منه هذه الصفحات عليه قيود على الاستخدام. لا تنتقل هذه القيود إلى هذا المستند."},
-"{count}個の注釈またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {"en": "{count} comments or form fields could not be removed. Content may remain in the redacted areas; check the document before you save it.", "zh_CN": "无法删除 {count} 个注释或表单字段。密文区域中可能仍有内容，请在保存前检查文档。", "ko": "주석 또는 양식 필드 {count}개를 삭제할 수 없습니다. 교정한 영역에 내용이 남아 있을 수 있으니 저장하기 전에 문서를 확인하세요.", "es": "No se pudieron quitar {count} comentarios o campos de formulario. Puede quedar contenido en las zonas censuradas; revisa el documento antes de guardarlo.", "fr": "Impossible de supprimer {count} commentaires ou champs de formulaire. Du contenu peut subsister dans les zones biffées ; vérifiez le document avant de l'enregistrer.", "ru": "Не удалось удалить комментарии или поля форм ({count}). В скрытых областях может остаться содержимое; проверьте документ перед сохранением.", "ar": "تعذّر حذف {count} من التعليقات أو حقول النماذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقّق من المستند قبل حفظه."},
-"この文書には見えない文字（OCRで付けた文字など）があります。削除すると、サニタイズしたPDFでは検索やコピーができなくなります。\n\n見えない文字も削除しますか？": {"en": "This document contains invisible text, such as text added by OCR. If it is removed, the sanitized PDF can no longer be searched or copied from.\n\nRemove the invisible text too?", "zh_CN": "此文档包含不可见文字（例如 OCR 添加的文字）。如果删除，净化后的 PDF 将无法搜索或复制文字。\n\n是否同时删除不可见文字？", "ko": "이 문서에는 보이지 않는 텍스트(OCR로 추가한 텍스트 등)가 있습니다. 삭제하면 정리된 PDF에서 검색하거나 복사할 수 없습니다.\n\n보이지 않는 텍스트도 삭제할까요?", "es": "Este documento contiene texto invisible, como el que añade el OCR. Si lo quitas, no podrás buscar ni copiar texto en el PDF saneado.\n\n¿Quitar también el texto invisible?", "fr": "Ce document contient du texte invisible, comme celui ajouté par l'OCR. S'il est supprimé, le PDF assaini ne pourra plus être recherché ni copié.\n\nSupprimer aussi le texte invisible ?", "ru": "В документе есть невидимый текст, например добавленный при распознавании (OCR). Если удалить его, в очищенном PDF нельзя будет искать и копировать текст.\n\nУдалить и невидимый текст?", "ar": "يحتوي هذا المستند على نص غير مرئي، مثل النص الذي يضيفه التعرف الضوئي على الحروف (OCR). إذا حُذف، فلن يمكن البحث في ملف PDF المنقّى أو النسخ منه.\n\nهل تريد حذف النص غير المرئي أيضًا؟"},
-"タブを別のウィンドウへ移動できませんでした": {"en": "Could not move the tab to another window", "zh_CN": "无法将标签页移到另一个窗口", "ko": "탭을 다른 창으로 옮길 수 없습니다", "es": "No se pudo mover la pestaña a otra ventana", "fr": "Impossible de déplacer l'onglet vers une autre fenêtre", "ru": "Не удалось переместить вкладку в другое окно", "ar": "تعذّر نقل علامة التبويب إلى نافذة أخرى"},
-"各ソフトウェアに含まれるライブラリやフォントを含む詳しい一覧と、ソースコードの入手先は、「{tab}」タブの「{document}」にあります。": {"en": "The full list, including the libraries and fonts inside each component, and where to get their source code, is in “{document}” on the “{tab}” tab.", "zh_CN": "包括各组件所含库和字体在内的完整列表以及源代码的获取位置，请参阅“{tab}”选项卡中的“{document}”。", "ko": "각 구성 요소에 포함된 라이브러리와 글꼴을 포함한 전체 목록과 소스 코드를 구할 수 있는 곳은 “{tab}” 탭의 “{document}”에 있습니다.", "es": "La lista completa, con las bibliotecas y fuentes que incluye cada componente, y dónde obtener su código fuente, está en «{document}», en la pestaña «{tab}».", "fr": "La liste complète, y compris les bibliothèques et polices contenues dans chaque composant, et l'adresse de leur code source se trouvent dans « {document} », onglet « {tab} ».", "ru": "Полный список, включая библиотеки и шрифты внутри каждого компонента, и сведения о том, где получить их исходный код, приведены в документе «{document}» на вкладке «{tab}».", "ar": "القائمة الكاملة، بما فيها المكتبات والخطوط المضمّنة في كل مكوّن، ومكان الحصول على شيفرتها المصدرية، موجودة في «{document}» ضمن علامة التبويب «{tab}»."},
+"{count}個の注釈またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {"en": "{count} comments or form fields couldn't be removed. Content may remain in the redacted areas; check the document before you save it.", "zh_CN": "无法删除 {count} 个注释或表单字段。密文区域中可能仍有内容，请在保存前检查文档。", "ko": "주석 또는 양식 필드 {count}개를 삭제할 수 없습니다. 교정한 영역에 내용이 남아 있을 수 있으니 저장하기 전에 문서를 확인하세요.", "es": "No se pudieron quitar {count} comentarios o campos de formulario. Puede quedar contenido en las zonas censuradas; revisa el documento antes de guardarlo.", "fr": "Impossible de supprimer {count} commentaires ou champs de formulaire. Du contenu peut subsister dans les zones biffées ; vérifiez le document avant de l'enregistrer.", "ru": "Не удалось удалить комментарии или поля форм ({count}). В скрытых областях может остаться содержимое; проверьте документ перед сохранением.", "ar": "تعذّر حذف {count} من التعليقات أو حقول النماذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقّق من المستند قبل حفظه."},
+"この文書には見えない文字（OCRで付けた文字など）があります。削除すると、サニタイズしたPDFでは検索やコピーができなくなります。\n\n見えない文字も削除しますか？": {"en": "This document contains invisible text, such as text added by OCR. If you remove it, you won't be able to search or copy text in the sanitized PDF.\n\nRemove the invisible text too?", "zh_CN": "此文档包含不可见文字（例如 OCR 添加的文字）。如果删除，净化后的 PDF 将无法搜索或复制文字。\n\n是否同时删除不可见文字？", "ko": "이 문서에는 보이지 않는 텍스트(OCR로 추가한 텍스트 등)가 있습니다. 삭제하면 정리된 PDF에서 검색하거나 복사할 수 없습니다.\n\n보이지 않는 텍스트도 삭제할까요?", "es": "Este documento contiene texto invisible, como el que añade el OCR. Si lo quitas, no podrás buscar ni copiar texto en el PDF saneado.\n\n¿Quitar también el texto invisible?", "fr": "Ce document contient du texte invisible, comme celui ajouté par l'OCR. Si vous le supprimez, vous ne pourrez plus rechercher ni copier de texte dans le PDF assaini.\n\nSupprimer aussi le texte invisible ?", "ru": "В документе есть невидимый текст, например добавленный при распознавании (OCR). Если удалить его, в очищенном PDF нельзя будет искать и копировать текст.\n\nУдалить и невидимый текст?", "ar": "يحتوي هذا المستند على نص غير مرئي، مثل النص الذي يضيفه التعرف الضوئي على الحروف (OCR). إذا حذفته، فلن تتمكن من البحث في النص أو نسخه في ملف PDF المنقّى.\n\nهل تريد حذف النص غير المرئي أيضًا؟"},
+"各ソフトウェアに含まれるライブラリやフォントまで載せた一覧と、ソース コードの入手先は、「{tab}」タブの「{document}」にあります。": {"en": "The full list, including the libraries and fonts inside each component, and where to get their source code, is in “{document}” on the “{tab}” tab.", "zh_CN": "包括各组件所含库和字体在内的完整列表以及源代码的获取位置，请参阅“{tab}”选项卡中的“{document}”。", "ko": "각 구성 요소에 포함된 라이브러리와 글꼴을 포함한 전체 목록과 소스 코드를 구할 수 있는 곳은 “{tab}” 탭의 “{document}”에 있습니다.", "es": "La lista completa, con las bibliotecas y fuentes que incluye cada componente, y dónde obtener su código fuente, está en «{document}», en la pestaña «{tab}».", "fr": "La liste complète, y compris les bibliothèques et polices contenues dans chaque composant, et l'adresse de leur code source se trouvent dans « {document} », onglet « {tab} ».", "ru": "Полный список, включая библиотеки и шрифты внутри каждого компонента, и сведения о том, где получить их исходный код, приведены в документе «{document}» на вкладке «{tab}».", "ar": "القائمة الكاملة، بما فيها المكتبات والخطوط المضمّنة في كل مكوّن، ومكان الحصول على شيفرتها المصدرية، موجودة في «{document}» ضمن علامة التبويب «{tab}»."},
 "制限": {"en": "Restrictions", "zh_CN": "限制", "ko": "제한", "es": "Restricciones", "fr": "Restrictions", "ru": "Ограничения", "ar": "القيود"},
 "、": {"en": ", ", "zh_CN": "、", "ko": ", ", "es": ", ", "fr": ", ", "ru": ", ", "ar": "، "},
 "文書の印刷": {"en": "Printing", "zh_CN": "打印", "ko": "인쇄", "es": "Impresión", "fr": "Impression", "ru": "Печать", "ar": "الطباعة"},
@@ -1907,32 +2035,32 @@ TRANSLATIONS = {
 "ライセンス情報": {"en": "License Information", "zh_CN": "许可信息", "ko": "라이선스 정보", "es": "Información de licencia", "fr": "Informations de licence", "ru": "Сведения о лицензии", "ar": "معلومات الترخيص"},
 "ライセンス情報...": {"en": "License Information...", "zh_CN": "许可信息...", "ko": "라이선스 정보...", "es": "Información de licencia...", "fr": "Informations de licence...", "ru": "Сведения о лицензии...", "ar": "معلومات الترخيص..."},
 "概要": {"en": "Overview", "zh_CN": "概述", "ko": "개요", "es": "Información general", "fr": "Vue d'ensemble", "ru": "Обзор", "ar": "نظرة عامة"},
-"サードパーティ製ソフトウェア": {"en": "Third-Party Software", "zh_CN": "第三方软件", "ko": "타사 소프트웨어", "es": "Software de terceros", "fr": "Logiciels tiers", "ru": "Сторонние программы", "ar": "برامج الجهات الخارجية"},
+"サード パーティ製ソフトウェア": {"en": "Third-Party Software", "zh_CN": "第三方软件", "ko": "타사 소프트웨어", "es": "Software de terceros", "fr": "Logiciels tiers", "ru": "Сторонние программы", "ar": "برامج الجهات الخارجية"},
 "ライセンス全文": {"en": "License Texts", "zh_CN": "许可证全文", "ko": "라이선스 전문", "es": "Textos de licencia", "fr": "Textes des licences", "ru": "Тексты лицензий", "ar": "نصوص التراخيص"},
-"利用規約": {"en": "Terms of Use", "zh_CN": "使用条款", "ko": "이용 약관", "es": "Términos de uso", "fr": "Conditions d'utilisation", "ru": "Условия использования", "ar": "شروط الاستخدام"},
+"利用規約": {"en": "Terms of Use", "zh_CN": "使用条款", "ko": "사용 약관", "es": "Términos de uso", "fr": "Conditions d'utilisation", "ru": "Условия использования", "ar": "شروط الاستخدام"},
 "プライバシー ポリシー": {"en": "Privacy Policy", "zh_CN": "隐私政策", "ko": "개인정보 처리방침", "es": "Política de privacidad", "fr": "Politique de confidentialité", "ru": "Политика конфиденциальности", "ar": "سياسة الخصوصية"},
 "{app}をお使いいただく前に": {"en": "Before you use {app}", "zh_CN": "使用 {app} 之前", "ko": "{app}을(를) 사용하기 전에", "es": "Antes de usar {app}", "fr": "Avant d'utiliser {app}", "ru": "Перед началом работы с {app}", "ar": "قبل استخدام {app}"},
-"{app}の利用には、下の利用規約が適用されます。［続ける］を選ぶと、利用規約に同意したものとみなされます。情報の取扱いについては、プライバシー ポリシーをご覧ください。": {"en": "Your use of {app} is subject to the Terms of Use below. By selecting Continue, you agree to the Terms of Use. The Privacy Policy explains how information is handled.", "zh_CN": "您使用 {app} 时适用以下使用条款。选择“继续”即表示您同意使用条款。有关信息的处理方式，请参阅隐私政策。", "ko": "{app} 사용에는 아래 이용 약관이 적용됩니다. [계속]을 선택하면 이용 약관에 동의한 것으로 간주됩니다. 정보 처리 방식은 개인정보 처리방침을 참조하세요.", "es": "El uso de {app} está sujeto a los Términos de uso que aparecen a continuación. Al seleccionar Continuar, aceptas los Términos de uso. La Política de privacidad explica cómo se trata la información.", "fr": "Votre utilisation de {app} est soumise aux Conditions d'utilisation ci-dessous. En sélectionnant Continuer, vous acceptez les Conditions d'utilisation. La Politique de confidentialité explique comment les informations sont traitées.", "ru": "Использование {app} регулируется приведенными ниже Условиями использования. Нажимая «Продолжить», вы принимаете Условия использования. О том, как обрабатывается информация, рассказывает Политика конфиденциальности.", "ar": "يخضع استخدامك لـ {app} لشروط الاستخدام الواردة أدناه. باختيارك «متابعة»، فإنك توافق على شروط الاستخدام. وتوضح سياسة الخصوصية كيفية التعامل مع المعلومات."},
-"{app}を初めて起動した時から{days}日間は、すべての機能を無料でお使いいただけます。その後、OCR や墨消しの範囲の指定などのプレミアム機能を使うには、購入が必要です。購入の前に、必要な機能が使えることを無料期間中にお確かめください。": {"en": "Every feature is free for {days} days from the first time you start {app}. After that, premium features such as OCR and marking text for redaction need a purchase. Please use the free period to make sure the features you need work for you before you buy.", "zh_CN": "从首次启动 {app} 起 {days} 天内，所有功能均可免费使用。之后，OCR、标记密文等高级功能需要购买。购买前，请在免费期间确认您需要的功能可以正常使用。", "ko": "{app}을(를) 처음 시작한 때부터 {days}일 동안 모든 기능을 무료로 사용할 수 있습니다. 그 후에는 OCR, 교정 영역 지정 등 프리미엄 기능을 사용하려면 구매해야 합니다. 구매하기 전에 무료 기간 동안 필요한 기능이 제대로 작동하는지 확인하세요.", "es": "Todas las funciones son gratuitas durante {days} días desde la primera vez que inicias {app}. Después, las características premium, como el OCR y marcar texto para censurar, requieren una compra. Antes de comprar, aprovecha el periodo gratuito para comprobar que las funciones que necesitas te sirven.", "fr": "Toutes les fonctionnalités sont gratuites pendant {days} jours à partir du premier démarrage de {app}. Ensuite, les fonctionnalités premium, comme l'OCR et le marquage de texte à biffer, nécessitent un achat. Avant d'acheter, profitez de la période gratuite pour vérifier que les fonctionnalités dont vous avez besoin vous conviennent.", "ru": "Все функции бесплатны в течение {days} дней с первого запуска {app}. После этого для премиум-функций, например OCR и выделения текста для скрытия, нужна покупка. Прежде чем покупать, убедитесь за бесплатный период, что нужные вам функции работают.", "ar": "جميع الميزات مجانية لمدة {days} يومًا من أول تشغيل لـ {app}. بعد ذلك، تتطلب الميزات المتميزة، مثل التعرف الضوئي على الحروف (OCR) وتحديد النص للتنقيح، إجراء عملية شراء. قبل الشراء، استفد من الفترة المجانية للتأكد من أن الميزات التي تحتاجها تعمل كما تريد."},
+"{app}の利用には、下の利用規約が適用されます。［続ける］を選ぶと、利用規約に同意したものとみなされます。情報の取扱いについては、プライバシー ポリシーをご覧ください。": {"en": "Your use of {app} is subject to the Terms of Use below. By selecting Continue, you agree to the Terms of Use. The Privacy Policy explains how information is handled.", "zh_CN": "您使用 {app} 时适用以下使用条款。选择“继续”即表示您同意使用条款。有关信息的处理方式，请参阅隐私政策。", "ko": "{app} 사용에는 아래 사용 약관이 적용됩니다. [계속]을 선택하면 사용 약관에 동의한 것으로 간주됩니다. 정보 처리 방식은 개인정보 처리방침을 참조하세요.", "es": "El uso de {app} está sujeto a los Términos de uso que aparecen a continuación. Al seleccionar Continuar, aceptas los Términos de uso. La Política de privacidad explica cómo se trata la información.", "fr": "Votre utilisation de {app} est soumise aux Conditions d'utilisation ci-dessous. En sélectionnant Continuer, vous acceptez les Conditions d'utilisation. La Politique de confidentialité explique comment les informations sont traitées.", "ru": "Использование {app} регулируется приведенными ниже Условиями использования. Нажимая «Продолжить», вы принимаете Условия использования. О том, как обрабатывается информация, рассказывает Политика конфиденциальности.", "ar": "يخضع استخدامك لـ {app} لشروط الاستخدام الواردة أدناه. باختيارك «متابعة»، فإنك توافق على شروط الاستخدام. وتوضح سياسة الخصوصية كيفية التعامل مع المعلومات."},
+"{app}を初めて起動した時から{days}日間は、すべての機能を無料でお使いいただけます。その後、OCR や墨消しの範囲の指定などのプレミアム機能を使うには、購入が必要です。購入の前に、必要な機能が使えることを無料期間中にお確かめください。": {"en": "Every feature is free for {days} days from the first time you start {app}. After that, premium features such as OCR and marking text for redaction need a purchase. Please use the free period to make sure the features you need work for you before you buy.", "zh_CN": "从首次启动 {app} 起 {days} 天内，所有功能均可免费使用。之后，OCR、标记密文等高级功能需要购买。购买前，请在免费期间确认您需要的功能可以正常使用。", "ko": "{app}을(를) 처음 시작한 때부터 {days}일 동안 모든 기능을 무료로 사용할 수 있습니다. 그 후에는 OCR, 교정 영역 지정 등 프리미엄 기능을 사용하려면 구매해야 합니다. 구매하기 전에 무료 기간 동안 필요한 기능이 제대로 작동하는지 확인하세요.", "es": "Todas las funciones son gratuitas durante {days} días desde la primera vez que inicias {app}. Después, las características premium, como el OCR y marcar texto para censurar, requieren una compra. Antes de comprar, aprovecha el periodo gratuito para comprobar que las funciones que necesitas te sirven.", "fr": "Toutes les fonctionnalités sont gratuites pendant {days} jours à partir du premier démarrage de {app}. Ensuite, les fonctionnalités premium, comme l'OCR et le marquage de texte à biffer, nécessitent un achat. Avant d'acheter, profitez de la période gratuite pour vérifier que les fonctionnalités dont vous avez besoin vous conviennent.", "ru": "Все функции бесплатны в течение {days} дней с первого запуска {app}. После этого для премиум-функций, например OCR и выделения текста для скрытия, нужна покупка. Прежде чем покупать, убедитесь в течение бесплатного периода, что нужные вам функции работают.", "ar": "جميع الميزات مجانية لمدة {days} يومًا من أول تشغيل لـ {app}. بعد ذلك، تتطلب الميزات المتميزة، مثل التعرف الضوئي على الحروف (OCR) وتحديد النص للتنقيح، إجراء عملية شراء. قبل الشراء، استفد من الفترة المجانية للتأكد من أن الميزات التي تحتاجها تعمل كما تريد."},
 "大切な文書は、編集する前に複製を保存してください。墨消しをした文書を渡す前に、保存したファイルを別のソフトウェアで開き、内容が消えていることを確かめてください。": {"en": "Keep a copy of any important document before you edit it. Before you share a redacted document, open the saved file in another program and check that the content is gone.", "zh_CN": "编辑重要文档前，请先保存一份副本。在分享已应用密文的文档前，请用其他软件打开保存后的文件，确认相应内容已被删除。", "ko": "중요한 문서는 편집하기 전에 사본을 저장하세요. 교정한 문서를 전달하기 전에 저장된 파일을 다른 프로그램으로 열어 내용이 지워졌는지 확인하세요.", "es": "Guarda una copia de los documentos importantes antes de editarlos. Antes de compartir un documento censurado, abre el archivo guardado en otro programa y comprueba que el contenido ya no está.", "fr": "Conservez une copie de tout document important avant de le modifier. Avant de partager un document biffé, ouvrez le fichier enregistré dans un autre programme et vérifiez que le contenu a bien disparu.", "ru": "Сохраняйте копию важного документа перед его изменением. Прежде чем передать документ со скрытыми данными, откройте сохраненный файл в другой программе и убедитесь, что содержимое удалено.", "ar": "احتفظ بنسخة من أي مستند مهم قبل تعديله. وقبل مشاركة مستند منقّح، افتح الملف المحفوظ في برنامج آخر وتحقق من أن المحتوى قد أُزيل."},
-"利用規約とプライバシー ポリシーは、{app}のライセンスである GNU AGPL に基づいて利用者が有する権利を制限するものではありません。": {"en": "The Terms of Use and the Privacy Policy do not restrict any right you have under the GNU AGPL, the license of {app}.", "zh_CN": "使用条款和隐私政策不限制您依据 {app} 的许可证 GNU AGPL 享有的任何权利。", "ko": "이용 약관과 개인정보 처리방침은 {app}의 라이선스인 GNU AGPL에 따라 사용자가 가지는 권리를 제한하지 않습니다.", "es": "Los Términos de uso y la Política de privacidad no restringen ninguno de los derechos que te concede la GNU AGPL, la licencia de {app}.", "fr": "Les Conditions d'utilisation et la Politique de confidentialité ne restreignent aucun des droits que vous confère la GNU AGPL, licence de {app}.", "ru": "Условия использования и Политика конфиденциальности не ограничивают ваши права по GNU AGPL, лицензии {app}.", "ar": "لا تقيّد شروط الاستخدام وسياسة الخصوصية أيّ حق تمنحك إياه رخصة GNU AGPL، وهي رخصة {app}."},
+"利用規約とプライバシー ポリシーは、{app}のライセンスである GNU AGPL に基づいて利用者が有する権利を制限するものではありません。": {"en": "The Terms of Use and the Privacy Policy do not restrict any right you have under the GNU AGPL, the license of {app}.", "zh_CN": "使用条款和隐私政策不限制您依据 {app} 的许可证 GNU AGPL 享有的任何权利。", "ko": "사용 약관과 개인정보 처리방침은 {app}의 라이선스인 GNU AGPL에 따라 사용자가 가지는 권리를 제한하지 않습니다.", "es": "Los Términos de uso y la Política de privacidad no restringen ninguno de los derechos que te concede la GNU AGPL, la licencia de {app}.", "fr": "Les Conditions d'utilisation et la Politique de confidentialité ne restreignent aucun des droits que vous confère la GNU AGPL, licence de {app}.", "ru": "Условия использования и Политика конфиденциальности не ограничивают ваши права по GNU AGPL, лицензии {app}.", "ar": "لا تقيّد شروط الاستخدام وسياسة الخصوصية أيّ حق تمنحك إياه رخصة GNU AGPL، وهي رخصة {app}."},
 "購入する…": {"en": "Buy…", "zh_CN": "购买…", "ko": "구매…", "es": "Comprar…", "fr": "Acheter…", "ru": "Купить…", "ar": "شراء…"},
-"［購入する］を選ぶと、購入の前に内容を確認する画面が開きます。": {"en": "Select Buy to see the details before you buy.", "zh_CN": "选择“购买”后，会在购买前打开确认内容的画面。", "ko": "[구매]를 선택하면 구매 전에 내용을 확인하는 화면이 열립니다.", "es": "Selecciona Comprar para ver los detalles antes de comprar.", "fr": "Sélectionnez Acheter pour voir le détail avant d'acheter.", "ru": "Нажмите «Купить», чтобы перед покупкой просмотреть ее условия.", "ar": "اختر «شراء» لعرض التفاصيل قبل الشراء."},
-"プレミアム機能は、Microsoft Store 版の pdfNote で購入できます。": {"en": "Premium features can be bought in pdfNote from the Microsoft Store.", "zh_CN": "高级功能可在 Microsoft Store 版 pdfNote 中购买。", "ko": "프리미엄 기능은 Microsoft Store 버전 pdfNote에서 구매할 수 있습니다.", "es": "Las características premium se pueden comprar en pdfNote de Microsoft Store.", "fr": "Les fonctionnalités premium s'achètent dans pdfNote du Microsoft Store.", "ru": "Премиум-функции можно купить в pdfNote из Microsoft Store.", "ar": "يمكن شراء الميزات المتميزة في pdfNote من Microsoft Store."},
+"［購入する］を選ぶと、購入の前に内容を確認する画面が開きます。": {"en": "Select Buy to see the details before you buy.", "zh_CN": "选择“购买”可在购买前查看详细信息。", "ko": "[구매]를 선택하면 구매 전에 내용을 확인하는 화면이 열립니다.", "es": "Selecciona Comprar para ver los detalles antes de comprar.", "fr": "Sélectionnez Acheter pour voir le détail avant d'acheter.", "ru": "Нажмите «Купить», чтобы перед покупкой просмотреть ее условия.", "ar": "اختر «شراء» لعرض التفاصيل قبل الشراء."},
+"プレミアム機能は、Microsoft Store 版の pdfNote で購入できます。": {"en": "You can buy premium features in the Microsoft Store edition of pdfNote.", "zh_CN": "高级功能可在 Microsoft Store 版 pdfNote 中购买。", "ko": "프리미엄 기능은 Microsoft Store 버전 pdfNote에서 구매할 수 있습니다.", "es": "Puedes comprar las características premium en la edición de pdfNote de Microsoft Store.", "fr": "Vous pouvez acheter les fonctionnalités premium dans l'édition Microsoft Store de pdfNote.", "ru": "Премиум-функции можно купить в pdfNote из Microsoft Store.", "ar": "يمكنك شراء الميزات المتميزة في إصدار Microsoft Store من pdfNote."},
 "プレミアムの購入": {"en": "Buy Premium", "zh_CN": "购买高级版", "ko": "프리미엄 구매", "es": "Comprar premium", "fr": "Acheter la version premium", "ru": "Покупка премиум-версии", "ar": "شراء الميزات المتميزة"},
 "購入の手続きが進行中です。Microsoft Store の画面で手続きを完了してください。": {"en": "A purchase is already in progress. Please finish it in the Microsoft Store window.", "zh_CN": "购买正在进行中。请在 Microsoft Store 窗口中完成购买。", "ko": "구매가 진행 중입니다. Microsoft Store 창에서 구매를 완료하세요.", "es": "Ya hay una compra en curso. Termínala en la ventana de Microsoft Store.", "fr": "Un achat est déjà en cours. Terminez-le dans la fenêtre du Microsoft Store.", "ru": "Покупка уже выполняется. Завершите ее в окне Microsoft Store.", "ar": "هناك عملية شراء قيد التنفيذ بالفعل. يُرجى إكمالها في نافذة Microsoft Store."},
 "ご購入ありがとうございます。プレミアム機能をお使いいただけます。": {"en": "Thank you for your purchase. The premium features are now available.", "zh_CN": "感谢您的购买。现在可以使用高级功能了。", "ko": "구매해 주셔서 감사합니다. 이제 프리미엄 기능을 사용할 수 있습니다.", "es": "Gracias por tu compra. Ya puedes usar las características premium.", "fr": "Merci pour votre achat. Les fonctionnalités premium sont maintenant disponibles.", "ru": "Спасибо за покупку. Премиум-функции теперь доступны.", "ar": "شكرًا لك على الشراء. أصبحت الميزات المتميزة متاحة الآن."},
-"この商品はすでに購入済みです。プレミアム機能をお使いいただけます。": {"en": "You have already bought this. The premium features are available.", "zh_CN": "您已购买此商品。可以使用高级功能。", "ko": "이미 구매한 상품입니다. 프리미엄 기능을 사용할 수 있습니다.", "es": "Ya has comprado este producto. Puedes usar las características premium.", "fr": "Vous avez déjà acheté ce produit. Les fonctionnalités premium sont disponibles.", "ru": "Вы уже купили этот продукт. Премиум-функции доступны.", "ar": "لقد اشتريت هذا المنتج بالفعل. الميزات المتميزة متاحة."},
-"購入を完了できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "The purchase could not be completed. Check your internet connection and try again.", "zh_CN": "无法完成购买。请检查网络连接后重试。", "ko": "구매를 완료할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo completar la compra. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "L'achat n'a pas pu être finalisé. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось завершить покупку. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذّر إكمال عملية الشراء. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
+"この商品はすでに購入済みです。プレミアム機能をお使いいただけます。": {"en": "You've already bought this. The premium features are available.", "zh_CN": "您已购买此商品。可以使用高级功能。", "ko": "이미 구매한 상품입니다. 프리미엄 기능을 사용할 수 있습니다.", "es": "Ya has comprado este producto. Puedes usar las características premium.", "fr": "Vous avez déjà acheté ce produit. Les fonctionnalités premium sont disponibles.", "ru": "Вы уже купили этот продукт. Премиум-функции доступны.", "ar": "لقد اشتريت هذا المنتج بالفعل. الميزات المتميزة متاحة."},
+"購入を完了できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "The purchase couldn't be completed. Check your internet connection and try again.", "zh_CN": "无法完成购买。请检查网络连接后重试。", "ko": "구매를 완료할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo completar la compra. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "L'achat n'a pas pu être finalisé. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось завершить покупку. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذّر إكمال عملية الشراء. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
 "{count} か月ごとに自動更新されます": {"en": "Renews automatically every {count} months", "zh_CN": "每 {count} 个月自动续订", "ko": "{count}개월마다 자동으로 갱신됩니다", "es": "Se renueva automáticamente cada {count} meses", "fr": "Renouvelé automatiquement tous les {count} mois", "ru": "Продлевается автоматически каждые {count} мес.", "ar": "يتجدد تلقائيًا كل {count} شهرًا"},
 "{count} 年ごとに自動更新されます": {"en": "Renews automatically every {count} years", "zh_CN": "每 {count} 年自动续订", "ko": "{count}년마다 자동으로 갱신됩니다", "es": "Se renueva automáticamente cada {count} años", "fr": "Renouvelé automatiquement tous les {count} ans", "ru": "Продлевается автоматически каждые {count} лет", "ar": "يتجدد تلقائيًا كل {count} سنة"},
 "自動更新されます": {"en": "Renews automatically", "zh_CN": "自动续订", "ko": "자동으로 갱신됩니다", "es": "Se renueva automáticamente", "fr": "Renouvelé automatiquement", "ru": "Продлевается автоматически", "ar": "يتجدد تلقائيًا"},
 "Microsoft Store から商品と価格を読み込んでいます…": {"en": "Getting products and prices from the Microsoft Store…", "zh_CN": "正在从 Microsoft Store 获取商品和价格…", "ko": "Microsoft Store에서 상품과 가격을 가져오는 중…", "es": "Obteniendo productos y precios de Microsoft Store…", "fr": "Récupération des produits et des prix depuis le Microsoft Store…", "ru": "Получение продуктов и цен из Microsoft Store…", "ar": "جارٍ جلب المنتجات والأسعار من Microsoft Store…"},
 "購入の前にお読みください:": {"en": "Please read before you buy:", "zh_CN": "购买前请阅读：", "ko": "구매 전에 읽어 주세요:", "es": "Lee esto antes de comprar:", "fr": "À lire avant d'acheter :", "ru": "Прочитайте перед покупкой:", "ar": "يُرجى القراءة قبل الشراء:"},
 "特定商取引法に基づく表記": {"en": "Legal notice for Japan (Specified Commercial Transactions Act)", "zh_CN": "基于《特定商业交易法》的标示（日本）", "ko": "특정상거래법에 따른 표기(일본)", "es": "Aviso legal para Japón (Ley de Transacciones Comerciales Especificadas)", "fr": "Mentions légales pour le Japon (loi sur les transactions commerciales spécifiées)", "ru": "Правовая информация для Японии (Закон об определенных коммерческих сделках)", "ar": "إشعار قانوني لليابان (قانون المعاملات التجارية المحددة)"},
-"利用規約に同意します。購入後すぐにプレミアム機能が使えるようになることに同意し、欧州経済領域又は英国にお住まいの場合は、これにより撤回権を失うことを了承します。": {"en": "I agree to the Terms of Use. I agree that the premium features are made available immediately after purchase and, if I live in the European Economic Area or the United Kingdom, I acknowledge that I thereby lose my right of withdrawal.", "zh_CN": "我同意使用条款。我同意购买后立即启用高级功能；如果我居住在欧洲经济区或英国，我知悉因此将丧失撤回权。", "ko": "이용 약관에 동의합니다. 구매 직후 프리미엄 기능을 사용할 수 있게 되는 것에 동의하며, 유럽 경제 지역 또는 영국에 거주하는 경우 이로 인해 철회권을 잃는다는 것을 인정합니다.", "es": "Acepto los Términos de uso. Acepto que las características premium estén disponibles inmediatamente después de la compra y, si resido en el Espacio Económico Europeo o en el Reino Unido, reconozco que por ello pierdo mi derecho de desistimiento.", "fr": "J'accepte les Conditions d'utilisation. J'accepte que les fonctionnalités premium soient disponibles immédiatement après l'achat et, si je réside dans l'Espace économique européen ou au Royaume-Uni, je reconnais perdre ainsi mon droit de rétractation.", "ru": "Я принимаю Условия использования. Я согласен с тем, что премиум-функции становятся доступны сразу после покупки, и, если я проживаю в Европейской экономической зоне или Великобритании, признаю, что тем самым теряю право на отказ от договора.", "ar": "أوافق على شروط الاستخدام. وأوافق على إتاحة الميزات المتميزة فور الشراء، وإذا كنت أقيم في المنطقة الاقتصادية الأوروبية أو المملكة المتحدة، فإنني أقر بأنني أفقد بذلك حقي في الانسحاب."},
+"利用規約に同意します。購入後すぐにプレミアム機能が使えるようになることに同意し、欧州経済領域又は英国にお住まいの場合は、これにより撤回権を失うことを了承します。": {"en": "I agree to the Terms of Use. I agree that the premium features are made available immediately after purchase and, if I live in the European Economic Area or the United Kingdom, I acknowledge that I thereby lose my right of withdrawal.", "zh_CN": "我同意使用条款。我同意购买后立即启用高级功能；如果我居住在欧洲经济区或英国，我知悉因此将丧失撤回权。", "ko": "사용 약관에 동의합니다. 구매 직후 프리미엄 기능을 사용할 수 있게 되는 것에 동의하며, 유럽 경제 지역 또는 영국에 거주하는 경우 이로 인해 철회권을 잃는다는 것을 인정합니다.", "es": "Acepto los Términos de uso. Acepto que las características premium estén disponibles inmediatamente después de la compra y, si resido en el Espacio Económico Europeo o en el Reino Unido, reconozco que por ello pierdo mi derecho de desistimiento.", "fr": "J'accepte les Conditions d'utilisation. J'accepte que les fonctionnalités premium soient disponibles immédiatement après l'achat et, si je réside dans l'Espace économique européen ou au Royaume-Uni, je reconnais perdre ainsi mon droit de rétractation.", "ru": "Я принимаю Условия использования. Я согласен с тем, что премиум-функции становятся доступны сразу после покупки, и, если я проживаю в Европейской экономической зоне или Великобритании, признаю, что тем самым теряю право на отказ от договора.", "ar": "أوافق على شروط الاستخدام. وأوافق على إتاحة الميزات المتميزة فور الشراء، وإذا كنت أقيم في المنطقة الاقتصادية الأوروبية أو المملكة المتحدة، فإنني أقر بأنني أفقد بذلك حقي في الانسحاب."},
 "Microsoft Store で購入": {"en": "Buy in Microsoft Store", "zh_CN": "在 Microsoft Store 中购买", "ko": "Microsoft Store에서 구매", "es": "Comprar en Microsoft Store", "fr": "Acheter dans le Microsoft Store", "ru": "Купить в Microsoft Store", "ar": "الشراء من Microsoft Store"},
-"Microsoft Store に接続できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "Could not connect to the Microsoft Store. Check your internet connection and try again.", "zh_CN": "无法连接到 Microsoft Store。请检查网络连接后重试。", "ko": "Microsoft Store에 연결할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo conectar con Microsoft Store. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "Impossible de se connecter au Microsoft Store. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось подключиться к Microsoft Store. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذّر الاتصال بـ Microsoft Store. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
+"Microsoft Store に接続できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "Couldn't connect to the Microsoft Store. Check your internet connection and try again.", "zh_CN": "无法连接到 Microsoft Store。请检查网络连接后重试。", "ko": "Microsoft Store에 연결할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo conectar con Microsoft Store. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "Impossible de se connecter au Microsoft Store. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось подключиться к Microsoft Store. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذّر الاتصال بـ Microsoft Store. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
 "現在購入できる商品がありません。": {"en": "There is nothing available to buy right now.", "zh_CN": "目前没有可购买的商品。", "ko": "현재 구매할 수 있는 상품이 없습니다.", "es": "Ahora mismo no hay nada disponible para comprar.", "fr": "Aucun produit n'est disponible à l'achat pour le moment.", "ru": "Сейчас нет доступных для покупки продуктов.", "ar": "لا يوجد ما يمكن شراؤه حاليًا."},
 "購入する商品を選んでください。": {"en": "Choose what to buy.", "zh_CN": "请选择要购买的商品。", "ko": "구매할 상품을 선택하세요.", "es": "Elige qué quieres comprar.", "fr": "Choisissez ce que vous voulez acheter.", "ru": "Выберите, что купить.", "ar": "اختر ما تريد شراءه."},
 "買い切り（お支払いは1回だけです）": {"en": "One-time purchase (you pay once)", "zh_CN": "一次性购买（仅支付一次）", "ko": "일회성 구매(한 번만 결제)", "es": "Compra única (pagas una sola vez)", "fr": "Achat unique (un seul paiement)", "ru": "Разовая покупка (оплата один раз)", "ar": "شراء لمرة واحدة (تدفع مرة واحدة فقط)"},
@@ -1951,12 +2079,12 @@ TRANSLATIONS = {
 "契約期間と解約": {"en": "Term and cancellation", "zh_CN": "合约期限与取消", "ko": "계약 기간 및 해지", "es": "Duración y cancelación", "fr": "Durée et résiliation", "ru": "Срок и отмена", "ar": "المدة والإلغاء"},
 "{renewal}。Microsoft アカウントの「サービスとサブスクリプション」でいつでも解約できます。解約は支払済みの期間の終わりに効力を生じ、残りの期間の分は返金されません。": {"en": "{renewal}. You can cancel at any time under Services & subscriptions in your Microsoft account. Cancellation takes effect at the end of the period you have paid for, and the rest of that period is not refunded.", "zh_CN": "{renewal}。您可以随时在 Microsoft 帐户的“服务和订阅”中取消。取消将在已付费期间结束时生效，剩余期间不予退款。", "ko": "{renewal}. Microsoft 계정의 '서비스 및 구독'에서 언제든지 해지할 수 있습니다. 해지는 결제한 기간이 끝날 때 효력이 발생하며, 남은 기간에 대해서는 환불되지 않습니다.", "es": "{renewal}. Puedes cancelarla en cualquier momento en Servicios y suscripciones de tu cuenta Microsoft. La cancelación surte efecto al final del periodo pagado, y el resto de ese periodo no se reembolsa.", "fr": "{renewal}. Vous pouvez résilier à tout moment dans Services et abonnements de votre compte Microsoft. La résiliation prend effet à la fin de la période payée, et le reste de cette période n'est pas remboursé.", "ru": "{renewal}. Отменить подписку можно в любое время в разделе «Службы и подписки» учетной записи Microsoft. Отмена вступает в силу в конце оплаченного периода; оставшаяся часть периода не возмещается.", "ar": "{renewal}. يمكنك الإلغاء في أي وقت من «الخدمات والاشتراكات» في حساب Microsoft الخاص بك. يسري الإلغاء في نهاية الفترة التي دفعت مقابلها، ولا يُسترد المبلغ عن باقي تلك الفترة."},
 "返品・返金": {"en": "Returns and refunds", "zh_CN": "退货与退款", "ko": "반품 및 환불", "es": "Devoluciones y reembolsos", "fr": "Retours et remboursements", "ru": "Возврат и возмещение", "ar": "الإرجاع واسترداد المبالغ"},
-"購入後の返金は、法令又は Microsoft の返金の規定による場合を除き、お受けできません。pdfNote は GNU AGPL の下で提供され、そのソースコードは公開されています。このことは返金の理由となりません。": {"en": "Purchases are not refundable, except where the law or Microsoft's refund policy provides otherwise. pdfNote is licensed under the GNU AGPL and its source code is published; this is not a ground for a refund.", "zh_CN": "除法律或 Microsoft 退款政策另有规定外，购买后不予退款。pdfNote 依据 GNU AGPL 提供，其源代码已公开；这不构成退款理由。", "ko": "법령 또는 Microsoft의 환불 규정에 따른 경우를 제외하고, 구매 후에는 환불되지 않습니다. pdfNote는 GNU AGPL에 따라 제공되며 소스 코드가 공개되어 있습니다. 이는 환불 사유가 되지 않습니다.", "es": "Las compras no son reembolsables, salvo que la ley o la política de reembolsos de Microsoft dispongan otra cosa. pdfNote se ofrece bajo la GNU AGPL y su código fuente está publicado; esto no es motivo de reembolso.", "fr": "Les achats ne sont pas remboursables, sauf si la loi ou la politique de remboursement de Microsoft en dispose autrement. pdfNote est distribué sous la GNU AGPL et son code source est publié ; cela ne constitue pas un motif de remboursement.", "ru": "Покупки не подлежат возврату, если иное не предусмотрено законом или правилами возврата Microsoft. pdfNote распространяется по лицензии GNU AGPL, и его исходный код опубликован; это не является основанием для возврата.", "ar": "لا تُسترد المبالغ بعد الشراء، إلا إذا نص القانون أو سياسة الاسترداد لدى Microsoft على خلاف ذلك. يُقدَّم pdfNote بموجب رخصة GNU AGPL وشيفرته المصدرية منشورة؛ ولا يُعد ذلك سببًا لاسترداد المبلغ."},
-"文書がその後に変更されたため、やり直せませんでした": {"en": "The document was changed since, so this cannot be redone", "zh_CN": "文档此后已被更改，因此无法恢复", "ko": "그 이후 문서가 변경되어 다시 실행할 수 없습니다", "es": "El documento se modificó después, así que no se puede rehacer", "fr": "Le document a été modifié depuis ; impossible de rétablir", "ru": "Документ был изменен после этого, поэтому повторить действие нельзя", "ar": "تم تغيير المستند منذ ذلك الحين، لذا لا يمكن الإعادة"},
+"購入後の返金は、法令又は Microsoft の返金の規定による場合を除き、お受けできません。pdfNote は GNU AGPL の下で提供され、そのソース コードは公開されています。このことは返金の理由となりません。": {"en": "Purchases are not refundable, except where the law or Microsoft's refund policy provides otherwise. pdfNote is licensed under the GNU AGPL and its source code is published; this is not grounds for a refund.", "zh_CN": "除法律或 Microsoft 退款政策另有规定外，购买后不予退款。pdfNote 依据 GNU AGPL 提供，其源代码已公开；这不构成退款理由。", "ko": "법령 또는 Microsoft의 환불 규정에 따른 경우를 제외하고, 구매 후에는 환불되지 않습니다. pdfNote는 GNU AGPL에 따라 제공되며 소스 코드가 공개되어 있습니다. 이는 환불 사유가 되지 않습니다.", "es": "Las compras no son reembolsables, salvo que la ley o la política de reembolsos de Microsoft dispongan otra cosa. pdfNote se ofrece bajo la GNU AGPL y su código fuente está publicado; esto no es motivo de reembolso.", "fr": "Les achats ne sont pas remboursables, sauf si la loi ou la politique de remboursement de Microsoft en dispose autrement. pdfNote est distribué sous la GNU AGPL et son code source est publié ; cela ne constitue pas un motif de remboursement.", "ru": "Покупки не подлежат возврату, если иное не предусмотрено законом или правилами возврата Microsoft. pdfNote распространяется по лицензии GNU AGPL, и его исходный код опубликован; это не является основанием для возврата.", "ar": "لا تُسترد المبالغ بعد الشراء، إلا إذا نص القانون أو سياسة الاسترداد لدى Microsoft على خلاف ذلك. يُقدَّم pdfNote بموجب رخصة GNU AGPL وشيفرته المصدرية منشورة؛ ولا يُعد ذلك سببًا لاسترداد المبلغ."},
+"文書がその後に変更されたため、やり直せませんでした": {"en": "The document has changed since then, so this can't be redone", "zh_CN": "文档此后已被更改，因此无法恢复", "ko": "그 이후 문서가 변경되어 다시 실행할 수 없습니다", "es": "El documento se modificó después, así que no se puede rehacer", "fr": "Le document a été modifié depuis ; impossible de rétablir", "ru": "Документ был изменен после этого, поэтому повторить действие нельзя", "ar": "تغيّر المستند منذ ذلك الحين، لذا تتعذّر الإعادة"},
 "続ける": {"en": "Continue", "zh_CN": "继续", "ko": "계속", "es": "Continuar", "fr": "Continuer", "ru": "Продолжить", "ar": "متابعة"},
 "AGPL 第7条に基づく追加条項（{app}の名称とアイコン、改変版の表示など）が適用されます。「{tab}」タブの「{document}」をご覧ください。": {"en": "Additional terms under section 7 of the AGPL apply, concerning among other things the name and icon of {app} and the marking of modified versions. See “{document}” on the “{tab}” tab.", "zh_CN": "适用 AGPL 第 7 条规定的附加条款（涉及 {app} 的名称和图标、修改版本的标示等）。请参阅“{tab}”选项卡中的“{document}”。", "ko": "AGPL 제7조에 따른 추가 조건({app}의 이름과 아이콘, 수정 버전의 표시 등)이 적용됩니다. “{tab}” 탭의 “{document}”을(를) 참조하세요.", "es": "Se aplican condiciones adicionales conforme a la sección 7 de la AGPL, relativas, entre otras cosas, al nombre y el icono de {app} y a la identificación de las versiones modificadas. Consulta «{document}», en la pestaña «{tab}».", "fr": "Des conditions supplémentaires au titre de l'article 7 de l'AGPL s'appliquent, notamment au nom et à l'icône de {app} et à l'identification des versions modifiées. Consultez « {document} », onglet « {tab} ».", "ru": "Применяются дополнительные условия согласно разделу 7 AGPL, в том числе в отношении названия и значка {app} и обозначения измененных версий. См. документ «{document}» на вкладке «{tab}».", "ar": "تسري شروط إضافية بموجب القسم 7 من AGPL، تتعلق من بين أمور أخرى باسم {app} وأيقونته وتمييز النسخ المعدّلة. راجع «{document}» ضمن علامة التبويب «{tab}»."},
 "{app}は、GNU Affero General Public License 第3版（またはそれ以降の版）の下で提供されます。ライセンシーは、同ライセンスの条件に従って{app}を頒布できます。ライセンスの本文は「{tab}」タブにあります。": {"en": "{app} is licensed under the GNU Affero General Public License, version 3 or (at your option) any later version. Licensees may convey {app} under the terms of that license, the text of which is on the “{tab}” tab.", "zh_CN": "{app} 依据 GNU Affero 通用公共许可证第 3 版（或您选择的任何更高版本）授权。被许可人可以按照该许可证的条款传递 {app}，许可证文本位于“{tab}”选项卡。", "ko": "{app}은(는) GNU Affero 일반 공중 사용 허가서 버전 3(또는 선택에 따라 그 이후 버전)에 따라 사용이 허가됩니다. 사용권자는 이 라이선스의 조건에 따라 {app}을(를) 배포할 수 있으며, 라이선스 본문은 “{tab}” 탭에 있습니다.", "es": "{app} se distribuye con la Licencia Pública General Affero de GNU, versión 3 o (a tu elección) cualquier versión posterior. Los licenciatarios pueden transmitir {app} según los términos de esa licencia, cuyo texto está en la pestaña «{tab}».", "fr": "{app} est distribué sous la licence publique générale GNU Affero, version 3 ou (à votre choix) toute version ultérieure. Les licenciés peuvent transmettre {app} selon les termes de cette licence, dont le texte figure dans l'onglet « {tab} ».", "ru": "{app} лицензируется на условиях Стандартной общественной лицензии GNU Affero версии 3 или (по вашему выбору) любой более поздней версии. Лицензиаты могут передавать {app} на условиях этой лицензии; ее текст приведен на вкладке «{tab}».", "ar": "يُرخَّص {app} بموجب رخصة جنو أفيرو العمومية العامة، الإصدار 3 أو (حسب اختيارك) أي إصدار لاحق. ويجوز للمرخَّص لهم نقل {app} وفقًا لشروط هذا الترخيص، ويوجد نصه في علامة التبويب «{tab}»."},
-"{app}には、法令で認められる範囲で、また利用規約に定める場合を除き、商品性や特定目的への適合性の保証を含め、いかなる保証もありません。Microsoft Store で提供される{app}とその中での購入には、「{terms}」タブの利用規約が適用されます。": {"en": "{app} comes with NO WARRANTY, including any implied warranty of merchantability or fitness for a particular purpose, to the extent permitted by applicable law and except as stated in the Terms of Use. The Terms of Use on the “{terms}” tab apply to {app} as published in the Microsoft Store and to purchases made in it.", "zh_CN": "在适用法律允许的范围内，除使用条款另有规定外，{app} 不提供任何担保，包括对适销性或特定用途适用性的默示担保。“{terms}”选项卡中的使用条款适用于在 Microsoft Store 中发布的 {app} 及在其中进行的购买。", "ko": "관련 법률이 허용하는 범위에서, 그리고 이용 약관에 규정된 경우를 제외하고, {app}은(는) 상품성이나 특정 목적 적합성에 대한 묵시적 보증을 포함하여 어떠한 보증도 제공하지 않습니다. Microsoft Store에서 게시된 {app} 및 그 안에서의 구매에는 “{terms}” 탭의 이용 약관이 적용됩니다.", "es": "{app} se ofrece SIN NINGUNA GARANTÍA, incluidas las garantías implícitas de comerciabilidad o idoneidad para un fin determinado, en la medida permitida por la ley aplicable y salvo lo dispuesto en los Términos de uso. Los Términos de uso de la pestaña «{terms}» se aplican a {app} tal como se publica en Microsoft Store y a las compras realizadas en él.", "fr": "{app} est fourni SANS AUCUNE GARANTIE, y compris les garanties implicites de qualité marchande ou d'adéquation à un usage particulier, dans la mesure permise par la loi applicable et sauf disposition contraire des Conditions d'utilisation. Les Conditions d'utilisation de l'onglet « {terms} » s'appliquent à {app} tel que publié dans le Microsoft Store et aux achats qui y sont effectués.", "ru": "{app} предоставляется БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, включая подразумеваемые гарантии товарной пригодности и пригодности для определенной цели, в пределах, допускаемых применимым законодательством, если иное не предусмотрено Условиями использования. Условия использования на вкладке «{terms}» применяются к {app}, опубликованной в Microsoft Store, и к покупкам в ней.", "ar": "يأتي {app} دون أي ضمان، بما في ذلك الضمانات الضمنية للقابلية للتسويق أو الملاءمة لغرض معين، في الحدود التي يسمح بها القانون المعمول به وباستثناء ما تنص عليه شروط الاستخدام. تسري شروط الاستخدام الموجودة في علامة التبويب «{terms}» على {app} كما هو منشور في Microsoft Store وعلى عمليات الشراء التي تتم فيه."},
+"{app}には、法令で認められる範囲で、また利用規約に定める場合を除き、商品性や特定目的への適合性の保証を含め、いかなる保証もありません。Microsoft Store で提供される{app}とその中での購入には、「{terms}」タブの利用規約が適用されます。": {"en": "{app} comes with NO WARRANTY, including any implied warranty of merchantability or fitness for a particular purpose, to the extent permitted by applicable law and except as stated in the Terms of Use. The Terms of Use on the “{terms}” tab apply to {app} as published in the Microsoft Store and to purchases made in it.", "zh_CN": "在适用法律允许的范围内，除使用条款另有规定外，{app} 不提供任何担保，包括对适销性或特定用途适用性的默示担保。“{terms}”选项卡中的使用条款适用于在 Microsoft Store 中发布的 {app} 及在其中进行的购买。", "ko": "관련 법률이 허용하는 범위에서, 그리고 사용 약관에 규정된 경우를 제외하고, {app}은(는) 상품성이나 특정 목적 적합성에 대한 묵시적 보증을 포함하여 어떠한 보증도 제공하지 않습니다. Microsoft Store에서 게시된 {app} 및 그 안에서의 구매에는 “{terms}” 탭의 사용 약관이 적용됩니다.", "es": "{app} se ofrece SIN NINGUNA GARANTÍA, incluidas las garantías implícitas de comerciabilidad o idoneidad para un fin determinado, en la medida permitida por la ley aplicable y salvo lo dispuesto en los Términos de uso. Los Términos de uso de la pestaña «{terms}» se aplican a {app} tal como se publica en Microsoft Store y a las compras realizadas en él.", "fr": "{app} est fourni SANS AUCUNE GARANTIE, y compris les garanties implicites de qualité marchande ou d'adéquation à un usage particulier, dans la mesure permise par la loi applicable et sauf disposition contraire des Conditions d'utilisation. Les Conditions d'utilisation de l'onglet « {terms} » s'appliquent à {app} tel que publié dans le Microsoft Store et aux achats qui y sont effectués.", "ru": "{app} предоставляется БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, включая подразумеваемые гарантии товарной пригодности и пригодности для определенной цели, в пределах, допускаемых применимым законодательством, если иное не предусмотрено Условиями использования. Условия использования на вкладке «{terms}» применяются к {app}, опубликованной в Microsoft Store, и к покупкам в ней.", "ar": "يأتي {app} دون أي ضمان، بما في ذلك الضمانات الضمنية للقابلية للتسويق أو الملاءمة لغرض معين، في الحدود التي يسمح بها القانون المعمول به وباستثناء ما تنص عليه شروط الاستخدام. تسري شروط الاستخدام الموجودة في علامة التبويب «{terms}» على {app} كما هو منشور في Microsoft Store وعلى عمليات الشراء التي تتم فيه."},
 "このソフトウェアは次のオープンソース ソフトウェアを利用しています。": {"en": "This software uses the following open-source software.", "zh_CN": "本软件使用了以下开放源代码软件。", "ko": "이 소프트웨어는 다음 오픈 소스 소프트웨어를 사용합니다.", "es": "Este software usa el siguiente software de código abierto.", "fr": "Ce logiciel utilise les logiciels open source suivants.", "ru": "Эта программа использует следующее ПО с открытым кодом.", "ar": "يستخدم هذا البرنامج البرامج مفتوحة المصدر التالية."},
 "コンポーネント": {"en": "Component", "zh_CN": "组件", "ko": "구성 요소", "es": "Componente", "fr": "Composant", "ru": "Компонент", "ar": "المكوّن"},
 "バージョン": {"en": "Version", "zh_CN": "版本", "ko": "버전", "es": "Versión", "fr": "Version", "ru": "Версия", "ar": "الإصدار"},
@@ -1970,17 +2098,37 @@ TRANSLATIONS = {
 # Excel Freeze Panes (Inmovilizar, Figer, Закрепить, 冻结, 틀 고정, تجميد).
 "ページを固定": {"en": "Freeze Page", "zh_CN": "冻结页面", "ko": "페이지 고정", "es": "Inmovilizar página", "fr": "Figer la page", "ru": "Закрепить страницу", "ar": "تجميد الصفحة"},
 "プレミアムでお使いいただけるもの:": {"en": "Premium includes:", "zh_CN": "高级版包含：", "ko": "프리미엄에 포함된 기능:", "es": "Premium incluye:", "fr": "Premium comprend :", "ru": "Премиум включает:", "ar": "يتضمّن Premium:"},
-"開く・読む・ハイライト・付箋・手書き・図形・保存・印刷は、これまでどおり無料でお使いいただけます。": {"en": "Opening, reading, Highlight, Sticky Note, Ink, shapes, Save and Print stay free.", "zh_CN": "打开、阅读、突出显示、便笺、手写、图形、保存和打印仍然免费。", "ko": "열기, 읽기, 강조 표시, 메모, 손글씨, 도형, 저장, 인쇄는 계속 무료로 사용할 수 있습니다.", "es": "Abrir, leer, Resaltar, Nota adhesiva, Dibujo a mano, formas, Guardar e Imprimir siguen siendo gratuitos.", "fr": "Ouvrir, lire, Surligner, Note autocollante, Dessin à main levée, formes, Enregistrer et Imprimer restent gratuits.", "ru": "Открытие, чтение, выделение цветом, заметки, рисование, фигуры, сохранение и печать остаются бесплатными.", "ar": "يظل الفتح والقراءة والتمييز والملاحظات الملصقة والرسم الحر والأشكال والحفظ والطباعة مجانية."},
+"開く・読む・ハイライト・付箋・手書き・図形・保存・印刷は、これまでどおり無料でお使いいただけます。": {"en": "Opening, reading, Highlight, Sticky Note, Ink, shapes, Save and Print stay free.", "zh_CN": "打开、阅读、突出显示、便笺、墨迹、图形、保存和打印仍然免费。", "ko": "열기, 읽기, 강조 표시, 스티커 메모, 잉크, 도형, 저장, 인쇄는 계속 무료로 사용할 수 있습니다.", "es": "Abrir, leer, Resaltar, Nota adhesiva, Entrada de lápiz, formas, Guardar e Imprimir siguen siendo gratuitos.", "fr": "Ouvrir, lire, Surlignage, Pense-bête, Encre, formes, Enregistrer et Imprimer restent gratuits.", "ru": "Открытие, чтение, выделение цветом, записки, рукописный ввод, фигуры, сохранение и печать остаются бесплатными.", "ar": "يظل الفتح والقراءة والتمييز والملاحظات الملصقة والحبر والأشكال والحفظ والطباعة مجانية."},
 "プレミアム機能": {"en": "Premium feature", "zh_CN": "高级功能", "ko": "프리미엄 기능", "es": "Característica premium", "fr": "Fonctionnalité premium", "ru": "Премиум-функция", "ar": "ميزة متميزة"},
 "「{feature}」はプレミアム機能です": {"en": "“{feature}” is a premium feature", "zh_CN": "“{feature}”是高级功能", "ko": "“{feature}”은(는) 프리미엄 기능입니다", "es": "«{feature}» es una característica premium", "fr": "« {feature} » est une fonctionnalité premium", "ru": "«{feature}» — премиум-функция", "ar": "«{feature}» ميزة متميزة"},
 "無料試用期間が終了しました": {"en": "Your free trial has ended", "zh_CN": "免费试用已结束", "ko": "무료 평가판 기간이 종료되었습니다", "es": "La prueba gratuita ha finalizado", "fr": "L'essai gratuit est terminé", "ru": "Срок действия бесплатной пробной версии истек", "ar": "انتهت التجربة المجانية"},
 "無料試用版: 残り {count} 日": {"en": "Free trial: {count} days left", "zh_CN": "免费试用：剩余 {count} 天", "ko": "무료 평가판: {count}일 남음", "es": "Prueba gratuita: quedan {count} días", "fr": "Essai gratuit : {count} jours restants", "ru": "Бесплатная пробная версия, осталось дней: {count}", "ar": "التجربة المجانية: متبقٍ {count} يومًا"},
-"無料試用版": {"en": "Free trial", "zh_CN": "免费试用", "ko": "무료 평가판", "es": "Prueba gratuita", "fr": "Essai gratuit", "ru": "Бесплатная пробная версия", "ar": "التجربة المجانية"},
 "Alt キーのショートカット": {"en": "Alt key shortcuts", "zh_CN": "Alt 键快捷方式", "ko": "Alt 키 바로 가기 키", "es": "Métodos abreviados con Alt", "fr": "Raccourcis clavier avec Alt", "ru": "Сочетания клавиш с ALT", "ar": "اختصارات المفتاح Alt"},
 "テキスト ボックスの追加": {"en": "Adding text boxes", "zh_CN": "添加文本框", "ko": "텍스트 상자 추가", "es": "Añadir cuadros de texto", "fr": "Ajout de zones de texte", "ru": "Добавление текстовых полей", "ar": "إضافة مربعات نص"},
 "キー ヒントを表示": {"en": "Show KeyTips", "zh_CN": "显示键提示", "ko": "키 설명 표시", "es": "Mostrar KeyTips", "fr": "Afficher les touches d'accès", "ru": "Показать подсказки клавиш", "ar": "إظهار تلميحات المفاتيح"},
 "Alt キー": {"en": "Alt", "zh_CN": "Alt", "ko": "Alt", "es": "Alt", "fr": "Alt", "ru": "ALT", "ar": "Alt"},
-"{description}: {shortcut}": {"en": "{description}: {shortcut}", "zh_CN": "{description}：{shortcut}", "ko": "{description}: {shortcut}", "es": "{description}: {shortcut}", "fr": "{description} : {shortcut}", "ru": "{description}: {shortcut}", "ar": "{description}: {shortcut}"},
+"以前の pdfNote で大きくなっていたファイルです。保存すると {before} から {after} になります": {"en": "An earlier pdfNote made this file larger than it needs to be. Saving brings it from {before} to {after}", "zh_CN": "旧版 pdfNote 使此文件变得过大。保存后将从 {before} 减小到 {after}", "ko": "이전 버전의 pdfNote가 이 파일을 필요 이상으로 크게 만들었습니다. 저장하면 {before}에서 {after}(으)로 줄어듭니다", "es": "Una versión anterior de pdfNote hizo este archivo más grande de lo necesario. Al guardarlo pasará de {before} a {after}", "fr": "Une version antérieure de pdfNote a rendu ce fichier plus volumineux que nécessaire. L'enregistrer le fera passer de {before} à {after}", "ru": "Предыдущая версия pdfNote сделала этот файл больше, чем нужно. После сохранения его размер уменьшится с {before} до {after}", "ar": "جعل إصدار سابق من pdfNote هذا الملف أكبر من اللازم. عند الحفظ سيصغر من {before} إلى {after}"},
+"PDFとして保存": {"en": "Save as PDF", "zh_CN": "另存为 PDF", "ko": "PDF로 저장", "es": "Guardar como PDF", "fr": "Enregistrer au format PDF", "ru": "Сохранить как PDF", "ar": "حفظ بتنسيق PDF"},
+"印刷を取り消しました": {"en": "Printing canceled", "zh_CN": "已取消打印", "ko": "인쇄를 취소했습니다", "es": "Se canceló la impresión", "fr": "Impression annulée", "ru": "Печать отменена", "ar": "تم إلغاء الطباعة"},
+"開いているPDFには上書きできません。別の名前を指定してください。": {"en": "Can't overwrite a PDF that's open. Choose another name.", "zh_CN": "无法覆盖已打开的 PDF。请指定其他名称。", "ko": "열려 있는 PDF에 덮어쓸 수 없습니다. 다른 이름을 지정하세요.", "es": "No se puede sobrescribir un PDF abierto. Elige otro nombre.", "fr": "Impossible de remplacer un PDF ouvert. Choisissez un autre nom.", "ru": "Нельзя перезаписать открытый PDF. Укажите другое имя.", "ar": "لا يمكن الكتابة فوق ملف PDF مفتوح. اختر اسمًا آخر."},
+"PDFを書き出せませんでした。\n\n{error}": {"en": "Couldn't write the PDF.\n\n{error}", "zh_CN": "无法写入 PDF。\n\n{error}", "ko": "PDF를 저장할 수 없습니다.\n\n{error}", "es": "No se pudo escribir el PDF.\n\n{error}", "fr": "Impossible d'écrire le PDF.\n\n{error}", "ru": "Не удалось записать PDF.\n\n{error}", "ar": "تعذر كتابة ملف PDF.\n\n{error}"},
+"OCRの処理が途中で終了しました（終了コード {code}）": {"en": "The OCR process ended early (exit code {code})", "zh_CN": "OCR 进程中途结束（退出代码 {code}）", "ko": "OCR 처리가 도중에 종료되었습니다(종료 코드 {code})", "es": "El proceso de OCR terminó antes de tiempo (código de salida {code})", "fr": "Le processus d'OCR s'est arrêté prématurément (code de sortie {code})", "ru": "Процесс OCR завершился досрочно (код выхода {code})", "ar": "انتهت عملية التعرف الضوئي مبكرًا (رمز الخروج {code})"},
+"墨消しを適用したため、OCRを中止しました": {"en": "Stopped OCR because the redactions were applied", "zh_CN": "已应用密文，因此停止了 OCR", "ko": "교정을 적용했으므로 OCR을 중지했습니다", "es": "Se detuvo el OCR porque se aplicó la censura", "fr": "OCR arrêté, car les biffures ont été appliquées", "ru": "OCR остановлен, так как применено скрытие", "ar": "توقف التعرف الضوئي لأن التنقيح طُبّق"},
+"付箋を追加できませんでした。書き始めた文書またはページがなくなっています。入力した内容はクリップボードにコピーしました。": {"en": "Couldn't add the note: the document or page it was started on is no longer there. What you wrote has been copied to the clipboard.", "zh_CN": "无法写入便笺：开始编写时的文档或页面已不存在。已将所写内容复制到剪贴板。", "ko": "스티커 메모를 쓸 수 없습니다. 작성을 시작한 문서나 페이지가 더 이상 없습니다. 작성한 내용은 클립보드에 복사했습니다.", "es": "No se pudo escribir la nota: el documento o la página en que se empezó ya no existe. Lo escrito se copió al portapapeles.", "fr": "Impossible d'écrire le pense-bête : le document ou la page sur laquelle il a été commencé n'existe plus. Le texte saisi a été copié dans le Presse-papiers.", "ru": "Не удалось сохранить записку: документа или страницы, где ее начали, больше нет. Написанное скопировано в буфер обмена.", "ar": "تعذرت كتابة الملاحظة: لم يعد المستند أو الصفحة التي بدأت عليها موجودًا. تم نسخ ما كتبته إلى الحافظة."},
+"プリンターが {sheet} 枚目を受け付けませんでした。印刷データは最後まで送信されていません。": {"en": "The printer didn't accept sheet {sheet}. The print job wasn't sent in full.", "zh_CN": "打印机未接受第 {sheet} 张。打印未能完整发送。", "ko": "프린터가 {sheet}번째 장을 받지 않았습니다. 인쇄가 끝까지 전송되지 않았습니다.", "es": "La impresora no aceptó la hoja {sheet}. La impresión no se envió completa.", "fr": "L'imprimante n'a pas accepté la feuille {sheet}. L'impression n'a pas été envoyée en entier.", "ru": "Принтер не принял лист {sheet}. Задание печати отправлено не полностью.", "ar": "لم تقبل الطابعة الورقة {sheet}. لم تُرسل الطباعة كاملة."},
+"印刷データを最後まで送信できませんでした。プリンターの状態をご確認ください。": {"en": "The print job couldn't be sent in full. Please check the printer.", "zh_CN": "未能完整发送打印。请检查打印机状态。", "ko": "인쇄를 끝까지 전송하지 못했습니다. 프린터 상태를 확인하세요.", "es": "No se pudo enviar la impresión completa. Comprueba la impresora.", "fr": "L'impression n'a pas pu être envoyée en entier. Vérifiez l'imprimante.", "ru": "Не удалось отправить задание печати полностью. Проверьте состояние принтера.", "ar": "تعذّر إرسال الطباعة كاملة. يرجى التحقق من الطابعة."},
+"この欄は読み取り専用です": {"en": "This field is read-only", "zh_CN": "此字段为只读", "ko": "이 필드는 읽기 전용입니다", "es": "Este campo es de solo lectura", "fr": "Ce champ est en lecture seule", "ru": "Это поле только для чтения", "ar": "هذا الحقل للقراءة فقط"},
+"PDF を開く既定のアプリが pdfNote ではありません。": {"en": "pdfNote is not the default app for PDF files.", "zh_CN": "pdfNote 不是打开 PDF 的默认应用。", "ko": "pdfNote가 PDF를 여는 기본 앱이 아닙니다.", "es": "pdfNote no es la aplicación predeterminada para los PDF.", "fr": "pdfNote n'est pas l'application par défaut pour les PDF.", "ru": "pdfNote не является приложением по умолчанию для PDF.", "ar": "pdfNote ليس التطبيق الافتراضي لملفات PDF."},
+"PDF をダブルクリックしたときに pdfNote で開くようにしますか？Windows の設定が開くので、「.pdf」に pdfNote を選んでください。": {"en": "Open PDFs with pdfNote when you double-click them? Windows Settings will open: choose pdfNote for \".pdf\".", "zh_CN": "是否在双击 PDF 时用 pdfNote 打开？将打开 Windows 设置：请为“.pdf”选择 pdfNote。", "ko": "PDF를 두 번 클릭할 때 pdfNote로 열까요? Windows 설정이 열리면 '.pdf'에 pdfNote를 선택하세요.", "es": "¿Abrir los PDF con pdfNote al hacer doble clic? Se abrirá Configuración de Windows: elige pdfNote para «.pdf».", "fr": "Ouvrir les PDF avec pdfNote lors d'un double-clic ? Les Paramètres de Windows vont s'ouvrir : choisissez pdfNote pour « .pdf ».", "ru": "Открывать PDF в pdfNote по двойному щелчку? Откроются параметры Windows: выберите pdfNote для «.pdf».", "ar": "هل تريد فتح ملفات PDF باستخدام pdfNote عند النقر المزدوج؟ ستُفتح إعدادات Windows: اختر pdfNote لـ «.pdf»."},
+"既定のアプリにする": {"en": "Make default", "zh_CN": "设为默认应用", "ko": "기본 앱으로 설정", "es": "Hacer predeterminada", "fr": "Définir par défaut", "ru": "Сделать по умолчанию", "ar": "جعله افتراضيًا"},
+"今はしない": {"en": "Not now", "zh_CN": "暂不", "ko": "나중에", "es": "Ahora no", "fr": "Pas maintenant", "ru": "Не сейчас", "ar": "ليس الآن"},
+"今後このメッセージを表示しない": {"en": "Don't show this again", "zh_CN": "不再显示此消息", "ko": "이 메시지를 다시 표시하지 않음", "es": "No volver a mostrar", "fr": "Ne plus afficher ce message", "ru": "Больше не показывать", "ar": "عدم إظهار هذه الرسالة مرة أخرى"},
+"Windows の設定を開けませんでした": {"en": "Couldn't open Windows Settings", "zh_CN": "无法打开 Windows 设置", "ko": "Windows 설정을 열 수 없습니다", "es": "No se pudo abrir Configuración de Windows", "fr": "Impossible d'ouvrir les Paramètres de Windows", "ru": "Не удалось открыть параметры Windows", "ar": "تعذّر فتح إعدادات Windows"},
+"Windows の設定で「.pdf」に pdfNote を選んでください": {"en": "In Windows Settings, choose pdfNote for \".pdf\"", "zh_CN": "请在 Windows 设置中为“.pdf”选择 pdfNote", "ko": "Windows 설정에서 '.pdf'에 pdfNote를 선택하세요", "es": "En Configuración de Windows, elige pdfNote para «.pdf»", "fr": "Dans les Paramètres de Windows, choisissez pdfNote pour « .pdf »", "ru": "В параметрах Windows выберите pdfNote для «.pdf»", "ar": "في إعدادات Windows، اختر pdfNote لـ «.pdf»"},
+"PDF を開く既定のアプリを pdfNote にしました": {"en": "pdfNote now opens your PDF files", "zh_CN": "已将 pdfNote 设为打开 PDF 的默认应用", "ko": "PDF를 여는 기본 앱을 pdfNote로 설정했습니다", "es": "pdfNote ya es la aplicación predeterminada para los PDF", "fr": "pdfNote est désormais l'application par défaut pour les PDF", "ru": "pdfNote теперь открывает PDF по умолчанию", "ar": "أصبح pdfNote التطبيق الافتراضي لملفات PDF"},
+"PDFを分割できませんでした。{total}個のうち{done}個のファイルは書き出しました。「{name}」から先は書き出していません。\n\n{error}": {"en": "Couldn't split the PDF. {done} of {total} files were written; nothing from “{name}” on was written.\n\n{error}", "zh_CN": "无法拆分 PDF。{total} 个文件中已写入 {done} 个，从“{name}”起未写入。\n\n{error}", "ko": "PDF를 분할할 수 없습니다. 파일 {total}개 중 {done}개는 저장했으며, '{name}'부터는 저장하지 않았습니다.\n\n{error}", "es": "No se pudo dividir el PDF. Se escribieron {done} de {total} archivos; desde «{name}» no se escribió nada.\n\n{error}", "fr": "Impossible de fractionner le PDF. {done} fichiers sur {total} ont été écrits ; rien n'a été écrit à partir de « {name} ».\n\n{error}", "ru": "Не удалось разделить PDF. Записано файлов: {done} из {total}; начиная с «{name}» ничего не записано.\n\n{error}", "ar": "تعذّر تقسيم ملف PDF. كُتب {done} من {total} ملفات، ولم يُكتب شيء بدءًا من «{name}».\n\n{error}"},
+"PDFに書き出しました: {path}": {"en": "Saved the PDF: {path}", "zh_CN": "已保存 PDF：{path}", "ko": "PDF로 저장했습니다: {path}", "es": "PDF guardado: {path}", "fr": "PDF enregistré : {path}", "ru": "PDF сохранен: {path}", "ar": "تم حفظ ملف PDF: {path}"},
+"pdfNote が PDF を直接作ります。文字は選択・検索でき、ファイルは小さくなります": {"en": "pdfNote writes the PDF itself: the text stays selectable and searchable, and the file stays small", "zh_CN": "pdfNote 将直接生成 PDF：文字仍可选择和搜索，文件也更小", "ko": "pdfNote가 PDF를 직접 만듭니다. 텍스트를 선택하고 검색할 수 있으며 파일 크기도 작아집니다", "es": "pdfNote crea el PDF directamente: el texto se puede seleccionar y buscar, y el archivo ocupa poco", "fr": "pdfNote crée le PDF lui-même : le texte peut toujours être sélectionné et recherché, et le fichier reste léger", "ru": "pdfNote создает PDF сам: текст можно выделять и искать, а файл получается небольшим", "ar": "ينشئ pdfNote ملف PDF بنفسه: يبقى النص قابلاً للتحديد والبحث ويكون الملف صغيرًا"},
 }
 
 
@@ -2081,11 +2229,11 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
             "few": "تم تحديد {count} مناطق للتنقيح. استخدم «تطبيق التنقيح» للإنهاء.",
         },
     },
-    "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄は完全に削除され、元に戻せません。\n\n実行しますか？": {
-        "en": {"one": "Apply {count} redaction? The text and images underneath, and any comments or form fields overlapping it, are removed permanently.\n\nContinue?"},
-        "es": {"one": "¿Aplicar {count} censura? El texto y las imágenes que cubre, y los comentarios o campos de formulario que la solapan, se eliminan de forma permanente.\n\n¿Continuar?"},
-        "fr": {"one": "Appliquer {count} biffure ? Le texte et les images masqués, ainsi que les commentaires et champs de formulaire qui la chevauchent, seront supprimés définitivement.\n\nContinuer ?"},
-        "ar": {"one": "تطبيق تنقيح واحد؟ سيُحذف النص والصور والتعليقات وحقول النماذج المتداخلة معه نهائيًا.\n\nهل تريد المتابعة؟", "two": "تطبيق تنقيحين؟ سيُحذف النص والصور والتعليقات وحقول النماذج المتداخلة معهما نهائيًا.\n\nهل تريد المتابعة؟", "few": "تطبيق {count} تنقيحات؟ سيُحذف النص والصور والتعليقات وحقول النماذج المتداخلة معها نهائيًا.\n\nهل تريد المتابعة؟", "many": "تطبيق {count} تنقيحًا؟ سيُحذف النص والصور والتعليقات وحقول النماذج المتداخلة معها نهائيًا.\n\nهل تريد المتابعة؟"},
+    "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": {
+        "en": {"one": "Apply {count} redaction? The text and images underneath, and any comments or form fields that overlap it, will be removed. They won't be in the saved PDF and can't be recovered from it. You can undo this while it's still in the edit history.\n\nContinue?"},
+        "es": {"one": "¿Aplicar {count} censura? Se eliminarán el texto y las imágenes que cubre, y los comentarios o campos de formulario que se superpongan. No quedarán en el PDF guardado ni podrán recuperarse de él. Puedes deshacerlo mientras siga en el historial de edición.\n\n¿Continuar?"},
+        "fr": {"one": "Appliquer {count} biffure ? Le texte et les images masqués, ainsi que les commentaires et champs de formulaire qui la chevauchent, seront supprimés. Ils ne figureront pas dans le PDF enregistré et ne pourront pas en être récupérés. Vous pouvez annuler l'opération tant qu'elle reste dans l'historique des modifications.\n\nContinuer ?"},
+        "ar": {"one": "هل تريد تطبيق تنقيح واحد؟ سيُحذف النص والصور الموجودة تحته، والتعليقات وحقول النماذج المتداخلة معه. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير.\n\nهل تريد المتابعة؟", "two": "هل تريد تطبيق تنقيحين؟ سيُحذف النص والصور الموجودة تحتهما، والتعليقات وحقول النماذج المتداخلة معهما. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير.\n\nهل تريد المتابعة؟", "few": "هل تريد تطبيق {count} تنقيحات؟ سيُحذف النص والصور الموجودة تحتها، والتعليقات وحقول النماذج المتداخلة معها. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير.\n\nهل تريد المتابعة؟", "many": "هل تريد تطبيق {count} تنقيحًا؟ سيُحذف النص والصور الموجودة تحتها، والتعليقات وحقول النماذج المتداخلة معها. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير.\n\nهل تريد المتابعة؟"},
     },
     "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": {
         "en": {"one": "A file with the same name already exists. Replace it?\n\n{names}"},
@@ -2107,11 +2255,11 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
     "墨消しが{count}件マークされています。適用すると完全に削除されます": {
         "en": {"one": "{count} area marked for redaction. Applying removes it permanently"},
         "es": {"one": "{count} área marcada para censurar. Al aplicar se elimina de forma permanente"},
-        "fr": {"one": "{count} zone marquée pour la biffure. L'application la supprime définitivement"},
+        "fr": {"one": "{count} zone marquée pour la biffure. Une fois appliquée, la biffure est définitive"},
         "ar": {
-            "one": "تم تحديد منطقة واحدة للتنقيح. التطبيق يحذفها نهائيًا",
-            "two": "تم تحديد منطقتين للتنقيح. التطبيق يحذفهما نهائيًا",
-            "few": "تم تحديد {count} مناطق للتنقيح. التطبيق يحذفها نهائيًا",
+            "one": "تم تحديد منطقة واحدة للتنقيح. وعند تطبيقها تُحذف نهائيًا",
+            "two": "تم تحديد منطقتين للتنقيح. وعند تطبيقهما تُحذفان نهائيًا",
+            "few": "تم تحديد {count} مناطق للتنقيح. وعند تطبيقها تُحذف نهائيًا",
         },
     },
     "{count}個のファイルに分割しました: {folder}": {
@@ -2134,7 +2282,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
             "few": "تم حذف {count} تعليقات توضيحية",
         },
     },
-    "{count}個の注釈を範囲選択": {
+    "{count}個の注釈を選択中": {
         "en": {"one": "{count} annotation selected"},
         "es": {"one": "{count} anotación seleccionada"},
         "fr": {"one": "{count} annotation sélectionnée"},
@@ -2144,14 +2292,14 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
             "few": "تم تحديد {count} تعليقات توضيحية",
         },
     },
-    "{count}文字を選択して{operation}を追加しました": {
-        "en": {"one": "Selected {count} character and added {operation}"},
-        "es": {"one": "Se seleccionó {count} carácter y se añadió {operation}"},
-        "fr": {"one": "{count} caractère sélectionné et {operation} ajouté"},
+    "{count}文字に{operation}を追加しました": {
+        "en": {"one": "Added {operation} to {count} character"},
+        "es": {"one": "Se añadió {operation} a {count} carácter"},
+        "fr": {"one": "{operation} ajouté à {count} caractère"},
         "ar": {
-            "one": "تم تحديد حرف واحد وإضافة {operation}",
-            "two": "تم تحديد حرفين وإضافة {operation}",
-            "few": "تم تحديد {count} أحرف وإضافة {operation}",
+            "one": "تمت إضافة {operation} إلى حرف واحد",
+            "two": "تمت إضافة {operation} إلى حرفين",
+            "few": "تمت إضافة {operation} إلى {count} أحرف",
         },
     },
     "{count}個の注釈を貼り付けました": {
@@ -2174,7 +2322,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
             "few": "تم تكرار {count} تعليقات توضيحية",
         },
     },
-    "{count}個の注釈の線の太さを変えました": {
+    "{count}個の注釈の線の太さを変更しました": {
         "en": {"one": "Changed the outline weight of {count} annotation"},
         "es": {"one": "Se cambió el grosor de {count} anotación"},
         "fr": {"one": "Épaisseur modifiée pour {count} annotation"},
@@ -2184,7 +2332,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
             "few": "تم تغيير سُمك حدود {count} تعليقات توضيحية",
         },
     },
-    "{count}個の注釈の色を変えました": {
+    "{count}個の注釈の色を変更しました": {
         "en": {"one": "Changed the color of {count} annotation"},
         "es": {"one": "Se cambió el color de {count} anotación"},
         "fr": {"one": "Couleur modifiée pour {count} annotation"},
@@ -2195,7 +2343,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
         },
     },
     "{count}個の注釈またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {
-        "en": {"one": "{count} comment or form field could not be removed. Content may remain in the redacted areas; check the document before you save it."},
+        "en": {"one": "{count} comment or form field couldn't be removed. Content may remain in the redacted areas; check the document before you save it."},
         "es": {"one": "No se pudo quitar {count} comentario o campo de formulario. Puede quedar contenido en las zonas censuradas; revisa el documento antes de guardarlo."},
         "fr": {"one": "Impossible de supprimer {count} commentaire ou champ de formulaire. Du contenu peut subsister dans les zones biffées ; vérifiez le document avant de l'enregistrer."},
         "ar": {"one": "تعذّر حذف تعليق أو حقل نموذج واحد. قد يبقى محتوى في المناطق المنقّحة؛ تحقّق من المستند قبل حفظه.", "two": "تعذّر حذف تعليقين أو حقلي نموذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقّق من المستند قبل حفظه.", "few": "تعذّر حذف {count} تعليقات أو حقول نماذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقّق من المستند قبل حفظه."},
@@ -2203,11 +2351,46 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
 }
 
 
+def _load_language_files() -> None:
+    """Add the languages kept in i18n/<code>.json to TRANSLATIONS and
+    PLURAL_FORMS. A file that is missing leaves its language falling back
+    to English (I18N.t); the self-test fails such a build."""
+    for code in LANGUAGE_FILES:
+        try:
+            data = json.loads(Path(resource_path(f"i18n/{code}.json")).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for key, text in data.get("strings", {}).items():
+            if key in TRANSLATIONS:
+                TRANSLATIONS[key][code] = text
+        for key, forms in data.get("plural", {}).items():
+            if key in TRANSLATIONS:
+                PLURAL_FORMS.setdefault(key, {})[code] = forms
+        QT_STRINGS[code] = {
+            (entry["context"], entry["source"]): entry["text"] for entry in data.get("qt", [])
+        }
+
+
+# Qt's own words -- the standard dialog buttons and the colour dialog -- for
+# the languages Qt has no catalogue of its own for, and European Portuguese
+# over Brazil's: {(context, source): text}, from the "qt" part of the file.
+QT_STRINGS: dict[str, dict[tuple[str, str], str]] = {}
+
+
+_load_language_files()
+
+
 def plural_category(language: str, count: int) -> str:
     """CLDR plural category of a whole number in one of the UI languages."""
     n = abs(int(count))
-    if language in ("en", "es"):
+    if language in ("en", "es", "de", "pt_PT", "ur", "la", "grc"):
         return "one" if n == 1 else "other"
+    if language in ("pt_BR", "hi", "bn"):
+        # 0 takes the singular too ("0 página", "0 पृष्ठ").
+        return "one" if n in (0, 1) else "other"
+    if language == "sa":
+        # Sanskrit has a dual: two things take a form of their own.
+        return {1: "one", 2: "two"}.get(n, "other")
     if language == "fr":
         return "one" if n in (0, 1) else "other"
     if language == "ru":
@@ -2247,7 +2430,9 @@ class I18N:
         if I18N.current != "ja":
             entry = TRANSLATIONS.get(key)
             if entry is not None:
-                text = entry.get(I18N.current, key)
+                # English rather than the Japanese key when a language
+                # lacks an entry: a build missing a language file.
+                text = entry.get(I18N.current) or entry.get("en", key)
             else:
                 text = key
         else:
@@ -2309,6 +2494,17 @@ KEY_NAMES: dict[str, dict[str, str]] = {
     "ar": {
         **_LATIN_KEY_NAMES, "Ctrl": "‪Ctrl", "Shift": "‪Shift", "Alt": "‪Alt",
     },
+    "ur": {
+        **_LATIN_KEY_NAMES, "Ctrl": "‪Ctrl", "Shift": "‪Shift", "Alt": "‪Alt",
+    },
+    # As Microsoft's German terminology and style guide write them: capitals,
+    # the names in the guide's key table (STRG+UMSCHALT+S, BILD-AB).
+    "de": {
+        **_LATIN_KEY_NAMES, "Ctrl": "STRG", "Shift": "UMSCHALT", "Alt": "ALT",
+        "Del": "ENTF", "Esc": "ESC", "Return": "EINGABE", "Enter": "EINGABE",
+        "Home": "POS1", "End": "ENDE", "PgUp": "BILD-AUF", "PgDown": "BILD-AB",
+        "Backspace": "RÜCK", "Tab": "TAB",
+    },
 }
 
 
@@ -2322,16 +2518,21 @@ class KeyNameTranslator(QTranslator):
     Qt takes "" as the translation, and "Ctrl+Shift+S" came out "CTRLSHIFTS".
     """
 
-    def __init__(self, names: dict[str, str], parent: Any = None) -> None:
+    def __init__(
+        self, names: dict[str, str], parent: Any = None,
+        strings: dict[tuple[str, str], str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._names = names
+        # Qt's own words for a language Qt has no catalogue for (QT_STRINGS).
+        self._strings = strings or {}
 
     def translate(  # noqa: N802 - Qt's name
         self, context: str, source: str, disambiguation: Any = None, n: int = -1
     ) -> str | None:
         if context == "QShortcut" and source:
             return self._names.get(source, source)
-        return None
+        return self._strings.get((context, source))
 
     def isEmpty(self) -> bool:  # noqa: N802 - Qt's name
         return False
@@ -2396,7 +2597,7 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("Alt キー",), "キー ヒントを表示", None),
         (("Esc",), "ページに戻る", None),
     )),
-    ("ページの文字", (
+    ("ページのテキスト", (
         (("F7",), "カーソルを表示/非表示", "act_text_cursor"),
         (("矢印キー",), "カーソルを移動", None),
         (("Ctrl+Left", "Ctrl+Right"), "単語単位で移動", None),
@@ -2423,14 +2624,14 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
     )),
     ("表示・ページ移動", (
         (("Ctrl+G", "Alt+J"), "ページ指定", "act_focus_page"),
-        (("Alt+Z",), "ズーム率へ移動", "act_focus_zoom"),
+        (("Alt+Z",), "ズーム率を入力", "act_focus_zoom"),
         (("Shift+Up", "Ctrl+PgUp"), "前のページ", "act_prev"),
         (("Shift+Down", "Ctrl+PgDown"), "次のページ", "act_next"),
         (("Ctrl+Home",), "最初のページ", "act_first_page"),
         (("Ctrl+End",), "最後のページ", "act_last_page"),
         (("Ctrl++", "Ctrl+Up"), "拡大", "act_zoom_in"),
         (("Ctrl+-", "Ctrl+Down"), "縮小", "act_zoom_out"),
-        (("Ctrl+マウスホイール",), "連続ズーム", None),
+        (("Ctrl+マウス ホイール",), "連続ズーム", None),
         (("Ctrl+0",), "100%", "act_actual"),
         (("Ctrl+Alt+O", "Alt+E"), "ページに合わせる", "act_fit_page"),
         (("Alt+W",), "幅に合わせる", "act_fit_width"),
@@ -2441,20 +2642,20 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("F5",), "更新", "act_refresh"),
     )),
     ("ナビゲーション", (
-        (("Ctrl+Left", "Ctrl+Right"), "ナビゲーションのタブ切替", None),
+        (("Ctrl+Left", "Ctrl+Right"), "ナビゲーションのタブを切り替え", None),
         (("Return",), "選択した項目へ移動", None),
         (("Ctrl+Up", "Ctrl+Down"), "ページを上下に移動", None),
         (("Ctrl+Shift+Up", "Ctrl+Shift+Down"), "ページを先頭 / 末尾へ移動", None),
         (("Ctrl+X", "Ctrl+C", "Ctrl+V"), "ページの切り取り・コピー・貼り付け", None),
-        (("Ctrl+D",), "ページ複製", None),
-        (("Del",), "ページ削除", None),
+        (("Ctrl+D",), "ページを複製", None),
+        (("Del",), "ページを削除", None),
     )),
     ("ページ管理", (
-        (("Ctrl+M", "Alt+Q"), "空白ページ挿入", "act_insert_blank"),
+        (("Ctrl+M", "Alt+Q"), "空白ページを挿入", "act_insert_blank"),
         (("Alt+M",), "ページを追加", "act_insert_pdf"),
-        (("Ctrl+Shift+D", "Alt+Y"), "ページ複製", "act_duplicate_page"),
-        (("Alt+O",), "ページ回転", "act_rotate_pdf_page"),
-        (("Ctrl+Shift+Del",), "ページ削除", "act_delete_page"),
+        (("Ctrl+Shift+D", "Alt+Y"), "ページを複製", "act_duplicate_page"),
+        (("Alt+O",), "ページを回転", "act_rotate_pdf_page"),
+        (("Ctrl+Shift+Del",), "ページを削除", "act_delete_page"),
     )),
     ("描画・注釈ツール", (
         (("Ctrl+H",), "ハイライト", "act_unified_highlight"),
@@ -2472,7 +2673,7 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("Alt+H",), "ハイライトの色", "act_markup_color_menu"),
         (("Alt+U",), "下線の色", "act_underline_color_menu"),
         (("Alt+K",), "取り消し線の色", "act_strikeout_color_menu"),
-        (("Alt+X",), "図形・手書き色", "act_drawing_color_menu"),
+        (("Alt+X",), "図形・手書きの色", "act_drawing_color_menu"),
         (("Alt+N, C", "Alt+D, C", "Alt+R, C", "Alt+A, C", "Alt+L, C"), "色の変更", None),
         (("Return",), "カーソル位置に挿入", None),
         (("Esc",), "編集を終了", "edit:select"),
@@ -2487,14 +2688,14 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("Ctrl+L",), "左揃え", "act_align_left"),
         (("Ctrl+E",), "中央揃え", "act_align_center"),
         (("Ctrl+R",), "右揃え", "act_align_right"),
-        (("F2",), "編集⇔選択切替", None),
-        (("Ctrl+Return",), "テキスト確定", "act_finish_text"),
+        (("F2",), "編集と選択を切り替え", None),
+        (("Ctrl+Return",), "入力を確定", "act_finish_text"),
     )),
     ("検索", (
         (("Ctrl+F",), "検索", "act_find"),
         (("Return", "F3"), "次の検索結果", "act_next_match"),
         (("Shift+Return", "Shift+F3"), "前の検索結果", "act_prev_match"),
-        (("Esc",), "検索終了", None),
+        (("Esc",), "検索を閉じる", None),
     )),
 )
 
@@ -2523,17 +2724,21 @@ def install_qt_translations(code: str) -> bool:
             resource_path("PySide6/translations"),
         )
     ):
+        # European Portuguese has no catalogue of its own: Brazil's, with
+        # the words that differ given in QT_STRINGS.
+        names = (code, "pt_BR") if code == "pt_PT" else (code,)
         translator = QTranslator(app)
-        if translator.load(f"qtbase_{code}", str(directory)):
+        if any(translator.load(f"qtbase_{name}", str(directory)) for name in names):
             app.installTranslator(translator)
             _QT_TRANSLATORS.append(translator)
             loaded = True
             break
         translator.deleteLater()
-    key_names = KeyNameTranslator(KEY_NAMES.get(code, _LATIN_KEY_NAMES), app)
+    strings = QT_STRINGS.get(code, {})
+    key_names = KeyNameTranslator(KEY_NAMES.get(code, _LATIN_KEY_NAMES), app, strings)
     app.installTranslator(key_names)
     _QT_TRANSLATORS.append(key_names)
-    return loaded
+    return loaded or bool(strings)
 
 
 # Every edit state a document passes through gets a number of its own, so an
@@ -2740,6 +2945,23 @@ def _next_journal_operation() -> str:
 _RESOURCE_TABLE_CHECKS = (0x5EED0001, 0x5EED0002, 0x5EED0003, 0x5EED0004)
 _JOURNAL_FIELD_OFFSET: int | None = None
 _JOURNAL_FIELD_SEARCHED = False
+# The builds this layout has been confirmed on: (PyMuPDF, MuPDF), on a
+# 64-bit little-endian process. The checks above run inside this process
+# and cannot catch a read that crashes it, so on any other build the
+# memory is not touched at all and undo keeps to snapshots (6.2). A new
+# PyMuPDF goes here only once the functional QA passes on it.
+JOURNAL_LAYOUT_TESTED = {("1.28.2", "1.28.2")}
+
+
+def journal_layout_tested() -> bool:
+    """Is this the PyMuPDF/MuPDF build, word size and byte order the
+    resource-table layout was confirmed on?"""
+    return (
+        (str(getattr(fitz, "VersionBind", "")), str(getattr(fitz, "VersionFitz", "")))
+        in JOURNAL_LAYOUT_TESTED
+        and struct.calcsize("P") == 8
+        and sys.byteorder == "little"
+    )
 
 
 def _struct_ints(address: int) -> tuple[int, int, int, int]:
@@ -2759,6 +2981,9 @@ def _journal_field_offset() -> int | None:
     if _JOURNAL_FIELD_SEARCHED:
         return _JOURNAL_FIELD_OFFSET
     _JOURNAL_FIELD_SEARCHED = True
+    if not journal_layout_tested():
+        _JOURNAL_FIELD_OFFSET = None
+        return None
     import ctypes
 
     document = fitz.open()
@@ -2893,6 +3118,280 @@ def journal_rewind(mark: JournalMark) -> bool:
         document.journal_start_op(_next_journal_operation())
 
 
+# ---- Undo: keeping the journal to what can still be undone (6.3) ------------
+#
+# MuPDF keeps every step of a journal until the document is closed, and has
+# no call that drops the oldest ones: an undo history of 8 steps still held
+# every picture ever deleted or replaced -- 30 photos of 6.4 MB put in and
+# taken out again kept 210 MB. So when the steps no undo can reach any more
+# hold enough to matter, the history is moved onto a copy of the document
+# made at the oldest step still reachable, and the steps after it are made
+# again on the copy, object by object: MuPDF writes out which objects each
+# step changed (pdf_write_journal), and their values are read from the
+# document as it stood after that step. The copy is then compared with the
+# document, object by object; anything that does not match, and the copy
+# is dropped and the document kept as it was. Only public MuPDF calls are
+# used, and only on the PyMuPDF the journal's format was checked with.
+
+_JOURNAL_FRAGMENT = re.compile(rb"(\d+) 0 (obj|newobj)\n")
+_JOURNAL_LENGTH = re.compile(rb"/Length (\d+)(?![\d ]*R)")
+_JOURNAL_DIRECT_LENGTH = re.compile(r"/Length \d+(?![\d ]*R)")
+
+
+def _journal_dump(document: fitz.Document) -> bytes:
+    """MuPDF's own account of a journal (pdf_write_journal). The document
+    must have no operation open."""
+    from pymupdf import mupdf
+
+    buffer = mupdf.fz_new_buffer(1024)
+    output = mupdf.FzOutput(buffer)
+    mupdf.pdf_write_journal(fitz._as_pdf_document(document), output)
+    mupdf.fz_close_output(output)
+    return bytes(mupdf.fz_buffer_extract(buffer))
+
+
+def parse_journal_dump(data: bytes) -> list[tuple[str, list[int], int]] | None:
+    """The steps of a journal written by pdf_write_journal: (name, numbers
+    of the objects it changed, bytes it holds) for each. None for anything
+    that is not exactly that format -- nothing is guessed."""
+    if not data.startswith(b"%!MuPDF-Journal-100\n"):
+        return None
+    head_end = data.find(b">>\n", data.find(b"\njournal\n<<"))
+    if head_end < 0:
+        return None
+    at = head_end + 3
+    steps: list[tuple[str, list[int], int]] = []
+    while True:
+        if data.startswith(b"endjournal", at):
+            return steps
+        if not data.startswith(b"entry\n(", at):
+            return None
+        title_end = data.find(b")\n", at + 7)
+        if title_end < 0:
+            return None
+        title = data[at + 7:title_end]
+        if b"\\" in title or b"(" in title:
+            return None  # pdfNote's names are plain; anything else is not read
+        start = at
+        at = title_end + 2
+        numbers: list[int] = []
+        while True:
+            match = _JOURNAL_FRAGMENT.match(data, at)
+            if match is None:
+                break
+            numbers.append(int(match.group(1)))
+            at = match.end()
+            if match.group(2) == b"newobj":
+                continue
+            line_end = data.find(b"\n", at)
+            if line_end < 0:
+                return None
+            text = data[at:line_end]
+            at = line_end + 1
+            if data.startswith(b"endobj\n", at):
+                at += 7
+                continue
+            if not data.startswith(b"stream\n", at):
+                return None
+            at += 7
+            ending = b"\nendstream\nendobj\n"
+            length = _JOURNAL_LENGTH.search(text)
+            end = at + int(length.group(1)) if length else -1
+            if end < 0 or not data.startswith(ending, end):
+                end = data.find(ending, at)
+                if end < 0:
+                    return None
+            at = end + len(ending)
+        steps.append((title.decode("latin-1"), numbers, at - start))
+
+
+def journal_steps(document: fitz.Document) -> list[tuple[str, list[int], int]] | None:
+    """parse_journal_dump() of `document`'s journal, checked against what
+    the journal says of itself: as many steps, under the same names. The
+    document must have no operation open."""
+    try:
+        steps = parse_journal_dump(_journal_dump(document))
+        _position, total = document.journal_position()
+        if steps is None or len(steps) != total:
+            return None
+        if any(document.journal_op_name(index) != steps[index][0] for index in range(total)):
+            return None
+        return steps
+    except Exception:
+        return None
+
+
+def _object_state(document: fitz.Document, number: int) -> tuple[str, bytes | None]:
+    """An object as text, with its stream as stored; ("null", None) for one
+    that does not exist."""
+    if not 0 < number < document.xref_length():
+        return "null", None
+    try:
+        text = document.xref_object(number, compressed=True) or "null"
+    except Exception:
+        return "null", None
+    try:
+        stream = document.xref_stream_raw(number) if document.xref_is_stream(number) else None
+    except Exception:
+        stream = None
+    if stream is not None:
+        # The data is compared itself. Its stated length is how much an
+        # encrypted file stores, padding and all, until the document is
+        # written again.
+        text = _JOURNAL_DIRECT_LENGTH.sub("", text)
+    return text, stream
+
+
+def _copy_object(source: fitz.Document, target: fitz.Document, number: int) -> None:
+    """Make object `number` of `target` what it is in `source`, stream and
+    all, as a change in the step open on `target`.
+
+    Replacing an object whole (pdf_update_object) is not recorded by the
+    journal: MuPDF records an object when a dictionary or array belonging
+    to it is altered, keeping its value from before. So a key is first put
+    into a scratch dictionary that names the object as its owner -- MuPDF
+    then keeps the object as it is, as for any change -- and only then is
+    it replaced."""
+    from pymupdf import mupdf
+
+    pdf = fitz._as_pdf_document(target)
+    while target.xref_length() <= number:
+        target.get_new_xref()
+    scratch = mupdf.pdf_new_dict(pdf, 1)
+    mupdf.pdf_set_obj_parent(scratch, number)
+    mupdf.pdf_dict_put(scratch, mupdf.pdf_new_name("PdfNoteRebase"), mupdf.pdf_new_int(1))
+    text, stream = _object_state(source, number)
+    if stream is None and target.xref_is_stream(number):
+        # A stream that is one no longer: only deleting the object lets go
+        # of its data. What it was is kept for undo already.
+        mupdf.pdf_delete_object(pdf, number)
+    target.update_object(number, text)
+    if stream is not None:
+        # Stored as it is: its /Filter, copied with the dictionary, still
+        # describes it.
+        mupdf.pdf_update_stream(
+            pdf, mupdf.pdf_new_indirect(pdf, number, 0),
+            mupdf.fz_new_buffer_from_copied_data(stream), 1,
+        )
+
+
+def same_document_state(first: fitz.Document, second: fitz.Document) -> bool:
+    """Do two documents hold the same objects under the same numbers? The
+    object streams and cross-reference streams of the file one was read
+    from are left out: they are how a file is stored, not what it holds."""
+    if len(first) != len(second):
+        return False
+    for key in ("Root", "Info"):
+        if first.xref_get_key(-1, key) != second.xref_get_key(-1, key):
+            return False
+    for number in range(1, max(first.xref_length(), second.xref_length())):
+        one, two = _object_state(first, number), _object_state(second, number)
+        if one == two:
+            continue
+        storage = ("/Type/ObjStm", "/Type/XRef")
+        if any(kind in text for text in (one[0], two[0]) for kind in storage) and "null" in (one[0], two[0]):
+            continue
+        return False
+    return True
+
+
+def rebase_journal(
+    document: fitz.Document,
+    keep_from: int,
+    keep_to: int,
+    steps: list[tuple[str, list[int], int]],
+    password: str | None = None,
+) -> fitz.Document | None:
+    """A copy of `document` in the same state, whose journal holds only
+    its steps from `keep_from` to `keep_to`, under the same names. None,
+    with `document` back where it was, when the copy does not come out
+    the same. `document` must have no operation open; the copy has none
+    open either."""
+    position, total = document.journal_position()
+    if not (0 <= keep_from <= position <= keep_to <= total) or len(steps) != total:
+        return None
+    copy: fitz.Document | None = None
+    try:
+        for _ in range(position - keep_from):
+            document.journal_undo()
+        copy = fitz.open(
+            stream=serialize_document(document, compact=False, collect=False), filetype="pdf"
+        )
+        if copy.needs_pass and not (password and copy.authenticate(password)):
+            raise RuntimeError("the copy could not be unlocked")
+        copy.journal_enable()
+        for index in range(keep_from, keep_to):
+            document.journal_redo()
+            copy.journal_start_op(steps[index][0])
+            for number in dict.fromkeys(steps[index][1]):
+                _copy_object(document, copy, number)
+            copy.journal_stop_op()
+        if tuple(copy.journal_position()) != (keep_to - keep_from, keep_to - keep_from):
+            raise RuntimeError("the copy's history has another length")
+        for _ in range(keep_to - position):
+            document.journal_undo()
+            copy.journal_undo()
+        copy._reset_page_refs()
+        if not same_document_state(document, copy):
+            raise RuntimeError("the copy is not the same")
+        return copy
+    except Exception:
+        if copy is not None:
+            try:
+                copy.close()
+            except Exception:
+                pass
+        try:
+            current = document.journal_position()[0]
+            while current > position:
+                document.journal_undo()
+                current -= 1
+            while current < position:
+                document.journal_redo()
+                current += 1
+            document._reset_page_refs()
+        except Exception:
+            pass
+        return None
+
+
+def process_memory_bytes() -> int | None:
+    """Memory this process holds: private bytes on Windows, the resident
+    set elsewhere; None when it cannot be told."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32")
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.K32GetProcessMemoryInfo.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD,
+            )
+            kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+            counters = Counters()
+            counters.cb = ctypes.sizeof(Counters)
+            if kernel32.K32GetProcessMemoryInfo(
+                kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+            ):
+                return int(counters.PagefileUsage)
+            return None
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return None
+
+
 def open_pdf(path: str) -> fitz.Document:
     """Open a PDF file: into memory up to OPEN_IN_MEMORY_BYTES, so that
     the document does not hold the file; beyond that, read from the file
@@ -2947,6 +3446,12 @@ class DocumentSession:
     # again for a snapshot that would only be thrown away.
     history_suspended: bool = False
     history_notified: bool = False
+    # The journal's upkeep (compact_history): steps since it was last looked
+    # at, how large the process was then, and whether an edit has started
+    # and not yet been marked done -- the journal is not touched meanwhile.
+    journal_steps_since_check: int = 0
+    journal_memory_at_check: int = 0
+    edit_open: bool = False
     # Holds pages taken from a PDF with usage restrictions that this
     # document does not inherit; update_document_notices() says so.
     pages_from_protected_pdf: bool = False
@@ -2967,6 +3472,9 @@ class DocumentSession:
     # file with garbage collection so nothing removed can be recovered.
     needs_full_rewrite: bool = False
     recovery_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # (bytes on disk, bytes once saved) for a file an older pdfNote made
+    # larger than it needs to be; the notice bar offers to save it (6.1).
+    shrink_estimate: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         # A new, merged or recovered document was never saved as it is.
@@ -2980,12 +3488,14 @@ class DocumentSession:
 
 
 class OcrWorker(QObject):
-    """Runs Tesseract over a copy of the document on a worker thread.
+    """Runs Tesseract over a copy of the document.
 
-    It never touches the document the window has open -- PyMuPDF documents
-    are not safe to use from two threads -- so it works on its own copy of
-    the bytes and hands back plain word rectangles for the GUI thread to
-    apply.
+    It never touches the document the window has open: it works on its own
+    copy of the bytes and hands back plain word rectangles for the window
+    to apply. It runs in a process of its own (ocr_worker_main, started by
+    OcrProcess): it used to run on a thread of pdfNote's, and PyMuPDF does
+    not support being used from two threads at once -- separate documents
+    or not, the library underneath is one (6.2).
     """
 
     pageReady = Signal(int, object)
@@ -3032,7 +3542,10 @@ class OcrWorker(QObject):
         except Exception:
             return False
 
-    def run(self) -> None:
+    def events(self) -> Iterable[dict[str, Any]]:
+        """The run, as the events it produces: {"page": index, "words": [...]},
+        {"progress": [done, total]}, {"candidates": count} and, when nothing
+        could be recognised because of an error, {"failed": message}."""
         total = len(self._pages)
         document = None
         first_error = ""
@@ -3048,9 +3561,10 @@ class OcrWorker(QObject):
                 try:
                     page = document[page_index]
                     if self._skip_threshold is not None and self._has_text(page, self._skip_threshold):
-                        self.progress.emit(done, total)
+                        yield {"progress": [done, total]}
                         continue
                     self.candidates += 1
+                    yield {"candidates": self.candidates}
                     words = PDFReaderWindow._ocr_words(
                         page, language=self._language, tessdata=self._tessdata
                     )
@@ -3059,8 +3573,8 @@ class OcrWorker(QObject):
                     first_error = first_error or str(exc)
                 if words:
                     recognised += 1
-                    self.pageReady.emit(page_index, words)
-                self.progress.emit(done, total)
+                    yield {"page": page_index, "words": [list(word) for word in words]}
+                yield {"progress": [done, total]}
         except Exception as exc:
             first_error = first_error or str(exc)
         finally:
@@ -3069,9 +3583,242 @@ class OcrWorker(QObject):
                     document.close()
                 except Exception:
                     pass
-            if first_error and not recognised and not self._cancelled:
-                self.failed.emit(first_error)
-            self.finished.emit(self._cancelled)
+        if first_error and not recognised and not self._cancelled:
+            yield {"failed": first_error}
+
+    def run(self) -> None:
+        """events() as signals, on the calling thread."""
+        for event in self.events():
+            if "page" in event:
+                self.pageReady.emit(int(event["page"]), [tuple(word) for word in event["words"]])
+            elif "progress" in event:
+                self.progress.emit(*event["progress"])
+            elif "failed" in event:
+                self.failed.emit(str(event["failed"]))
+        self.finished.emit(self._cancelled)
+
+
+def ocr_worker_main(job: str) -> int:
+    """`pdfNote --ocr-worker <folder>`: the OCR of one run, in a process of
+    its own. The folder holds the copy of the document (input.pdf) and the
+    run's settings (job.json); the events of OcrWorker.events() go to
+    out.jsonl, one JSON object a line, each flushed as soon as it is known,
+    and the last line is {"finished": true}. A protected copy is unlocked
+    with the password in OCR_PASSWORD_VARIABLE."""
+    folder = Path(job)
+    with open(folder / "out.jsonl", "a", encoding="utf-8") as out:
+
+        def send(event: dict[str, Any]) -> None:
+            out.write(json.dumps(event, ensure_ascii=False) + "\n")
+            out.flush()
+
+        try:
+            settings = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+            worker = OcrWorker(
+                (folder / "input.pdf").read_bytes(),
+                [int(index) for index in settings.get("pages", [])],
+                str(settings.get("language") or "eng"),
+                settings.get("tessdata"),
+                skip_threshold=settings.get("skip_threshold"),
+                password=os.environ.get(OCR_PASSWORD_VARIABLE) or None,
+            )
+            for event in worker.events():
+                send(event)
+        except Exception as exc:
+            send({"failed": str(exc) or exc.__class__.__name__})
+        send({"finished": True})
+    return 0
+
+
+class OcrProcess(QObject):
+    """An OCR run in a process of its own, with OcrWorker's signals.
+
+    The copy of the document and the settings go into a private temporary
+    folder, the child (ocr_worker_main) writes its events to a file there,
+    and they are read back every 150 ms and turned into signals on the GUI
+    thread -- which is the only thread of pdfNote that ever uses PyMuPDF
+    (6.2). Cancelling ends the child at once. The folder goes when the run
+    ends."""
+
+    pageReady = Signal(int, object)
+    progress = Signal(int, int)
+    failed = Signal(str)
+    finished = Signal(bool)
+    # The test suite runs a stand-in worker instead of pdfNote's own; the
+    # folder is appended to this command.
+    command_override: list[str] | None = None
+
+    def __init__(
+        self,
+        data: bytes,
+        page_indices: list[int],
+        language: str = "eng",
+        tessdata: str | None = None,
+        skip_threshold: int | None = None,
+        password: str | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._data = data
+        self._pages = list(page_indices)
+        self._language = language
+        self._tessdata = tessdata
+        self._skip_threshold = skip_threshold
+        self._password = password
+        self.candidates = 0
+        self._cancelled = False
+        self._ended = False
+        self._worker_finished = False
+        self._read_offset = 0
+        self._pending = b""
+        self._folder: Path | None = None
+        self._process = QProcess(self)
+        self._process.finished.connect(self._process_finished)
+        self._process.errorOccurred.connect(self._process_error)
+        self._timer = QTimer(self)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self._read_events)
+
+    @staticmethod
+    def command() -> list[str]:
+        """pdfNote itself, in its OCR worker mode."""
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--ocr-worker"]
+        return [sys.executable, str(Path(__file__).resolve()), "--ocr-worker"]
+
+    def start(self) -> None:
+        try:
+            self._folder = Path(tempfile.mkdtemp(prefix="pdfnote-ocr-"))
+            (self._folder / "input.pdf").write_bytes(self._data)
+            (self._folder / "job.json").write_text(
+                json.dumps(
+                    {
+                        "pages": self._pages,
+                        "language": self._language,
+                        "tessdata": self._tessdata,
+                        "skip_threshold": self._skip_threshold,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (self._folder / "out.jsonl").write_bytes(b"")
+        except OSError as exc:
+            QTimer.singleShot(0, lambda: (self.failed.emit(str(exc)), self._end()))
+            return
+        self._data = b""
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.remove(OCR_PASSWORD_VARIABLE)
+        if self._password:
+            environment.insert(OCR_PASSWORD_VARIABLE, self._password)
+        self._process.setProcessEnvironment(environment)
+        self._process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
+        program, *arguments = list(self.command_override or self.command()) + [str(self._folder)]
+        self._timer.start()
+        self._process.start(program, arguments)
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._process.state() != QProcess.NotRunning:
+            self._process.kill()
+
+    def running(self) -> bool:
+        return not self._ended
+
+    def stop(self) -> None:
+        """End the run without a word: the window is going."""
+        self._cancelled = True
+        self._ended = True
+        self._timer.stop()
+        if self._process.state() != QProcess.NotRunning:
+            self._process.kill()
+            self._process.waitForFinished(3000)
+        self._remove_folder()
+
+    def _read_events(self) -> None:
+        if self._folder is None or self._ended:
+            return
+        try:
+            with open(self._folder / "out.jsonl", "rb") as stream:
+                stream.seek(self._read_offset)
+                chunk = stream.read()
+        except OSError:
+            return
+        self._read_offset += len(chunk)
+        lines = (self._pending + chunk).split(b"\n")
+        self._pending = lines.pop()
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if self._cancelled:
+                continue  # nothing more is applied once cancelled
+            if "page" in event:
+                words = [tuple(word) for word in event.get("words") or []]
+                self.pageReady.emit(int(event["page"]), words)
+            elif "progress" in event:
+                done, total = event["progress"]
+                self.progress.emit(int(done), int(total))
+            elif "candidates" in event:
+                self.candidates = int(event["candidates"])
+            elif "failed" in event:
+                self.failed.emit(str(event["failed"]))
+            elif event.get("finished"):
+                self._worker_finished = True
+
+    def _process_finished(self, *_args: Any) -> None:
+        if self._ended:
+            return
+        self._read_events()
+        if not self._worker_finished and not self._cancelled:
+            self.failed.emit(
+                tr("OCRの処理が途中で終了しました（終了コード {code}）").format(
+                    code=self._process.exitCode()
+                )
+            )
+        self._end()
+
+    def _process_error(self, error: Any) -> None:
+        if error == QProcess.FailedToStart and not self._ended:
+            self.failed.emit(self._process.errorString())
+            self._end()
+
+    def _end(self) -> None:
+        if self._ended:
+            return
+        self._ended = True
+        self._timer.stop()
+        self._remove_folder()
+        self.finished.emit(self._cancelled)
+
+    def _remove_folder(self) -> None:
+        if self._folder is not None:
+            shutil.rmtree(self._folder, ignore_errors=True)
+            self._folder = None
+
+
+def page_content_fingerprint(document: fitz.Document, index: int) -> str:
+    """What page `index` draws, as a short digest: its content streams, the
+    pictures it names, its rotation and size. Taken when OCR starts and
+    compared before a page's result is written: a page changed meanwhile
+    -- redacted, a picture deleted -- gets nothing from a copy of how it
+    was (6.2)."""
+    page = document[index]
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(repr((page.rotation, tuple(page.rect))).encode())
+    for xref in page.get_contents():
+        digest.update(b"%d:" % xref)
+        try:
+            digest.update(document.xref_stream_raw(xref))
+        except Exception:
+            digest.update(b"?")
+    try:
+        digest.update(repr(page.get_images(full=True)).encode())
+    except Exception:
+        digest.update(b"?")
+    return digest.hexdigest()
 
 
 class RecoverySnapshotWriter:
@@ -3097,25 +3844,35 @@ class RecoverySnapshotWriter:
         # was saved or closed while they were being written.
         self._in_flight: Path | None = None
         self._dropped: set[Path] = set()
-        # Failed writes not yet reported, for the window (take_failure).
-        # A snapshot that silently never lands is no safety net. This was a
-        # single slot, which the next write's outcome overwrote -- a failure
-        # followed quickly by a success was never reported.
-        self._failures: list[str] = []
+        # Failed writes not yet reported, for the window (take_failure),
+        # with the snapshot each was for. A snapshot that silently never
+        # lands is no safety net. This was a single slot, which the next
+        # write's outcome overwrote -- a failure followed quickly by a
+        # success was never reported.
+        self._failures: list[tuple[Path, str]] = []
         # (snapshot path, revision, error or None) of every finished write.
         self._results: list[tuple[Path, int | None, str | None]] = []
 
-    def take_failure(self) -> str | None:
-        """The latest failed write not yet reported, once; None if none."""
+    def take_failure(self, paths: Iterable[Path] | None = None) -> str | None:
+        """The latest failed write not yet reported, once; None if none.
+        With `paths`, only the snapshots of those: one writer serves every
+        window, and each reports its own tabs' (6.2)."""
+        wanted = None if paths is None else set(paths)
         with self._lock:
-            failures, self._failures = self._failures, []
-        return failures[-1] if failures else None
+            taken = [f for f in self._failures if wanted is None or f[0] in wanted]
+            self._failures = [f for f in self._failures if wanted is not None and f[0] not in wanted]
+        return taken[-1][1] if taken else None
 
-    def take_results(self) -> list[tuple[Path, int | None, str | None]]:
-        """Every write that finished since the last call, with its outcome."""
+    def take_results(
+        self, paths: Iterable[Path] | None = None
+    ) -> list[tuple[Path, int | None, str | None]]:
+        """Every write that finished since the last call, with its outcome;
+        with `paths`, only those of the snapshots named."""
+        wanted = None if paths is None else set(paths)
         with self._lock:
-            results, self._results = self._results, []
-        return results
+            taken = [r for r in self._results if wanted is None or r[0] in wanted]
+            self._results = [r for r in self._results if wanted is not None and r[0] not in wanted]
+        return taken
 
     def submit(
         self, pdf_path: Path, meta_path: Path, data: bytes, meta: str,
@@ -3144,6 +3901,9 @@ class RecoverySnapshotWriter:
         """
         with self._ready:
             self._pending.pop(pdf_path, None)
+            # No one is left to hear how its writes went.
+            self._results = [r for r in self._results if r[0] != pdf_path]
+            self._failures = [f for f in self._failures if f[0] != pdf_path]
             if self._in_flight != pdf_path:
                 return
             self._dropped.add(pdf_path)
@@ -3188,7 +3948,7 @@ class RecoverySnapshotWriter:
             finally:
                 with self._ready:
                     if failure is not None:
-                        self._failures.append(failure)
+                        self._failures.append((pdf_path, failure))
                     if pdf_path in self._dropped:
                         self._dropped.discard(pdf_path)
                         for leftover in (partial, meta_partial, pdf_path, meta_path):
@@ -3220,6 +3980,24 @@ class RecoverySnapshotWriter:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(partial, target)
+
+
+_SHARED_RECOVERY_WRITER: RecoverySnapshotWriter | None = None
+
+
+def shared_recovery_writer() -> RecoverySnapshotWriter:
+    """The one recovery writer of this process, for every window.
+
+    Each window had its own. A tab moved to another window while its
+    snapshot was being written left the outcome with the first window,
+    which no longer held the tab: a failed write was never tried again,
+    and two writers could land an older snapshot over a newer one. One
+    writer keeps the writes of a snapshot in order, and each window takes
+    the outcomes of the tabs it holds at the time (6.2)."""
+    global _SHARED_RECOVERY_WRITER
+    if _SHARED_RECOVERY_WRITER is None or _SHARED_RECOVERY_WRITER._closed:
+        _SHARED_RECOVERY_WRITER = RecoverySnapshotWriter()
+    return _SHARED_RECOVERY_WRITER
 
 
 # Office draws its ribbon in colour: a document is a pale sheet, not an empty
@@ -4182,6 +4960,9 @@ def neutralize_marker_xrefs(document: fitz.Document) -> None:
             try:
                 annot.set_info(subject="|".join(parts))
                 annot.update()
+                if subject.startswith("SumiEditableImage|"):
+                    # The original it kept goes with the number naming it.
+                    delete_pdf_key(document, xref, "SumiSource")
             except Exception:
                 continue
 
@@ -4201,6 +4982,7 @@ def serialize_document(
     full_rewrite: bool = False,
     compact: bool = True,
     password: str | None = None,
+    collect: bool = True,
 ) -> bytes:
     """Turn a document into bytes -- the only place that does.
 
@@ -4216,6 +4998,9 @@ def serialize_document(
     journalled document is therefore copied as it is, and the copy is
     rebuilt; the document itself is left alone. `password` unlocks that
     copy when the document has a user password.
+
+    `collect=False` keeps every object, used or not, under its number: the
+    copy rebase_journal() builds its history on (6.3).
     """
     if full_rewrite and _journalled(document):
         staged = serialize_document(document, full_rewrite=False)
@@ -4230,13 +5015,20 @@ def serialize_document(
         neutralize_marker_xrefs(document)
         garbage, clean, deflate = 4, True, True
     else:
-        # Editable image markers intentionally keep stable xref references,
-        # including the untouched original kept for later re-cropping.
-        garbage, clean, deflate = 0, False, compact
+        # Garbage collection at level 1 leaves out what nothing refers to
+        # -- a deleted page, the drawing of a box written again -- and
+        # renumbers nothing: the marks keep naming their objects by number,
+        # in this document and in the file it is reopened from. Level 0 kept
+        # everything, and a file only ever grew (6.1). What a mark needs
+        # beyond what is drawn, the original kept for cropping again, is
+        # referred to from the mark itself (/SumiSource).
+        garbage, clean, deflate = (1 if collect else 0), False, compact
     return document.tobytes(
         garbage=garbage,
         clean=clean,
         deflate=deflate,
+        deflate_images=deflate,
+        deflate_fonts=deflate,
         encryption=fitz.PDF_ENCRYPT_KEEP,
     )
 
@@ -4292,6 +5084,1173 @@ def protected_document(document: fitz.Document, options: dict[str, Any]) -> fitz
     which is why it may turn a document into bytes besides
     serialize_document()."""
     return fitz.open(stream=document.tobytes(**options), filetype="pdf")
+
+
+# ---- keeping files small (6.1) ---------------------------------------------
+#
+# Up to 6.0 pdfNote made a PDF far larger than what it held. Measured on 6.0
+# with a 6 MB Japanese font: one text box 4.3 MB, the same box edited three
+# times 17.4 MB, a 3.6 MB photo moved once +21 MB, six of ten pages deleted
+# -0 MB. Four things did it:
+# - a text box carried a whole copy of its font, however few characters it
+#   had, one copy per box and per edit (subset_scratch_fonts);
+# - an edit emptied the old drawing but left what it drew -- the box's font,
+#   the picture's old copy -- listed in the page's resources, where every
+#   save found it (drop_undrawn_xobjects);
+# - a moved or resized picture was decoded and stored again as PNG;
+# - and a save never left out what nothing used any more (serialize_document).
+# The helpers below only ever take out what nothing draws, so a page looks
+# and reads -- selects, searches -- exactly as before.
+
+_PDF_NAME_TOKEN = re.compile(rb"/([^\s/\[\]()<>{}%]*)")
+_PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
+# A page's own resources may carry a few kilobytes of what nothing draws
+# without anyone minding; these are what the check on opening counts.
+SHRINK_NOTICE_MIN_BYTES = 256 * 1024
+# A cropped photo, or a photo pasted from the clipboard, is stored as JPEG at
+# this quality: well above what shows on screen or paper.
+IMAGE_JPEG_QUALITY = 92
+# Printing to Microsoft Print to PDF writes the PDF directly (6.1). Pictures
+# finer than this on the sheet are brought down to it -- MuPDF halves, thirds
+# and so on, so they end between this and twice this -- and photos are
+# stored as JPEG at the quality below; black-and-white scans keep twice it.
+PRINT_PDF_IMAGE_DPI = 200
+PRINT_PDF_JPEG_QUALITY = 85
+
+
+def is_pdf_writer_printer(name: str) -> bool:
+    """Is this Windows' own "Microsoft Print to PDF"? By the queue name or,
+    for a renamed queue, the driver's."""
+    wanted = "microsoft print to pdf"
+    if not name:
+        return False
+    if wanted in name.lower():
+        return True
+    try:
+        info = QPrinterInfo.printerInfo(name)
+        return not info.isNull() and wanted in info.makeAndModel().lower()
+    except Exception:
+        return False
+
+
+def pdf_names_in(stream: bytes) -> set[str]:
+    """Every name a content stream mentions, as a resource dictionary spells
+    it (#xx escapes decoded). Anything that looks like a name counts, an
+    operand of any operator or bytes inside an inline image too: a resource
+    is only ever taken out when its name appears nowhere."""
+    names: set[str] = set()
+    for raw in _PDF_NAME_TOKEN.findall(stream):
+        if b"#" in raw:
+            raw = _PDF_NAME_ESCAPE.sub(lambda match: bytes([int(match.group(1), 16)]), raw)
+        names.add(raw.decode("latin-1"))
+    return names
+
+
+def _pdf_of(document: fitz.Document) -> Any:
+    return fitz._as_pdf_document(document)
+
+
+def delete_pdf_key(document: fitz.Document, xref: int, key: str) -> None:
+    """Remove `key` from object `xref`. xref_set_key(..., "null") leaves the
+    key behind, and in a nested path a placeholder string."""
+    from pymupdf import mupdf
+
+    mupdf.pdf_dict_dels(mupdf.pdf_load_object(_pdf_of(document), xref), key)
+
+
+def _page_resources(document: fitz.Document, index: int) -> tuple[Any, tuple | None]:
+    """The resource dictionary page `index` draws from and who it belongs to:
+    ("ref", n) when it is object n of its own, which other pages may share;
+    ("in", n) when it is written inside object n, the page itself or the
+    page-tree node the page inherits it from."""
+    from pymupdf import mupdf
+
+    pdf = _pdf_of(document)
+    node = mupdf.pdf_lookup_page_obj(pdf, index)
+    holder = document.page_xref(index)
+    for _depth in range(64):
+        if not node.m_internal:
+            break
+        value = mupdf.pdf_dict_get(node, mupdf.PDF_ENUM_NAME_Resources)
+        if value.m_internal:
+            if mupdf.pdf_is_indirect(value):
+                resolved = mupdf.pdf_resolve_indirect(value)
+                if mupdf.pdf_is_dict(resolved):
+                    return resolved, ("ref", mupdf.pdf_to_num(value))
+                return None, None
+            if mupdf.pdf_is_dict(value):
+                return value, ("in", holder)
+            return None, None
+        parent = mupdf.pdf_dict_get(node, mupdf.PDF_ENUM_NAME_Parent)
+        if not parent.m_internal:
+            break
+        holder = mupdf.pdf_to_num(parent)
+        node = mupdf.pdf_resolve_indirect(parent)
+    return None, None
+
+
+def _resource_category(resources: Any, owner: tuple, category: str) -> tuple[Any, tuple | None]:
+    """The /XObject or /Font dictionary of `resources`, and who it belongs
+    to -- it may be an object of its own, shared with other resources."""
+    from pymupdf import mupdf
+
+    if resources is None or not resources.m_internal:
+        return None, None
+    value = mupdf.pdf_dict_gets(resources, category)
+    if not value.m_internal:
+        return None, None
+    if mupdf.pdf_is_indirect(value):
+        resolved = mupdf.pdf_resolve_indirect(value)
+        return (resolved, ("ref", mupdf.pdf_to_num(value))) if mupdf.pdf_is_dict(resolved) else (None, None)
+    return (value, (category,) + owner) if mupdf.pdf_is_dict(value) else (None, None)
+
+
+def _dict_names(dictionary: Any) -> list[str]:
+    from pymupdf import mupdf
+
+    return [
+        mupdf.pdf_to_name(mupdf.pdf_dict_get_key(dictionary, index))
+        for index in range(mupdf.pdf_dict_len(dictionary))
+    ]
+
+
+def _stream_names(document: fitz.Document, xref: int) -> set[str]:
+    try:
+        return pdf_names_in(document.xref_stream(xref))
+    except Exception:
+        # Unreadable: treat it as naming everything, so nothing is dropped.
+        return {"*"}
+
+
+def _borrowed_names(document: fitz.Document, resources: Any) -> set[str]:
+    """Names that streams without resources of their own look up in
+    `resources`: tiling patterns, soft-mask groups and Type 3 glyphs written
+    that way (the specification asks for resources; not every PDF has them)."""
+    from pymupdf import mupdf
+
+    names: set[str] = set()
+    if resources is None or not resources.m_internal:
+        return names
+
+    def entries(category: str) -> list[Any]:
+        found = mupdf.pdf_resolve_indirect(mupdf.pdf_dict_gets(resources, category))
+        if not found.m_internal or not mupdf.pdf_is_dict(found):
+            return []
+        return [mupdf.pdf_dict_get_val(found, i) for i in range(mupdf.pdf_dict_len(found))]
+
+    def lacks_resources(obj: Any) -> bool:
+        return not mupdf.pdf_dict_get(
+            mupdf.pdf_resolve_indirect(obj), mupdf.PDF_ENUM_NAME_Resources
+        ).m_internal
+
+    for pattern in entries("Pattern"):
+        if mupdf.pdf_is_stream(mupdf.pdf_resolve_indirect(pattern)) and lacks_resources(pattern):
+            names |= _stream_names(document, mupdf.pdf_to_num(pattern))
+    for state in entries("ExtGState"):
+        mask = mupdf.pdf_dict_get(mupdf.pdf_resolve_indirect(state), mupdf.PDF_ENUM_NAME_SMask)
+        group = mupdf.pdf_dict_get(mupdf.pdf_resolve_indirect(mask), mupdf.PDF_ENUM_NAME_G) if mask.m_internal else None
+        if group is not None and group.m_internal and lacks_resources(group):
+            names |= _stream_names(document, mupdf.pdf_to_num(group))
+    for font in entries("Font"):
+        resolved = mupdf.pdf_resolve_indirect(font)
+        if not mupdf.pdf_name_eq(
+            mupdf.pdf_dict_get(resolved, mupdf.PDF_ENUM_NAME_Subtype), mupdf.PDF_ENUM_NAME_Type3
+        ) or not lacks_resources(font):
+            continue
+        procs = mupdf.pdf_resolve_indirect(mupdf.pdf_dict_get(resolved, mupdf.PDF_ENUM_NAME_CharProcs))
+        for glyph in range(mupdf.pdf_dict_len(procs) if procs.m_internal else 0):
+            names |= _stream_names(document, mupdf.pdf_to_num(mupdf.pdf_dict_get_val(procs, glyph)))
+    return names
+
+
+def _form_reads_from(form: Any, resources_owner: tuple, xobjects_owner: tuple) -> bool:
+    """Does this form XObject look its names up in the given resources --
+    by having none of its own (PDF 1.1 allowed that), or the very same?"""
+    from pymupdf import mupdf
+
+    own = mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Resources)
+    if not own.m_internal:
+        return True
+    if mupdf.pdf_is_indirect(own):
+        number = mupdf.pdf_to_num(own)
+        return ("ref", number) in (resources_owner, xobjects_owner)
+    return False
+
+
+def _names_a_page_uses(
+    document: fitz.Document, index: int, resources_owner: tuple, xobjects: Any, xobjects_owner: tuple
+) -> set[str]:
+    """Every name page `index` may look up in its resources: its content
+    streams, and whatever draws from the same dictionaries -- forms that
+    have no resources of their own or share these, annotation appearances
+    without resources."""
+    from pymupdf import mupdf
+
+    page = document[index]
+    names: set[str] = set()
+    for xref in page.get_contents():
+        names |= _stream_names(document, xref)
+    names |= _borrowed_names(document, _page_resources(document, index)[0])
+    try:
+        annotation_xrefs = [xref for xref, _kind, _name in page.annot_xrefs()]
+    except Exception:
+        annotation_xrefs = []
+    for annotation in annotation_xrefs:
+        for state in ("N", "D", "R"):
+            kind, value = document.xref_get_key(annotation, f"AP/{state}")
+            if kind != "xref":
+                continue
+            try:
+                appearance = int(value.split()[0])
+            except (ValueError, IndexError):
+                continue
+            if document.xref_get_key(appearance, "Resources")[0] == "null":
+                names |= _stream_names(document, appearance)
+    if xobjects is not None:
+        for position in range(mupdf.pdf_dict_len(xobjects)):
+            reference = mupdf.pdf_dict_get_val(xobjects, position)
+            form = mupdf.pdf_resolve_indirect(reference)
+            if not mupdf.pdf_name_eq(
+                mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Subtype), mupdf.PDF_ENUM_NAME_Form
+            ):
+                continue
+            if _form_reads_from(form, resources_owner, xobjects_owner):
+                names |= _stream_names(document, mupdf.pdf_to_num(reference))
+    return names
+
+
+def drop_undrawn_xobjects(document: fitz.Document, index: int, names: set[str]) -> int:
+    """Take the XObjects `names` out of the resources of page `index` when
+    no page that shares those resources draws them any more.
+
+    An edit that lifts something off a page -- a text box written again,
+    a picture moved or deleted -- empties the drawing and used to leave the
+    object listed in the page's resources: the old box with its font, the
+    old copy of the picture. Listed, it was reachable, and every save wrote
+    it out again. Runs inside the edit, so undo puts the entry back.
+    Returns how many entries were taken out."""
+    from pymupdf import mupdf
+
+    try:
+        resources, owner = _page_resources(document, index)
+        xobjects, key = _resource_category(resources, owner, "XObject")
+        if xobjects is None or key is None or owner is None:
+            return 0
+        candidates = {
+            name for name in names
+            if name.isascii() and mupdf.pdf_dict_gets(xobjects, name).m_internal
+        }
+        if not candidates:
+            return 0
+        page_local = owner == ("in", document.page_xref(index)) and key[0] != "ref"
+        sharing = [index]
+        if not page_local:
+            for other in range(len(document)):
+                if other == index:
+                    continue
+                other_resources, other_owner = _page_resources(document, other)
+                _other_xobjects, other_key = _resource_category(
+                    other_resources, other_owner, "XObject"
+                )
+                if other_key == key:
+                    sharing.append(other)
+        for page_number in sharing:
+            other_resources, other_owner = _page_resources(document, page_number)
+            used = _names_a_page_uses(document, page_number, other_owner, xobjects, key)
+            if "*" in used:
+                return 0
+            candidates -= used
+            if not candidates:
+                return 0
+        for name in candidates:
+            mupdf.pdf_dict_dels(xobjects, name)
+        return len(candidates)
+    except Exception:
+        return 0
+
+
+def prune_unused_resources(document: fitz.Document) -> int:
+    """Take out of every page's and form's resources the XObjects and fonts
+    nothing draws. For a document pdfNote has just made from some pages of
+    another -- an extracted page, the pieces of a split, a print to PDF.
+
+    Many PDFs list every page's pictures and fonts in one dictionary that
+    all pages share; a page copied out of one took all of them along, so a
+    one-page extract of a ten-page scan was as large as the scan. Only
+    names that appear nowhere in what draws from a dictionary are taken
+    out, and dictionaries a form field fills from (/DR) are left alone.
+    Returns how many entries were taken out."""
+    from pymupdf import mupdf
+
+    pdf = _pdf_of(document)
+    groups: dict[tuple, list] = {}
+    protected: set[tuple] = set()
+    try:
+        form = mupdf.pdf_dict_getp(mupdf.pdf_trailer(pdf), "Root/AcroForm")
+        defaults = mupdf.pdf_dict_gets(form, "DR") if form.m_internal else None
+        if defaults is not None and defaults.m_internal:
+            if mupdf.pdf_is_indirect(defaults):
+                owner: tuple = ("ref", mupdf.pdf_to_num(defaults))
+            else:
+                owner = ("in", mupdf.pdf_to_num(mupdf.pdf_dict_getp(mupdf.pdf_trailer(pdf), "Root")))
+            for category in ("XObject", "Font"):
+                _dictionary, key = _resource_category(
+                    mupdf.pdf_resolve_indirect(defaults), owner, category
+                )
+                if key is not None:
+                    protected.add(key)
+    except Exception:
+        pass
+    visited_forms: set[int] = set()
+
+    def record(resources: Any, owner: tuple, names: set[str]) -> None:
+        xobjects, xobjects_key = _resource_category(resources, owner, "XObject")
+        fonts, fonts_key = _resource_category(resources, owner, "Font")
+        names = set(names) | _borrowed_names(document, resources)
+        if xobjects is not None:
+            # Forms that read their names from here add theirs, as far down
+            # as such forms go.
+            pending = True
+            seen: set[int] = set()
+            while pending:
+                pending = False
+                for position in range(mupdf.pdf_dict_len(xobjects)):
+                    name = mupdf.pdf_to_name(mupdf.pdf_dict_get_key(xobjects, position))
+                    reference = mupdf.pdf_dict_get_val(xobjects, position)
+                    number = mupdf.pdf_to_num(reference)
+                    if number in seen or (name not in names and "*" not in names):
+                        continue
+                    form = mupdf.pdf_resolve_indirect(reference)
+                    if not mupdf.pdf_name_eq(
+                        mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Subtype), mupdf.PDF_ENUM_NAME_Form
+                    ):
+                        continue
+                    seen.add(number)
+                    if _form_reads_from(form, owner, xobjects_key or ()):
+                        names |= _stream_names(document, number)
+                        pending = True
+        for dictionary, key in ((xobjects, xobjects_key), (fonts, fonts_key)):
+            if dictionary is None or key is None:
+                continue
+            group = groups.setdefault(key, [dictionary, set()])
+            group[1] |= names
+        if xobjects is not None:
+            for position in range(mupdf.pdf_dict_len(xobjects)):
+                reference = mupdf.pdf_dict_get_val(xobjects, position)
+                visit_form(reference)
+
+    def visit_form(reference: Any) -> None:
+        number = mupdf.pdf_to_num(reference)
+        if not number or number in visited_forms:
+            return
+        form = mupdf.pdf_resolve_indirect(reference)
+        if not mupdf.pdf_name_eq(
+            mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Subtype), mupdf.PDF_ENUM_NAME_Form
+        ):
+            return
+        visited_forms.add(number)
+        own = mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Resources)
+        if not own.m_internal:
+            return
+        if mupdf.pdf_is_indirect(own):
+            resources, owner = mupdf.pdf_resolve_indirect(own), ("ref", mupdf.pdf_to_num(own))
+        else:
+            resources, owner = own, ("in", number)
+        record(resources, owner, _stream_names(document, number))
+
+    for index in range(len(document)):
+        resources, owner = _page_resources(document, index)
+        if resources is None or owner is None:
+            continue
+        xobjects, xobjects_key = _resource_category(resources, owner, "XObject")
+        record(
+            resources, owner,
+            _names_a_page_uses(document, index, owner, xobjects, xobjects_key or ()),
+        )
+        page = document[index]
+        for annotation, _kind, _name in page.annot_xrefs():
+            for state in ("N", "D", "R"):
+                kind, value = document.xref_get_key(annotation, f"AP/{state}")
+                if kind == "xref":
+                    try:
+                        visit_form(mupdf.pdf_new_indirect(pdf, int(value.split()[0]), 0))
+                    except (ValueError, IndexError):
+                        continue
+    removed = 0
+    for key, (dictionary, names) in groups.items():
+        if key in protected or "*" in names:
+            continue
+        for name in _dict_names(dictionary):
+            if name.isascii() and name not in names:
+                mupdf.pdf_dict_dels(dictionary, name)
+                removed += 1
+    return removed
+
+
+def write_file_atomically(target: str | Path, data: bytes) -> None:
+    """Put `data` at `target` whole or not at all: written to a temporary
+    file beside it, flushed to the disk, then swapped in. What was there
+    before stays until the new file is complete."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
+    )
+    temp_path: Path | None = Path(temp_name)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def compact_page_copy(document: fitz.Document) -> dict[str, Any]:
+    """Get a document made of pages copied out of another -- an extracted
+    page, a piece of a split, a page on the clipboard -- ready to write, and
+    the save options for it.
+
+    Its marks are blanked, since their numbers named the other document's
+    objects, and what the copied pages do not draw is taken out of their
+    resources: a page copied from a PDF whose pages share one dictionary
+    took every page's pictures along (6.1). The options rebuild the file
+    with every object written once, compressed."""
+    neutralize_marker_xrefs_on(document, range(len(document)))
+    prune_unused_resources(document)
+    return {"garbage": 4, "deflate": True, "deflate_images": True, "deflate_fonts": True}
+
+
+def neutralize_marker_xrefs_on(document: fitz.Document, pages: Iterable[int]) -> None:
+    """neutralize_marker_xrefs() for some pages only: the pages just copied
+    in from elsewhere -- another document, the clipboard, a duplicate.
+
+    A mark's cached numbers named the objects of the page it was made on.
+    On a copy they named the original's: writing the copy's text box again
+    emptied the original's, and moving the copy's picture took the
+    original's off its page. Blanked, the lookups find the copy's own."""
+    wanted = set(pages)
+    for index in sorted(wanted):
+        if not 0 <= index < len(document):
+            continue
+        page = document[index]
+        for xref, _kind, _name in page.annot_xrefs():
+            try:
+                annot = page.load_annot(xref)
+                subject = str(annot.info.get("subject") or "")
+            except Exception:
+                continue
+            parts = subject.split("|")
+            if subject.startswith("SumiRichText|") and len(parts) >= 5:
+                parts[4] = "0"
+            elif subject.startswith("SumiEditableImage|") and len(parts) >= 4:
+                parts[1] = parts[2] = parts[3] = "0"
+            else:
+                continue
+            try:
+                annot.set_info(subject="|".join(parts))
+                annot.update()
+                if subject.startswith("SumiEditableImage|"):
+                    delete_pdf_key(document, xref, "SumiSource")
+            except Exception:
+                continue
+
+
+def remap_copied_marks(document: fitz.Document, source: int, copy: int) -> None:
+    """Make the marks of page `copy`, a duplicate of page `source` in the same
+    document, name the copy's own objects.
+
+    Content streams correspond by their place in /Contents; pictures are
+    the source's own once share_resources_with() has run, or found again
+    under the mark when not. Anything that cannot be matched is blanked,
+    which the lookups treat as unknown (neutralize_marker_xrefs_on)."""
+    try:
+        source_contents = document[source].get_contents()
+        page = document[copy]
+        copy_contents = page.get_contents()
+        images = {int(item[0]) for item in page.get_images(full=True)}
+    except Exception:
+        neutralize_marker_xrefs_on(document, [copy])
+        return
+
+    def mapped(value: str) -> str:
+        try:
+            position = source_contents.index(int(value))
+            return str(copy_contents[position])
+        except (ValueError, IndexError):
+            return "0"
+
+    for xref, _kind, _name in page.annot_xrefs():
+        try:
+            annot = page.load_annot(xref)
+            subject = str(annot.info.get("subject") or "")
+        except Exception:
+            continue
+        parts = subject.split("|")
+        if subject.startswith("SumiRichText|") and len(parts) >= 5:
+            parts[4] = mapped(parts[4])
+        elif subject.startswith("SumiEditableImage|") and len(parts) >= 4:
+            try:
+                visible, source_image = int(parts[1]), int(parts[3])
+            except ValueError:
+                visible = source_image = 0
+            parts[1] = str(visible) if visible in images else "0"
+            parts[2] = mapped(parts[2]) if parts[1] != "0" else "0"
+            keep_source = (
+                parts[1] != "0"
+                and source_image > 0
+                and document.xref_get_key(source_image, "Subtype")[1] == "/Image"
+            )
+            parts[3] = str(source_image) if keep_source else parts[1]
+        else:
+            continue
+        try:
+            annot.set_info(subject="|".join(parts))
+            annot.update()
+            if subject.startswith("SumiEditableImage|"):
+                # The copy came with a copy of the kept original; it now
+                # names the original's own, and the copy goes unused.
+                if parts[3] not in ("0", parts[1]):
+                    document.xref_set_key(xref, "SumiSource", f"{parts[3]} 0 R")
+                elif document.xref_get_key(xref, "SumiSource")[0] != "null":
+                    delete_pdf_key(document, xref, "SumiSource")
+        except Exception:
+            continue
+
+
+def share_resources_with(document: fitz.Document, source: int, copy: int) -> int:
+    """Point the resources of page `copy`, just made from page `source`, at
+    the source's own pictures, forms and fonts instead of copies of them.
+
+    A duplicated page used to carry a second copy of every picture and font
+    on it: a scanned page duplicated was a second scan. The copy's own
+    resource dictionaries stay its own, so what an edit takes out of one
+    page is still drawn on the other. Returns how many entries now share."""
+    from pymupdf import mupdf
+
+    shared = 0
+    try:
+        source_resources, source_owner = _page_resources(document, source)
+        copy_resources, copy_owner = _page_resources(document, copy)
+        if source_owner is None or copy_owner is None or source_owner == copy_owner:
+            return 0
+        pdf = _pdf_of(document)
+        for category in ("XObject", "Font"):
+            original, original_key = _resource_category(source_resources, source_owner, category)
+            duplicate, duplicate_key = _resource_category(copy_resources, copy_owner, category)
+            if original is None or duplicate is None or original_key == duplicate_key:
+                continue
+            for name in _dict_names(duplicate):
+                theirs = mupdf.pdf_dict_gets(original, name)
+                ours = mupdf.pdf_dict_gets(duplicate, name)
+                if not (mupdf.pdf_is_indirect(theirs) and mupdf.pdf_is_indirect(ours)):
+                    continue
+                if mupdf.pdf_to_num(theirs) == mupdf.pdf_to_num(ours):
+                    continue
+                first = mupdf.pdf_resolve_indirect(theirs)
+                second = mupdf.pdf_resolve_indirect(ours)
+                same_kind = all(
+                    mupdf.pdf_name_eq(mupdf.pdf_dict_get(first, key), mupdf.pdf_dict_get(second, key))
+                    for key in (mupdf.PDF_ENUM_NAME_Type, mupdf.PDF_ENUM_NAME_Subtype)
+                )
+                if not same_kind:
+                    continue
+                if mupdf.pdf_is_stream(first):
+                    if document.xref_stream_raw(mupdf.pdf_to_num(theirs)) != document.xref_stream_raw(
+                        mupdf.pdf_to_num(ours)
+                    ):
+                        continue
+                mupdf.pdf_dict_puts(duplicate, name, mupdf.pdf_new_indirect(pdf, mupdf.pdf_to_num(theirs), 0))
+                shared += 1
+    except Exception:
+        return shared
+    return shared
+
+
+def share_identical_images(document: fitz.Document, new_pages: Iterable[int]) -> int:
+    """Point the pictures on `new_pages` at identical pictures already on the
+    other pages, so a page pasted back into its own document does not bring
+    a second copy of each. Compared byte for byte, mask included."""
+    from pymupdf import mupdf
+
+    wanted = set(new_pages)
+    pdf = _pdf_of(document)
+    known: dict[tuple, list[int]] = {}
+    for index in range(len(document)):
+        if index in wanted:
+            continue
+        try:
+            for item in document.get_page_images(index, full=True):
+                xref = int(item[0])
+                known.setdefault((item[2], item[3], item[4], item[8]), []).append(xref)
+        except Exception:
+            continue
+    if not known:
+        return 0
+
+    def same(first: int, second: int) -> bool:
+        try:
+            if document.xref_stream_raw(first) != document.xref_stream_raw(second):
+                return False
+            masks = [document.xref_get_key(xref, "SMask") for xref in (first, second)]
+            if masks[0][0] != masks[1][0]:
+                return False
+            if masks[0][0] == "xref":
+                return same(int(masks[0][1].split()[0]), int(masks[1][1].split()[0]))
+            return True
+        except Exception:
+            return False
+
+    shared = 0
+    for index in sorted(wanted):
+        if not 0 <= index < len(document):
+            continue
+        resources, owner = _page_resources(document, index)
+        xobjects, _key = _resource_category(resources, owner, "XObject")
+        if xobjects is None:
+            continue
+        try:
+            images = document.get_page_images(index, full=True)
+        except Exception:
+            continue
+        for item in images:
+            if item[9] != 0:
+                continue  # drawn inside a form, not listed on the page
+            xref, name = int(item[0]), str(item[7])
+            for candidate in known.get((item[2], item[3], item[4], item[8]), []):
+                if candidate != xref and same(candidate, xref):
+                    mupdf.pdf_dict_puts(xobjects, name, mupdf.pdf_new_indirect(pdf, candidate, 0))
+                    shared += 1
+                    break
+    return shared
+
+
+# A ToUnicode CMap as MuPDF writes it for a whole font: every glyph mapped,
+# 150 KB for a Japanese one, in each text box -- after the font itself was
+# cut down to a few glyphs, this was most of what a box weighed.
+_CMAP_RANGE = re.compile(
+    rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]*)>|\[([^\]]*)\])"
+)
+_CMAP_CHAR = re.compile(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>")
+
+
+def _tounicode_map(cmap: bytes) -> dict[int, str] | None:
+    """Code -> UTF-16BE hex of a ToUnicode CMap's bfchar and bfrange
+    entries. None when it holds anything else."""
+    mapping: dict[int, str] = {}
+    for block in re.findall(rb"beginbfrange(.*?)endbfrange", cmap, re.S):
+        for low, high, start, array in _CMAP_RANGE.findall(block):
+            first, last = int(low, 16), int(high, 16)
+            if last < first or last - first > 0xFFFF:
+                return None
+            if array:
+                targets = re.findall(rb"<([0-9A-Fa-f]*)>", array)
+                for offset, target in enumerate(targets[: last - first + 1]):
+                    mapping[first + offset] = target.decode("ascii")
+            else:
+                value = int(start, 16)
+                width = len(start)
+                for offset in range(last - first + 1):
+                    mapping[first + offset] = format(value + offset, f"0{width}X")
+    for block in re.findall(rb"beginbfchar(.*?)endbfchar", cmap, re.S):
+        for code, target in _CMAP_CHAR.findall(block):
+            mapping[int(code, 16)] = target.decode("ascii")
+    return mapping
+
+
+def _tounicode_cmap(mapping: dict[int, str]) -> bytes:
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo <</Registry(Adobe)/Ordering(UCS)/Supplement 0>> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        "<0000> <FFFF>",
+        "endcodespacerange",
+    ]
+    codes = sorted(mapping)
+    for start in range(0, len(codes), 100):
+        chunk = codes[start:start + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        lines.extend(f"<{code:04X}> <{mapping[code]}>" for code in chunk)
+        lines.append("endbfchar")
+    lines += [
+        "endcmap",
+        "CMapName currentdict /CMap defineresource pop",
+        "end",
+        "end",
+    ]
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+_TEXT_FONT_OR_STRING = re.compile(
+    rb"/([^\s/\[\]()<>{}%]+)\s+[-+0-9.]+\s+Tf|<([0-9A-Fa-f\s]*)>|(\()"
+)
+
+
+def _codes_by_font(stream: bytes) -> dict[str, set[int]] | None:
+    """Which two-byte codes each font (by resource name) shows in a content
+    stream written by MuPDF. None if it shows text any other way."""
+    used: dict[str, set[int]] = {}
+    current: str | None = None
+    for match in _TEXT_FONT_OR_STRING.finditer(stream):
+        if match.group(1) is not None:
+            current = match.group(1).decode("latin-1")
+            used.setdefault(current, set())
+        elif match.group(3) is not None:
+            return None
+        elif current is not None:
+            digits = re.sub(rb"\s", b"", match.group(2))
+            if len(digits) % 4:
+                return None
+            used[current].update(int(digits[i:i + 4], 16) for i in range(0, len(digits), 4))
+    return used
+
+
+def subset_scratch_fonts(scratch: fitz.Document) -> None:
+    """Cut the fonts of a scratch document down to the glyphs its pages
+    show: MuPDF's subsetter, then the ToUnicode maps to the same glyphs.
+    The scratch documents are a text box laid out by MuPDF, or text boxes
+    of an older pdfNote copied out of a document. Text stays selectable
+    and searchable: every glyph shown keeps its Unicode. Anything that does
+    not go as expected leaves that font as it was."""
+    from pymupdf import mupdf
+
+    try:
+        scratch.subset_fonts()
+    except Exception:
+        return
+    used_by_font: dict[int, set[int]] = {}
+    unknown: set[int] = set()
+    for index in range(len(scratch)):
+        page = scratch[index]
+        fonts = {name: xref for xref, _ext, _type, _base, name, _enc, *_rest in page.get_fonts(full=True)}
+        codes: dict[str, set[int]] | None = {}
+        for content in page.get_contents():
+            found = _codes_by_font(scratch.xref_stream(content))
+            if found is None:
+                codes = None
+                break
+            for name, values in found.items():
+                codes.setdefault(name, set()).update(values)
+        if codes is None:
+            unknown.update(fonts.values())
+            continue
+        for name, values in codes.items():
+            if name in fonts:
+                used_by_font.setdefault(fonts[name], set()).update(values)
+    for font, codes in used_by_font.items():
+        if font in unknown:
+            continue
+        try:
+            if scratch.xref_get_key(font, "Encoding")[1] != "/Identity-H":
+                continue
+            kind, value = scratch.xref_get_key(font, "ToUnicode")
+            if kind != "xref":
+                continue
+            cmap_xref = int(value.split()[0])
+            mapping = _tounicode_map(scratch.xref_stream(cmap_xref))
+            if mapping is None or not codes <= set(mapping):
+                continue
+            trimmed = {code: mapping[code] for code in codes}
+            scratch.update_stream(cmap_xref, _tounicode_cmap(trimmed))
+        except Exception:
+            continue
+
+
+def insert_html_subset(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    html: str,
+    *,
+    css: str = "",
+    archive: Any = None,
+    scale_low: float = 0,
+    scale_word_width: bool = True,
+) -> tuple[float, float]:
+    """Page.insert_htmlbox, with the fonts cut down to what the box shows.
+
+    insert_htmlbox lays the HTML out on a page of a scratch document and
+    shows that page here; the scratch page embeds every font whole -- a
+    Japanese one is several megabytes -- and each box brought its own copy.
+    This does the same steps as PyMuPDF 1.28's insert_htmlbox (rotation 0,
+    full opacity, no links, which a text box never has) and subsets the
+    scratch fonts before the page is shown. Same return values."""
+    from pymupdf import mupdf
+
+    rect = fitz.Rect(rect)
+    if not 0 <= scale_low <= 1:
+        raise ValueError("'scale_low' must be in [0, 1]")
+    story = fitz.Story(html=html, user_css="body {margin:1px;}" + (css or ""), archive=archive)
+    fit = story.fit_scale(
+        fitz.Rect(0, 0, rect.width, rect.height),
+        scale_min=1,
+        scale_max=None if scale_low == 0 else 1 / scale_low,
+        flags=mupdf.FZ_PLACE_STORY_FLAG_NO_OVERFLOW if scale_word_width else 0,
+    )
+    if not fit.big_enough:
+        return (-1, 1 / fit.parameter)
+    filled = fitz.Rect(fit.filled)
+    scale = 1 / fit.parameter
+    spare_height = max((fit.rect.y1 - filled.y1) * scale, 0)
+    scratch = story.write_with_links(lambda *_args: (fit.rect, fit.rect, None))
+    try:
+        subset_scratch_fonts(scratch)
+        page.show_pdf_page(rect, scratch, 0)
+    finally:
+        scratch.close()
+    return (spare_height, scale)
+
+
+def _is_subset_font_name(base_font: str) -> bool:
+    name = base_font.lstrip("/")
+    return len(name) > 7 and name[6] == "+" and name[:6].isalpha() and name[:6].isupper()
+
+
+def subset_form_fonts(document: fitz.Document, forms: Iterable[int]) -> int:
+    """Cut the whole fonts the given form XObjects use down to what they show.
+
+    For text boxes an older pdfNote baked with a whole font each. The forms
+    are copied into a scratch document, one per page, the fonts are cut
+    down there (subset_scratch_fonts), and each form's font entry is pointed
+    at the cut-down copy brought back. The whole font is then drawn by
+    nothing and the next save leaves it out. Returns how many fonts."""
+    from pymupdf import mupdf
+
+    pdf = _pdf_of(document)
+    scratch = fitz.open()
+    replaced = 0
+    try:
+        spdf = _pdf_of(scratch)
+        to_scratch = mupdf.pdf_new_graft_map(spdf)
+        entries: list[tuple[Any, str, int]] = []
+        scratch_fonts: dict[int, Any] = {}
+        for xref in forms:
+            try:
+                form = mupdf.pdf_load_object(pdf, xref)
+                resources = mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Resources)
+                if not resources.m_internal:
+                    continue
+                fonts = mupdf.pdf_resolve_indirect(
+                    mupdf.pdf_dict_get(mupdf.pdf_resolve_indirect(resources), mupdf.PDF_ENUM_NAME_Font)
+                )
+                if not fonts.m_internal or not mupdf.pdf_dict_len(fonts):
+                    continue
+                whole = []
+                for name in _dict_names(fonts):
+                    reference = mupdf.pdf_dict_gets(fonts, name)
+                    if not mupdf.pdf_is_indirect(reference):
+                        continue
+                    number = mupdf.pdf_to_num(reference)
+                    base = document.xref_get_key(number, "BaseFont")[1]
+                    if document.xref_get_key(number, "Subtype")[1] != "/Type0" or _is_subset_font_name(base):
+                        continue
+                    whole.append((name, number, reference))
+                if not whole:
+                    continue
+                try:
+                    bbox = fitz.Rect(
+                        [float(value) for value in document.xref_get_key(xref, "BBox")[1].strip("[]").split()[:4]]
+                    )
+                except (ValueError, TypeError):
+                    bbox = fitz.Rect(0, 0, 595, 842)
+                # Only the glyphs shown matter here, not where they land.
+                page = scratch.new_page(width=max(1.0, bbox.width), height=max(1.0, bbox.height))
+                page_object = mupdf.pdf_lookup_page_obj(spdf, page.number)
+                mupdf.pdf_dict_put(
+                    page_object, mupdf.PDF_ENUM_NAME_Resources,
+                    mupdf.pdf_graft_mapped_object(to_scratch, resources),
+                )
+                # A new page has no content stream: give it the form's.
+                content = scratch.get_new_xref()
+                scratch.update_object(content, "<<>>")
+                scratch.update_stream(content, document.xref_stream(xref))
+                scratch.xref_set_key(page.xref, "Contents", f"{content} 0 R")
+                for name, number, reference in whole:
+                    scratch_fonts[number] = mupdf.pdf_graft_mapped_object(to_scratch, reference)
+                    entries.append((fonts, name, number))
+            except Exception:
+                continue
+        if not scratch_fonts:
+            return 0
+        subset_scratch_fonts(scratch)
+        back = mupdf.pdf_new_graft_map(pdf)
+        brought: dict[int, Any] = {}
+        for number, scratch_reference in scratch_fonts.items():
+            base = scratch.xref_get_key(mupdf.pdf_to_num(scratch_reference), "BaseFont")[1]
+            if not _is_subset_font_name(base):
+                continue  # the subsetter left it alone; so does this
+            brought[number] = mupdf.pdf_graft_mapped_object(back, scratch_reference)
+        for fonts, name, number in entries:
+            if number in brought:
+                mupdf.pdf_dict_puts(fonts, name, brought[number])
+                replaced += 1
+    finally:
+        scratch.close()
+    return replaced
+
+
+def _pages_with_pdfnote_marks(document: fitz.Document) -> list[int]:
+    pages: list[int] = []
+    for index in range(len(document)):
+        try:
+            annotations = [xref for xref, _kind, _name in document[index].annot_xrefs()]
+        except Exception:
+            continue
+        for xref in annotations:
+            kind, subject = document.xref_get_key(xref, "Subj")
+            if kind == "string" and subject.startswith(("SumiRichText", "SumiEditableImage")):
+                pages.append(index)
+                break
+    return pages
+
+
+def _forms_with_whole_fonts(document: fitz.Document, index: int) -> list[int]:
+    """The form XObjects page `index` draws that use a whole embedded Type 0
+    font -- what an older pdfNote baked each text box into."""
+    from pymupdf import mupdf
+
+    found: list[int] = []
+    resources, owner = _page_resources(document, index)
+    xobjects, _key = _resource_category(resources, owner, "XObject")
+    pending = []
+    if xobjects is not None:
+        pending = [mupdf.pdf_dict_get_val(xobjects, i) for i in range(mupdf.pdf_dict_len(xobjects))]
+    seen: set[int] = set()
+    while pending:
+        reference = pending.pop()
+        number = mupdf.pdf_to_num(reference)
+        if not number or number in seen or len(seen) > 2000:
+            continue
+        seen.add(number)
+        form = mupdf.pdf_resolve_indirect(reference)
+        if not mupdf.pdf_name_eq(
+            mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Subtype), mupdf.PDF_ENUM_NAME_Form
+        ):
+            continue
+        own = mupdf.pdf_resolve_indirect(mupdf.pdf_dict_get(form, mupdf.PDF_ENUM_NAME_Resources))
+        if not own.m_internal:
+            continue
+        inner = mupdf.pdf_resolve_indirect(mupdf.pdf_dict_get(own, mupdf.PDF_ENUM_NAME_XObject))
+        if inner.m_internal:
+            pending += [mupdf.pdf_dict_get_val(inner, i) for i in range(mupdf.pdf_dict_len(inner))]
+        fonts = mupdf.pdf_resolve_indirect(mupdf.pdf_dict_get(own, mupdf.PDF_ENUM_NAME_Font))
+        for position in range(mupdf.pdf_dict_len(fonts) if fonts.m_internal else 0):
+            font = mupdf.pdf_dict_get_val(fonts, position)
+            font_number = mupdf.pdf_to_num(font)
+            if not font_number:
+                continue
+            if document.xref_get_key(font_number, "Subtype")[1] != "/Type0":
+                continue
+            if _is_subset_font_name(document.xref_get_key(font_number, "BaseFont")[1]):
+                continue
+            found.append(number)
+            break
+    return found
+
+
+def _drop_undrawn_on(document: fitz.Document, pages: list[int]) -> int:
+    """drop_undrawn_xobjects() for every XObject of the given pages, each
+    shared dictionary looked at once: what nothing on any page sharing it
+    draws goes. Returns how many entries."""
+    from pymupdf import mupdf
+
+    wanted = set(pages)
+    groups: dict[tuple, list] = {}
+    for index in range(len(document)):
+        resources, owner = _page_resources(document, index)
+        xobjects, key = _resource_category(resources, owner, "XObject")
+        if xobjects is None or key is None or owner is None:
+            continue
+        group = groups.setdefault(key, [xobjects, []])
+        group[1].append((index, owner))
+    removed = 0
+    for key, (xobjects, members) in groups.items():
+        if not any(index in wanted for index, _owner in members):
+            continue
+        used: set[str] = set()
+        for index, owner in members:
+            used |= _names_a_page_uses(document, index, owner, xobjects, key)
+        if "*" in used:
+            continue
+        for name in _dict_names(xobjects):
+            if name.isascii() and name not in used:
+                mupdf.pdf_dict_dels(xobjects, name)
+                removed += 1
+    return removed
+
+
+def _same_picture(document: fitz.Document, first: int, second: int) -> bool:
+    """Do two image objects show the same picture? Decoded and compared,
+    every few hundredth sample: a JPEG decoded by Qt and by MuPDF differs by
+    a level or two here and there, which no one can see."""
+    try:
+        if document.xref_get_key(first, "SMask")[0] != document.xref_get_key(second, "SMask")[0]:
+            return False
+        one, two = fitz.Pixmap(document, first), fitz.Pixmap(document, second)
+        if (one.width, one.height, one.n, one.alpha) != (two.width, two.height, two.n, two.alpha):
+            return False
+        if one.width * one.height > 60_000_000:
+            return False
+        a, b = one.samples, two.samples
+        step = max(1, len(a) // 400_000) | 1
+        total = worst = count = 0
+        for x, y in zip(a[::step], b[::step]):
+            difference = abs(x - y)
+            total += difference
+            worst = max(worst, difference)
+            count += 1
+        return count > 0 and worst <= 8 and total <= count * 0.5
+    except Exception:
+        return False
+
+
+def _image_size(document: fitz.Document, xref: int) -> tuple[int, int] | None:
+    try:
+        if document.xref_get_key(xref, "Subtype")[1] != "/Image":
+            return None
+        width, height = document.xref_get_key(xref, "Width"), document.xref_get_key(xref, "Height")
+        if width[0] != "int" or height[0] != "int":
+            return None
+        return int(width[1]), int(height[1])
+    except Exception:
+        return None
+
+
+def image_source_fits(
+    document: fitz.Document, visible: int, source: int,
+    crop: tuple[float, float, float, float],
+) -> bool:
+    """Can the picture `visible` have been cut from `source` by `crop`?
+
+    A mark names the original it keeps by number, and a number means
+    something only in its own file. 1.0.0 pasted a picture into another
+    document with the number of the original in the first one; moving or
+    cropping the copy later took whatever picture had that number here
+    (6.2). A crop keeps the original's pixels, so the picture on the page
+    is the original's size times the crop's -- a stranger rarely is."""
+    if source == visible:
+        return True
+    shown, kept = _image_size(document, visible), _image_size(document, source)
+    if shown is None or kept is None:
+        return False
+    left, top, right, bottom = crop
+    wanted = (max(1.0, (right - left) * kept[0]), max(1.0, (bottom - top) * kept[1]))
+    return all(
+        abs(actual - expected) <= max(2.0, expected * 0.02)
+        for actual, expected in zip(shown, wanted)
+    )
+
+
+def tidy_pdfnote_leftovers(document: fitz.Document) -> int:
+    """Undo, in a document an older pdfNote saved, what made it large.
+
+    On every page with pdfNote's text boxes or pictures: what nothing draws
+    leaves the resources -- boxes written again and moved pictures left
+    their old drawing listed, a whole font in each -- the whole fonts of the
+    boxes still drawn are cut down to their characters, and the original a
+    cropped picture keeps is referred to from its mark, so that leaving out
+    what nothing uses does not take it too. Nothing drawn changes, and all
+    text stays selectable and searchable. Runs before the document's undo
+    history starts. Returns how many changes were made."""
+    from pymupdf import mupdf
+
+    changes = 0
+    pages = _pages_with_pdfnote_marks(document)
+    for index in pages:
+        page = document[index]
+        for xref, _kind, _name in page.annot_xrefs():
+            kind, subject = document.xref_get_key(xref, "Subj")
+            if kind != "string" or not subject.startswith("SumiEditableImage|"):
+                continue
+            parts = subject.split("|")
+            try:
+                visible, source = int(parts[1]), int(parts[3])
+                crop = [float(value) for value in parts[4].split(",")] if len(parts) > 4 else [0, 0, 1, 1]
+            except (ValueError, IndexError):
+                continue
+            if (
+                len(crop) == 4
+                and source > 0
+                and visible > 0
+                and source != visible
+                and _image_size(document, visible) is not None
+                and not image_source_fits(document, visible, source, tuple(crop))
+            ):
+                # The original named belongs to another file (see
+                # image_source_fits): the picture on the page becomes its
+                # own original, whole.
+                annot = page.load_annot(xref)
+                parts[3] = str(visible)
+                if len(parts) > 4:
+                    parts[4] = "0.000000,0.000000,1.000000,1.000000"
+                annot.set_info(subject="|".join(parts))
+                annot.update()
+                if document.xref_get_key(xref, "SumiSource")[0] != "null":
+                    delete_pdf_key(document, xref, "SumiSource")
+                changes += 1
+                continue
+            uncropped = len(crop) == 4 and all(
+                abs(value - whole) < 1e-4 for value, whole in zip(crop, (0, 0, 1, 1))
+            )
+            if (
+                uncropped
+                and source > 0
+                and visible != source
+                and document.xref_get_key(source, "Subtype")[1] == "/Image"
+                and _same_picture(document, visible, source)
+            ):
+                # A picture an older pdfNote moved or resized: the page shows
+                # a lossless copy of the original, several times its size --
+                # a 3.6 MB photo became 21 MB. The original is drawn again.
+                resources, owner = _page_resources(document, index)
+                xobjects, _key = _resource_category(resources, owner, "XObject")
+                if xobjects is not None:
+                    for name in _dict_names(xobjects):
+                        reference = mupdf.pdf_dict_gets(xobjects, name)
+                        if mupdf.pdf_to_num(reference) == visible:
+                            mupdf.pdf_dict_puts(
+                                xobjects, name, mupdf.pdf_new_indirect(_pdf_of(document), source, 0)
+                            )
+                    parts[1] = str(source)
+                    annot = page.load_annot(xref)
+                    annot.set_info(subject="|".join(parts))
+                    annot.update()
+                    if document.xref_get_key(xref, "SumiSource")[0] != "null":
+                        delete_pdf_key(document, xref, "SumiSource")
+                    changes += 1
+                    continue
+            if (
+                source > 0
+                and source != visible
+                and document.xref_get_key(source, "Subtype")[1] == "/Image"
+                and document.xref_get_key(xref, "SumiSource")[0] == "null"
+            ):
+                document.xref_set_key(xref, "SumiSource", f"{source} 0 R")
+                changes += 1
+    changes += _drop_undrawn_on(document, pages)
+    forms: list[int] = []
+    for index in pages:
+        for form in _forms_with_whole_fonts(document, index):
+            if form not in forms:
+                forms.append(form)
+    if forms:
+        changes += subset_form_fonts(document, forms)
+    return changes
+
+
+def format_file_size(size: int) -> str:
+    if size >= 1048576:
+        return f"{size / 1048576:.1f} MB"
+    return f"{max(1, round(size / 1024))} KB"
 
 
 def printer_tray_names(printer_name: str) -> dict[int, str]:
@@ -4430,6 +6389,15 @@ class PrintDialog(QDialog):
             if index >= 0:
                 self.printer_box.setCurrentIndex(index)
         form.addRow(tr("プリンター"), self.printer_box)
+        # Microsoft Print to PDF gets the PDF from pdfNote itself (6.1).
+        self.pdf_writer_note = QLabel(
+            tr("pdfNote が PDF を直接作ります。文字は選択・検索でき、ファイルは小さくなります")
+        )
+        self.pdf_writer_note.setWordWrap(True)
+        self.pdf_writer_note.setMaximumWidth(300)
+        self.pdf_writer_note.setStyleSheet(f"color: {COLORS['muted']}; font-size: 10px;")
+        self.pdf_writer_note.setVisible(is_pdf_writer_printer(self.printer_box.currentText()))
+        form.addRow("", self.pdf_writer_note)
 
         self.range_all = QRadioButton(tr("すべてのページ"))
         self.range_current = QRadioButton(tr("現在のページ"))
@@ -4493,7 +6461,7 @@ class PrintDialog(QDialog):
         self.orientation.addItem(tr("横"), QPageLayout.Landscape)
         form.addRow(tr("印刷の向き"), self.orientation)
         self.paper_source = CappedComboBox()
-        self.paper_source_row = self._row(form, tr("給紙"), self.paper_source)
+        self.paper_source_row = self._row(form, tr("給紙方法"), self.paper_source)
         self.duplex = CappedComboBox()
         self.duplex_row = self._row(form, tr("両面"), self.duplex)
         self.color_mode = CappedComboBox()
@@ -4529,8 +6497,8 @@ class PrintDialog(QDialog):
         self.order_buttons = QButtonGroup(self)
         self.order_buttons.setExclusive(True)
         for value, icon_kind, tip in (
-            ("across", "nup_across", "右へ進み、次の段へ"),
-            ("down", "nup_down", "下へ進み、次の列へ"),
+            ("across", "nup_across", "左上から右へ"),
+            ("down", "nup_down", "左上から下へ"),
         ):
             button = QToolButton()
             button.setCheckable(True)
@@ -4600,7 +6568,7 @@ class PrintDialog(QDialog):
         margin_widget.setLayout(margin_grid)
         form.addRow(tr("余白 (mm)"), margin_widget)
 
-        note = QLabel(tr("ホチキス・パンチはプリンター側の設定画面で行ってください"))
+        note = QLabel(tr("ホチキス留めとパンチ穴あけは、プリンターの設定で指定してください"))
         note.setWordWrap(True)
         # A form field will not wrap on its own; without a ceiling this ran
         # straight off the edge of the column.
@@ -4622,7 +6590,12 @@ class PrintDialog(QDialog):
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QFrame.NoFrame)
         scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroller.setFixedWidth(392)
+        # As wide as the column needs, 392 at least: with no horizontal
+        # scrolling, a fixed 392 cut the right end off every box behind a
+        # long label -- Ancient Greek's "pages per sheet" (6.4).
+        scroller.setFixedWidth(
+            max(392, inner.minimumSizeHint().width() + scroller.verticalScrollBar().sizeHint().width())
+        )
         # A QScrollArea paints its own light Base colour, which put white
         # behind near-white label text and made the whole column unreadable.
         # Selector-scoped on purpose: a bare "background: transparent" set on
@@ -4727,6 +6700,7 @@ class PrintDialog(QDialog):
         """Offer exactly what the chosen printer says it can do."""
         self._loading = True
         try:
+            self.pdf_writer_note.setVisible(is_pdf_writer_printer(self.printer_box.currentText()))
             info = QPrinterInfo.printerInfo(self.printer_box.currentText())
             duplex_labels = {
                 QPrinter.DuplexNone: "片面",
@@ -4780,7 +6754,7 @@ class PrintDialog(QDialog):
             names = printer_tray_names(self.printer_box.currentText())
             self.paper_source.clear()
             for position, value in enumerate(raw_sources, start=1):
-                label = names.get(int(value)) or tr("給紙 {number}").format(number=position)
+                label = names.get(int(value)) or tr("トレイ {number}").format(number=position)
                 self.paper_source.addItem(label, int(value))
             self._set_row_visible(
                 self.paper_source_row, self.paper_source, len(raw_sources) > 1
@@ -4896,8 +6870,8 @@ class PrintDialog(QDialog):
         self._set_row_visible(self.order_row_label, self.order_widget, per_sheet > 1)
         self._set_row_visible(self.order_hint_label, self.order_hint, per_sheet > 1)
         self.order_hint.setText(
-            tr("右へ進み、次の段へ") if options["order"] == "across"
-            else tr("下へ進み、次の列へ")
+            tr("左上から右へ") if options["order"] == "across"
+            else tr("左上から下へ")
         )
         # An empty range (say 5–3) used to leave Print enabled, and pressing
         # it printed nothing without a word.
@@ -6259,7 +8233,7 @@ class LineEndpointHandle(QFrame):
         self._last_global: QPointF | None = None
         self.setFixedSize(14, 14)
         self.setCursor(Qt.CrossCursor)
-        self.setToolTip(tr("矢印の先端を360度自由に移動") if is_head else tr("線の始点を自由に移動"))
+        self.setToolTip(tr("ドラッグして矢印の先端を移動") if is_head else tr("ドラッグして線の始点を移動"))
         self.set_color(QColor(COLORS["accent"]))
 
     def set_color(self, color: QColor) -> None:
@@ -6505,6 +8479,34 @@ def _windows_fonts_dir() -> Path:
     return Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
 
 
+# Fonts installed for one user only (Windows 10 1809 and later) live in the
+# user's own folder; a text box names them "user/<file>" (6.3).
+USER_FONT_PREFIX = "user/"
+
+
+def _user_fonts_dir() -> Path | None:
+    base = os.environ.get("LOCALAPPDATA")
+    return Path(base) / "Microsoft" / "Windows" / "Fonts" if base else None
+
+
+def text_box_font_path(name: str) -> Path:
+    """The file of a text-box font named as TEXT_BOX_FONTS names it."""
+    if name.startswith(USER_FONT_PREFIX):
+        folder = _user_fonts_dir() or Path(".")
+        return folder / name[len(USER_FONT_PREFIX):]
+    return _windows_fonts_dir() / name
+
+
+def text_box_font_archive() -> fitz.Archive:
+    """Where insert_htmlbox finds the text-box fonts: the Windows folder,
+    and the user's own under "user/"."""
+    archive = fitz.Archive(str(_windows_fonts_dir()))
+    user = _user_fonts_dir()
+    if user is not None and user.is_dir():
+        archive.add(str(user), path=USER_FONT_PREFIX.rstrip("/"))
+    return archive
+
+
 def _font_embedding_allowed(path: Path) -> bool:
     """May this font be embedded in a document? pdfNote embeds the text-box
     fonts in the PDFs it saves, and the Windows licence allows that only as
@@ -6562,6 +8564,174 @@ def _available_text_box_fonts() -> dict[str, tuple[str, str, str | None]]:
 
 
 TEXT_BOX_FONTS = _available_text_box_fonts()
+# The fonts the right-click menus offer -- the ones above and the common
+# ones below; the toolbar's list has every font (6.3).
+MAIN_TEXT_BOX_FONT_KEYS: set[str] = set(TEXT_BOX_FONTS)
+# Japanese names of the fonts added from what is installed, for the
+# Japanese UI; the six above are keyed by theirs.
+TEXT_BOX_FONT_LABELS_JA: dict[str, str] = {}
+# Fonts most people look for, by family, offered first after the six above
+# when the PC has them.
+_COMMON_TEXT_BOX_FAMILIES = (
+    "Yu Mincho", "MS Mincho", "UD Digi Kyokasho N-R", "UD Digi Kyokasho NK-R",
+    "Noto Sans JP", "Noto Serif JP", "Arial", "Times New Roman", "Calibri",
+    "Cambria", "Century", "Century Gothic", "Segoe UI", "Georgia", "Verdana",
+    "Tahoma", "Courier New",
+)
+_TEXT_BOX_FONTS_EXTENDED = False
+
+
+def _font_face_summary(path: Path) -> dict[str, Any] | None:
+    """What face 0 of a font file is: its family names (English and
+    Japanese), weight, whether it is italic, and whether it has a Unicode
+    character map or is a symbol font. Face 0 because that is the face
+    insert_htmlbox takes from a file. Reads its tables' directory and three
+    small tables, not the file."""
+    try:
+        with open(path, "rb") as handle:
+
+            def read(offset: int, size: int) -> bytes:
+                handle.seek(offset)
+                data = handle.read(size)
+                if len(data) != size:
+                    raise ValueError("truncated font file")
+                return data
+
+            base = 0
+            if read(0, 4) == b"ttcf":
+                base = struct.unpack(">I", read(12, 4))[0]
+            if read(base, 4) not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+                return None
+            count = struct.unpack(">H", read(base + 4, 2))[0]
+            directory = read(base + 12, 16 * count)
+            tables: dict[bytes, tuple[int, int]] = {}
+            for index in range(count):
+                entry = directory[16 * index:16 * index + 16]
+                tables[entry[:4]] = struct.unpack(">II", entry[8:16])
+            if not all(tag in tables for tag in (b"name", b"OS/2", b"cmap")):
+                return None
+            offset, length = tables[b"name"]
+            name_table = read(offset, min(length, 1 << 20))
+            _format, records, strings = struct.unpack(">HHH", name_table[:6])
+            names: dict[tuple[int, int], str] = {}
+            for index in range(records):
+                platform, encoding, language, name_id, size, at = struct.unpack(
+                    ">HHHHHH", name_table[6 + 12 * index:18 + 12 * index]
+                )
+                if platform != 3 or encoding not in (1, 10) or name_id not in (1, 2, 16, 17):
+                    continue
+                raw = name_table[strings + at:strings + at + size]
+                try:
+                    names[(name_id, language)] = raw.decode("utf-16-be")
+                except UnicodeDecodeError:
+                    continue
+            os2 = tables[b"OS/2"][0]
+            weight = struct.unpack(">H", read(os2 + 4, 2))[0]
+            selection = struct.unpack(">H", read(os2 + 62, 2))[0]
+            cmap = tables[b"cmap"][0]
+            subtables = struct.unpack(">H", read(cmap + 2, 2))[0]
+            encodings = {
+                struct.unpack(">HH", read(cmap + 4 + 8 * index, 4)) for index in range(subtables)
+            }
+
+            def named(name_id: int, language: int | None) -> str | None:
+                if language is not None:
+                    return names.get((name_id, language))
+                return next((text for (key, _l), text in sorted(names.items()) if key == name_id), None)
+
+            legacy = named(1, 0x0409) or named(1, None)
+            family = named(16, 0x0409) or named(16, None) or legacy
+            if not family:
+                return None
+            return {
+                "family": family,
+                "legacy": legacy or family,
+                "family_ja": named(16, 0x0411) or named(1, 0x0411),
+                "weight": weight,
+                "italic": bool(selection & 0x0001),
+                "bold": bool(selection & 0x0020),
+                "symbol": (3, 0) in encodings,
+                "unicode": bool({(3, 1), (3, 10), (0, 3), (0, 4)} & encodings),
+            }
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def installed_text_box_fonts(
+    known_families: set[str],
+) -> list[tuple[str, str, str | None, str | None]]:
+    """The fonts installed on this PC that a text box can use: (family as
+    Qt knows it, regular file, bold file or None, Japanese name or None),
+    files named as TEXT_BOX_FONTS names them.
+
+    A font is offered when Qt draws it under that family name (so the box
+    looks while typing as it does on the page), it has Unicode characters
+    (symbol fonts do not), and its licence allows embedding (see
+    _font_embedding_allowed). Only the first face of a collection can be
+    used, so the faces after it -- MS PGothic, Meiryo UI -- are not."""
+    faces: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for prefix, folder in (("", _windows_fonts_dir()), (USER_FONT_PREFIX, _user_fonts_dir())):
+        if folder is None:
+            continue
+        try:
+            files = sorted(folder.iterdir())
+        except OSError:
+            continue
+        for path in files:
+            if path.suffix.lower() not in (".ttf", ".ttc", ".otf"):
+                continue
+            face = _font_face_summary(path)
+            if face is None or face["symbol"] or not face["unicode"] or face["italic"]:
+                continue
+            family = next(
+                (name for name in (face["family"], face["legacy"]) if name in known_families), None
+            )
+            if family is not None:
+                faces.setdefault(family, []).append((prefix + path.name, face))
+    found: list[tuple[str, str, str | None, str | None]] = []
+    for family, entries in faces.items():
+        regular_name, regular = min(
+            entries, key=lambda item: (abs(item[1]["weight"] - 400), item[1]["bold"], item[0])
+        )
+        if not _font_embedding_allowed(text_box_font_path(regular_name)):
+            continue
+        heavier = [
+            item for item in entries
+            if item[0] != regular_name and (item[1]["bold"] or item[1]["weight"] >= 600)
+        ]
+        bold_name = None
+        if heavier and regular["weight"] < 600:
+            candidate = min(heavier, key=lambda item: (abs(item[1]["weight"] - 700), item[0]))[0]
+            if _font_embedding_allowed(text_box_font_path(candidate)):
+                bold_name = candidate
+        found.append((family, regular_name, bold_name, regular["family_ja"]))
+    return found
+
+
+def extend_text_box_fonts() -> None:
+    """Add the fonts installed on this PC to TEXT_BOX_FONTS, once, after
+    the six chosen ones: the common ones next, then the rest by name. Only
+    the six were offered, and only from the Windows folder (6.3). Needs the
+    QApplication, which knows what Qt can draw."""
+    global _TEXT_BOX_FONTS_EXTENDED
+    if _TEXT_BOX_FONTS_EXTENDED or QGuiApplication.instance() is None:
+        return
+    _TEXT_BOX_FONTS_EXTENDED = True
+    known = set(QFontDatabase.families())
+    present = {family for family, _regular, _bold in TEXT_BOX_FONTS.values()}
+    found = {
+        family: (regular, bold, japanese)
+        for family, regular, bold, japanese in installed_text_box_fonts(known)
+        if family not in present
+    }
+    common = [family for family in _COMMON_TEXT_BOX_FAMILIES if family in found]
+    rest = sorted((family for family in found if family not in common), key=str.casefold)
+    for family in (*common, *rest):
+        regular, bold, japanese = found[family]
+        TEXT_BOX_FONTS[family] = (family, regular, bold)
+        if japanese and japanese != family:
+            TEXT_BOX_FONT_LABELS_JA[family] = japanese
+    MAIN_TEXT_BOX_FONT_KEYS.update(common)
 # Fall back to the previous hardcoded font if none of the curated
 # candidates exist on this machine at all (very old/stripped-down Windows).
 # DEFAULT_TEXT_BOX_FONT is the *display* name (combo box item / dict key,
@@ -6781,10 +8951,32 @@ def _text_box_span_style(
     ]
     if decorations:
         styles.append("text-decoration:" + " ".join(decorations))
-    background = fmt.background()
-    if background.style() != Qt.NoBrush and background.color().alpha() > 0:
-        styles.append(f"background-color:{background.color().name()}")
+    if char_format_highlighted(fmt):
+        styles.append(f"background-color:{fmt.background().color().name()}")
     return "; ".join(styles)
+
+
+def char_format_highlighted(fmt: QTextCharFormat) -> bool:
+    """Has this text a highlight? A format without a background brush still
+    reports a valid colour (black, the brush's default), so the colour alone
+    called every plain character highlighted: the toggle then took away a
+    highlight that was not there and could never add one (6.2)."""
+    background = fmt.background()
+    return background.style() != Qt.NoBrush and background.color().alpha() > 0
+
+
+def _python_indices(text: str) -> list[int]:
+    """Qt positions in `text` (UTF-16 units) as Python indices: an emoji or
+    another character beyond U+FFFF is two units to Qt and one character to
+    Python. Index i of the list is Qt's position i; the last entry is the
+    end of the text."""
+    indices: list[int] = []
+    for index, character in enumerate(text):
+        indices.append(index)
+        if ord(character) > 0xFFFF:
+            indices.append(index)
+    indices.append(len(text))
+    return indices
 
 
 def text_box_html(
@@ -6817,13 +9009,22 @@ def text_box_html(
             f"font-size:{block_size:g}pt; text-align:{align};"
         )
         text = block.text()
+        # Qt counts positions in UTF-16 units, Python strings in characters.
+        # Mixed, a run after an emoji was cut one character short for each
+        # emoji before its end: "😀AB" with AB bold lost the B, on the page
+        # and in the box kept for editing (6.2).
+        index_of = _python_indices(text)
+
+        def to_index(position: int) -> int:
+            return index_of[max(0, min(position, len(index_of) - 1))]
+
         runs: list[tuple[int, str, QTextCharFormat]] = []
         iterator = block.begin()
         while not iterator.atEnd():
             fragment = iterator.fragment()
             if fragment.isValid() and fragment.length():
                 runs.append(
-                    (fragment.position() - block.position(), fragment.text(), fragment.charFormat())
+                    (to_index(fragment.position() - block.position()), fragment.text(), fragment.charFormat())
                 )
             iterator += 1
         if not text:
@@ -6833,7 +9034,7 @@ def text_box_html(
         spans: list[tuple[int, int]] = [(0, len(text))]
         layout = block.layout()
         if lines and layout is not None and layout.lineCount():
-            starts = [layout.lineAt(i).textStart() for i in range(layout.lineCount())]
+            starts = [to_index(layout.lineAt(i).textStart()) for i in range(layout.lineCount())]
             spans = list(zip(starts, starts[1:] + [len(text)]))
         body: list[str] = []
         for number, (start, end) in enumerate(spans):
@@ -6945,8 +9146,7 @@ class RichTextFormatMixin:
         self._merge_char_format(fmt)
 
     def _toggle_highlight(self, color: QColor) -> None:
-        current = self.editor.textCursor().charFormat().background().color()
-        is_highlighted = current.isValid() and current.alpha() > 0
+        is_highlighted = char_format_highlighted(self.editor.textCursor().charFormat())
         fmt = QTextCharFormat()
         fmt.setBackground(Qt.NoBrush if is_highlighted else QColor(color))
         self._merge_char_format(fmt)
@@ -7059,7 +9259,7 @@ class RichTextFormatMixin:
         entry(menu, "すべて選択", self.editor.selectAll, "select_all", "Ctrl+A")
         menu.addSeparator()
         entry(
-            menu, "テキスト確定", self._finish_editing, "confirm",
+            menu, "入力を確定", self._finish_editing, "confirm",
             keys_of("act_finish_text", "Ctrl+Return"),
         )
         menu.addSeparator()
@@ -7078,8 +9278,7 @@ class RichTextFormatMixin:
             keys_of("act_unified_highlight", "Ctrl+H"),
         )
         highlight_action.setCheckable(True)
-        background = char_format.background().color()
-        highlight_action.setChecked(background.isValid() and background.alpha() > 0)
+        highlight_action.setChecked(char_format_highlighted(char_format))
         underline_action = entry(
             format_menu, "下線", self._toggle_underline, "text_underline_run",
             keys_of("act_unified_underline", "Ctrl+U"),
@@ -7103,6 +9302,8 @@ class RichTextFormatMixin:
         font_menu = submenu("フォント", "font")
         menu.addMenu(font_menu)
         for display_name, (qt_family, _regular, _bold) in TEXT_BOX_FONTS.items():
+            if display_name not in MAIN_TEXT_BOX_FONT_KEYS:
+                continue  # the toolbar's list has every font
             # Same localised label the toolbar's font picker shows.
             font_menu.addAction(
                 PDFReaderWindow.font_display_name(display_name),
@@ -8495,6 +10696,133 @@ def is_wide_text(text: str) -> bool:
     return any(is_han_or_kana(char) or is_hangul(char) for char in text)
 
 
+# ---- OCR language data, downloaded when first needed (6.5) ---------------
+# Tesseract's best models from the Tesseract OCR project (Apache-2.0),
+# pinned to one commit and checked byte for byte, so what lands in the
+# folder is exactly what was measured here. The *_vert files are the
+# vertical-text models the Japanese, Chinese and Korean ones load.
+OCR_DATA_COMMIT = "e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+OCR_DATA_URL = "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/{commit}/{pack}.traineddata"
+OCR_DATA_FILES: dict[str, tuple[int, str]] = {
+    "eng": (15400601, "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba"),
+    "jpn": (14330109, "36bdf9ac823f5911e624c30d0553e890b8abc7c31a65b3ef14da943658c40b79"),
+    "jpn_vert": (14330809, "1258be6eb2a9851f18043234ad18cca13ed32690bfff62b335c898bbea371548"),
+    "chi_sim": (13077423, "4fef2d1306c8e87616d4d3e4c6c67faf5d44be3342290cf8f2f0f6e3aa7e735b"),
+    "chi_sim_vert": (13077507, "ea672a78157199c333aa12ec4e74550077689b545df5fc770903716850c8b2e5"),
+    "kor": (12528128, "f888d4038348a0c3d25151e7f452bda0d74ca275b18cab146798bcbb94084fff"),
+    "kor_vert": (3964469, "e6c72327617c0bf195a9a8b631827bf102c75735bbb932126e6fa1c4656c7568"),
+    "spa": (13570187, "e2c1ffdad8b30f26c45d4017a9183d3a7f9aa69e59918be4f88b126fac99ab2c"),
+    "fra": (3972885, "907743d98915c91a3906dfbf6e48b97598346698fe53aaa797e1a064ffcac913"),
+    "rus": (15301764, "b617eb6830ffabaaa795dd87ea7fd251adfe9cf0efe05eb9a2e8128b7728d6b6"),
+    "ara": (12603724, "ab9d157d8e38ca00e7e39c7d5363a5239e053f5b0dbdb3167dde9d8124335896"),
+    "deu": (8628461, "8407331d6aa0229dc927685c01a7938fc5a641d1a9524f74838cdac599f0d06e"),
+    "por": (8159939, "711de9dbb8052067bd42f16b9119967f30bada80d57e2ef24f65d09f531adb04"),
+    "hin": (11895564, "bd2e65a2184af08a167b0be2439e91fa5edbc4394399ca2f692b843ae26e78d6"),
+    "ben": (11045427, "1cd0129288d1f74f6661c35e638e487bd146a66bb732ecd9e011e48dcb0df623"),
+    "urd": (7994323, "65af3f6e50a3c3df15d7b405aab5d467e53433207745c8f5be5b8ff1a58a67c8"),
+    "lat": (9705145, "60054dd32ac03ebd9b4f87d0665bd491a7ffe0d3ee99ceb91aefaf348b65e94f"),
+    "grc": (5168122, "dfc9bda286cd9d8755b1832e5731a5425d1cf0803393a5fa6dee078466178cf1"),
+    "san": (15136202, "5fbc152e7946b3b8201a2a557864bd23b521db4102b521f3e95169c82c5d0b0d"),
+}
+# What a pack needs beside it: Tesseract loads the vertical model with these.
+OCR_DATA_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "jpn": ("jpn_vert",), "chi_sim": ("chi_sim_vert",), "kor": ("kor_vert",),
+}
+# Each pack named in the download question in its own language.
+OCR_PACK_NAMES: dict[str, str] = {
+    "eng": "English", "jpn": "日本語", "chi_sim": "简体中文", "kor": "한국어",
+    "spa": "Español", "fra": "Français", "rus": "Русский", "ara": "العربية",
+    "deu": "Deutsch", "por": "Português", "hin": "हिन्दी", "ben": "বাংলা",
+    "urd": "اردو", "lat": "Latina", "grc": "Ἑλληνική", "san": "संस्कृतम्",
+}
+
+
+def ocr_data_open(url: str, timeout: float = 30.0) -> Any:
+    """The one connection pdfNote opens itself: the OCR language data the
+    user has agreed to download (6.5). Everything else pdfNote does stays on
+    the PC. The tests put their own function here."""
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+class OcrDataDownload(QObject):
+    """Fetches OCR language packs on a thread of its own and puts each in the
+    folder only once its size and SHA-256 match OCR_DATA_FILES, through a
+    temporary file, so a cut connection or a cancel leaves nothing half
+    written behind."""
+
+    progress = Signal(int, int)  # bytes so far, bytes in all
+    failed = Signal(str)  # the reason; empty when cancelled
+    succeeded = Signal()
+
+    CORRUPT = "corrupt"
+
+    def __init__(self, packs: Iterable[str], folder: Path, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.packs = [pack for pack in packs if pack in OCR_DATA_FILES]
+        self.folder = Path(folder)
+        self.total = sum(OCR_DATA_FILES[pack][0] for pack in self.packs)
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="pdfNote OCR data", daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self._thread is not None:
+            self._thread.join(timeout)
+            return not self._thread.is_alive()
+        return True
+
+    def _run(self) -> None:
+        done = 0
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            for pack in self.packs:
+                size, digest = OCR_DATA_FILES[pack]
+                target = self.folder / f"{pack}.traineddata"
+                partial = target.with_name(target.name + ".part")
+                try:
+                    hasher = hashlib.sha256()
+                    received = 0
+                    url = OCR_DATA_URL.format(commit=OCR_DATA_COMMIT, pack=pack)
+                    with ocr_data_open(url) as response, open(partial, "wb") as stream:
+                        while True:
+                            if self._cancel.is_set():
+                                self.failed.emit("")
+                                return
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            received += len(chunk)
+                            if received > size:
+                                raise ValueError(self.CORRUPT)
+                            hasher.update(chunk)
+                            stream.write(chunk)
+                            self.progress.emit(done + received, self.total)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if received != size or hasher.hexdigest() != digest:
+                        raise ValueError(self.CORRUPT)
+                    os.replace(partial, target)
+                finally:
+                    try:
+                        partial.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                done += size
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+            return
+        self.succeeded.emit()
+
+
 class OcrMixin:
     """OCR: recognition, and writing the result back as an invisible text
     layer so search, selection, copying and highlighting all work on it."""
@@ -8503,6 +10831,9 @@ class OcrMixin:
     OCR_LANGUAGE_PACKS: dict[str, tuple[str, ...]] = {
         "ja": ("jpn",), "zh_CN": ("chi_sim",), "ko": ("kor",), "es": ("spa",),
         "fr": ("fra",), "ru": ("rus",), "ar": ("ara",), "en": (),
+        "de": ("deu",), "pt": ("por",), "pt_BR": ("por",), "pt_PT": ("por",),
+        "hi": ("hin",), "bn": ("ben",), "ur": ("urd",), "la": ("lat",),
+        "grc": ("grc",), "sa": ("san",),
     }
 
     @staticmethod
@@ -8595,6 +10926,125 @@ class OcrMixin:
         if not chosen and installed:
             chosen = [sorted(installed)[0]]
         return "+".join(chosen) or "eng"
+
+    @staticmethod
+    def ocr_wanted_packs(ui_language: str, system_locale: str = "") -> list[str]:
+        """The language packs OCR reads with, as ocr_language_codes picks
+        them, with the vertical-text models they load beside them."""
+        system = system_locale.split("_")[0] if system_locale else ""
+        wanted: list[str] = []
+        for code in (ui_language, "zh_CN" if system == "zh" else system):
+            wanted.extend(OcrMixin.OCR_LANGUAGE_PACKS.get(code, ()))
+        wanted.append("eng")
+        packs: list[str] = []
+        for pack in dict.fromkeys(wanted):
+            packs.append(pack)
+            packs.extend(OCR_DATA_COMPANIONS.get(pack, ()))
+        return list(dict.fromkeys(packs))
+
+    def _ocr_missing_packs(self) -> list[str]:
+        """The packs to download before OCR reads in full: none when the
+        folder in use has them all, or is one the user pointed
+        TESSDATA_PREFIX at. Downloads go to pdfNote's own folder, which is
+        used from then on, so what it lacks is what is missing (6.5)."""
+        wanted = self.ocr_wanted_packs(I18N.current, QLocale.system().name())
+
+        def packs_in(folder: str | Path) -> set[str]:
+            try:
+                return {path.stem for path in Path(folder).glob("*.traineddata")}
+            except OSError:
+                return set()
+
+        current = self.ocr_tessdata()
+        own = self.user_tessdata_dir()
+        if current is not None and Path(current) != own:
+            if all(pack in packs_in(current) for pack in wanted):
+                return []
+            prefix = os.environ.get("TESSDATA_PREFIX")
+            if prefix and Path(current) == Path(prefix):
+                return []
+        have = packs_in(own)
+        return [pack for pack in wanted if pack not in have and pack in OCR_DATA_FILES]
+
+    def _ocr_language_data_ready(self, then: Callable[[], object]) -> bool:
+        """Whether OCR can start now. When packs it reads with are missing,
+        asks to download them; once they are in place `then` runs again.
+        Declined, OCR goes on with whatever data there is (6.5)."""
+        if self._ocr_download is not None:
+            return False
+        missing = self._ocr_missing_packs()
+        if missing and self._ask_ocr_download(missing):
+            self._start_ocr_download(missing, then)
+            return False
+        if not self.ocr_available():
+            self.status_label.setText(self._ocr_data_missing_message())
+            return False
+        return True
+
+    def _ask_ocr_download(self, packs: list[str]) -> bool:
+        names = " / ".join(OCR_PACK_NAMES[pack] for pack in packs if pack in OCR_PACK_NAMES)
+        size = sum(OCR_DATA_FILES[pack][0] for pack in packs) / 1_000_000
+        answer = QMessageBox.question(
+            self,
+            tr("OCRの言語データ"),
+            tr(
+                "OCRには言語データが必要です。次の言語データをダウンロードしますか？\n\n"
+                "{languages}（約 {size} MB）\n\n"
+                "ダウンロード元: GitHub（Tesseract OCR プロジェクト）。接続するのは、このダウンロードのときだけです。"
+            ).format(languages=names, size=f"{size:.0f}"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return answer == QMessageBox.Yes
+
+    def _start_ocr_download(self, packs: list[str], then: Callable[[], object]) -> None:
+        download = OcrDataDownload(packs, self.user_tessdata_dir(), parent=self)
+        megabytes = lambda value: f"{value / 1_000_000:.0f}"
+        label = tr("OCRの言語データをダウンロードしています… ({done} / {total} MB)")
+        dialog = QProgressDialog(
+            label.format(done=0, total=megabytes(download.total)), tr("キャンセル"), 0, 1000, self
+        )
+        dialog.setWindowTitle(tr("OCRの言語データ"))
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        self._ocr_download_dialog = dialog
+
+        def progress(done: int, total: int) -> None:
+            dialog.setValue(int(done * 1000 / max(total, 1)))
+            dialog.setLabelText(label.format(done=megabytes(done), total=megabytes(total)))
+
+        def finish() -> None:
+            self._ocr_download = None
+            self._ocr_download_dialog = None
+            dialog.close()
+            dialog.deleteLater()
+
+        def failed(reason: str) -> None:
+            finish()
+            if not reason:
+                self.status_label.setText(tr("ダウンロードを中止しました"))
+                return
+            if reason == OcrDataDownload.CORRUPT:
+                reason = tr("ダウンロードしたデータが壊れています。もう一度お試しください。")
+            QMessageBox.warning(
+                self, APP_NAME,
+                tr("OCRの言語データをダウンロードできませんでした。\n\n{error}").format(error=reason),
+            )
+
+        def succeeded() -> None:
+            finish()
+            self.status_label.setText(tr("OCRの言語データをダウンロードしました"))
+            then()
+
+        download.progress.connect(progress)
+        download.failed.connect(failed)
+        download.succeeded.connect(succeeded)
+        dialog.canceled.connect(download.cancel)
+        self._ocr_download = download
+        download.start()
+        dialog.show()
 
     @staticmethod
     def _page_object_xref(document: fitz.Document, page_index: int) -> int:
@@ -8762,6 +11212,7 @@ class OcrMixin:
         wide_font = next(
             (font for pack, font in OcrMixin.OCR_CJK_FONTS if pack in packs), "japan"
         )
+        contents_before = set(page.get_contents())
         applied = 0
         for x0, y0, x1, y1, text in OcrMixin._ocr_lines(words):
             height = max(1.0, y1 - y0)
@@ -8783,7 +11234,37 @@ class OcrMixin:
                     break
                 except Exception:
                     continue
+        OcrMixin._join_added_streams(page, contents_before)
         return applied
+
+    @staticmethod
+    def _join_added_streams(page: fitz.Page, before: set[int]) -> None:
+        """One content stream for the page's OCR text instead of one per line.
+
+        insert_text() adds a stream for every call, each a whole q ... Q,
+        so they join end to end unchanged. Fifty lines made fifty objects
+        on every scanned page (6.1)."""
+        from pymupdf import mupdf
+
+        document = page.parent
+        added = [xref for xref in page.get_contents() if xref not in before]
+        if len(added) < 2:
+            return
+        try:
+            joined = b"\n".join(document.xref_stream(xref) for xref in added)
+            contents = mupdf.pdf_dict_get(
+                mupdf.pdf_lookup_page_obj(_pdf_of(document), page.number),
+                mupdf.PDF_ENUM_NAME_Contents,
+            )
+            contents = mupdf.pdf_resolve_indirect(contents)
+            if not mupdf.pdf_is_array(contents):
+                return
+            document.update_stream(added[0], joined)
+            for position in range(mupdf.pdf_array_len(contents) - 1, -1, -1):
+                if mupdf.pdf_to_num(mupdf.pdf_array_get(contents, position)) in added[1:]:
+                    mupdf.pdf_array_delete(contents, position)
+        except Exception:
+            return
 
     def ocr_current_page(self) -> bool:
         """OCR the page on screen, off the UI thread. Tesseract takes
@@ -8791,8 +11272,7 @@ class OcrMixin:
         every one of them."""
         if self.document is None or self._premium_blocked("OCR"):
             return False
-        if not self.ocr_available():
-            self.status_label.setText(self._ocr_data_missing_message())
+        if not self._ocr_language_data_ready(self.ocr_current_page):
             return False
         return self._start_ocr([self.page_index], single_page=True)
 
@@ -8824,8 +11304,7 @@ class OcrMixin:
         """OCR every scanned page, off the UI thread."""
         if self.document is None or self._premium_blocked("OCR"):
             return False
-        if not self.ocr_available():
-            self.status_label.setText(self._ocr_data_missing_message())
+        if not self._ocr_language_data_ready(self.ocr_document):
             return False
         # Which pages need OCR is decided on the worker thread. Asking every
         # page for its text here froze the window for seconds on a long
@@ -8836,7 +11315,7 @@ class OcrMixin:
         """Start a background OCR run over `targets`. A single page is
         recognised whatever text it has already, as asked; a whole
         document only where a page has too little text."""
-        if self._ocr_thread is not None:
+        if self._ocr_worker is not None:
             return False
         session = self._current_session()
         if session is None:
@@ -8848,9 +11327,11 @@ class OcrMixin:
         if not self._finish_active_overlays():
             self.status_label.setText(tr("編集を確定できなかったため中止しました"))
             return False
-        self._ocr_page_marks = {
-            index: self._page_object_xref(self.document, index) for index in targets
-        }
+        # And what each page draws: a page changed before its result comes
+        # back -- redacted, a picture taken off -- must not get the words
+        # read from the copy of how it was. Those words are invisible text:
+        # a redaction would have come back as text to search and copy (6.2).
+        self._ocr_page_marks = {index: self._ocr_page_mark(self.document, index) for index in targets}
         # The worker gets its own copy of the bytes: a PyMuPDF document must
         # not be touched from two threads, and the recognised words are
         # applied back here on the GUI thread.
@@ -8879,14 +11360,13 @@ class OcrMixin:
         self._ocr_generation = session.history_generation
         tessdata, language = self._ocr_settings()
         self._ocr_language = language
-        self._ocr_thread = QThread(self)
-        self._ocr_worker = OcrWorker(
+        # In a process of its own: PyMuPDF must not run on two threads (6.2).
+        self._ocr_worker = OcrProcess(
             data, targets, language, tessdata,
             skip_threshold=None if single_page else self.OCR_TEXT_THRESHOLD,
             password=session.password,
+            parent=self,
         )
-        self._ocr_worker.moveToThread(self._ocr_thread)
-        self._ocr_thread.started.connect(self._ocr_worker.run)
         self._ocr_worker.pageReady.connect(self._ocr_page_ready)
         self._ocr_worker.progress.connect(self._ocr_progress)
         self._ocr_worker.failed.connect(self._ocr_failed)
@@ -8895,7 +11375,8 @@ class OcrMixin:
         self._ocr_error = ""
         self._ocr_single_page = single_page
         self._ocr_unwritten = False
-        self._ocr_thread.start()
+        self._ocr_stopped_by = ""
+        self._ocr_worker.start()
         self.act_ocr_page.setEnabled(False)
         self.act_ocr_document.setEnabled(False)
         self.act_ocr_cancel.setEnabled(True)
@@ -8932,9 +11413,16 @@ class OcrMixin:
         except Exception:
             return
         expected = self._ocr_page_marks.get(page_index)
-        if expected is not None and self._page_object_xref(document, page_index) != expected:
+        if expected is None:
+            # Not a page this run was started for, or no longer one it may
+            # write to (see _stop_ocr_for).
+            return
+        if self._page_object_xref(document, page_index) != expected[0]:
             # The pages moved under the run: this result belongs to a page
             # that is no longer at this index.
+            return
+        if page_content_fingerprint(document, page_index) != expected[1]:
+            # The page changed after the copy was taken (6.2).
             return
         # Count only pages that got text: nothing written is no page done
         # (the single-page run already checked this).
@@ -8954,10 +11442,12 @@ class OcrMixin:
         applied = self._ocr_applied_pages
         candidates = getattr(self._ocr_worker, "candidates", None)
         error = getattr(self, "_ocr_error", "")
+        stopped_by = getattr(self, "_ocr_stopped_by", "")
         self._ocr_error = ""
+        self._ocr_stopped_by = ""
         self._ocr_session = None
         self._ocr_document = None
-        self._stop_ocr_thread()
+        self._stop_ocr_process()
         if not applied:
             self._withdraw_ocr_history()
         self._ocr_history = None
@@ -8965,7 +11455,9 @@ class OcrMixin:
         self.act_ocr_document.setEnabled(self.document is not None)
         self.act_ocr_cancel.setEnabled(False)
         single_page = getattr(self, "_ocr_single_page", False)
-        if cancelled:
+        if cancelled and stopped_by:
+            self.status_label.setText(stopped_by)
+        elif cancelled:
             self.status_label.setText(tr("OCRを中止しました"))
         elif single_page and not applied and not error:
             # Recognising words but writing none of them is a failure, not
@@ -9002,29 +11494,61 @@ class OcrMixin:
         if self._ocr_worker is not None:
             self._ocr_worker.cancel()
 
-    def _stop_ocr_thread(self) -> None:
-        thread = self._ocr_thread
+    def _ocr_page_mark(self, document: fitz.Document, index: int) -> tuple[int | None, str]:
+        """Which page object is at `index`, and what it draws."""
+        return self._page_object_xref(document, index), page_content_fingerprint(document, index)
+
+    def _stop_ocr_for(self, document: fitz.Document, reason: str) -> None:
+        """Stop the OCR run of `document`, if one is going, and write none of
+        its results that have not been written yet. Applying redactions
+        does this first: a result read before them would put the words
+        they removed back as invisible text (6.2)."""
+        if self._ocr_worker is None or self._ocr_document is not document:
+            return
+        self._ocr_page_marks = {}
+        self._ocr_stopped_by = reason
+        self._ocr_worker.cancel()
+
+    def _stop_ocr_process(self) -> None:
         worker = self._ocr_worker
-        self._ocr_thread = None
         self._ocr_worker = None
-        if worker is not None:
-            # Delete the worker on the thread that owns it, not this one.
-            worker.deleteLater()
-        if thread is None:
+        if worker is None:
             return
-        thread.quit()
-        if not thread.wait(5000):
-            # Still inside a page. Deleting the QThread now would tear down
-            # a running thread; leave it referenced and let it finish, and
-            # let Qt delete it when it eventually signals finished.
-            thread.finished.connect(thread.deleteLater)
-            self._abandoned_ocr_threads.append(thread)
-            return
-        thread.deleteLater()
+        if worker.running():
+            worker.stop()
+        worker.deleteLater()
+
+
+class FormTextEditor(QPlainTextEdit):
+    """The editor of a multi-line text field: Enter starts a new line, as
+    the field allows, and leaving it finishes the field, as leaving a
+    one-line field does. Tab still moves on rather than typing a tab."""
+
+    editingFinished = Signal()
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setPlainText(text)
+        self.setTabChangesFocus(True)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def focusOutEvent(self, event: Any) -> None:
+        super().focusOutEvent(event)
+        # Its own right-click menu takes the focus too; that is not leaving.
+        if event.reason() != Qt.PopupFocusReason:
+            self.editingFinished.emit()
 
 
 class FormFieldsMixin:
-    """Interactive AcroForm fields: hit testing, editing and clearing."""
+    """Interactive AcroForm fields: hit testing, editing and clearing.
+
+    What a field says of itself is kept to (6.2): a read-only field is not
+    edited, toggled or cleared; a text field keeps to its maximum length,
+    hides a password as it is typed and takes several lines when it is
+    multi-line; a combo box that allows its own entry takes one. A field
+    was edited by its type alone, whatever it said."""
 
     def _page_form_fields(self, page: fitz.Page) -> list[dict[str, Any]]:
         """Form fields as plain data.
@@ -9052,11 +11576,24 @@ class FormFieldsMixin:
                         "choices": [str(v) for v in (widget.choice_values or [])],
                         "on_state": widget.on_state(),
                         "name": widget.field_name,
+                        "flags": int(widget.field_flags or 0),
+                        "maxlen": int(widget.text_maxlen or 0),
                     }
                 )
             except Exception:
                 continue
         return fields
+
+    @staticmethod
+    def _form_field_read_only(field: dict[str, Any]) -> bool:
+        return bool(int(field.get("flags") or 0) & fitz.PDF_FIELD_IS_READ_ONLY)
+
+    def _refuse_read_only_field(self, field: dict[str, Any]) -> bool:
+        """True, having said so, when `field` is read-only."""
+        if not self._form_field_read_only(field):
+            return False
+        self.status_label.setText(tr("この欄は読み取り専用です"))
+        return True
 
     def _form_field_at_point(self, page_point: fitz.Point) -> dict[str, Any] | None:
         if self.document is None:
@@ -9075,20 +11612,37 @@ class FormFieldsMixin:
         except Exception:
             pass
 
-    def _commit_form_widget(self, xref: int, value: Any) -> bool:
-        """Write one field value back. Snapshotting here is what puts form
-        edits on the same undo stack -- and in the same recovery snapshot --
-        as every other edit."""
+    def _commit_form_widget(self, xref: int, value: Any, page_index: int | None = None) -> bool:
+        """Write one field value back; True when it changed the document."""
+        return self._write_form_value(xref, value, page_index) == "changed"
+
+    def _write_form_value(self, xref: int, value: Any, page_index: int | None = None) -> str:
+        """Write one field value back: "changed", "unchanged" or "failed".
+
+        Snapshotting here is what puts form edits on the same undo stack --
+        and in the same recovery snapshot -- as every other edit. The field
+        is looked for on `page_index`, the page its editor was opened on:
+        the page on screen may be another by now. A write that fails is
+        put back whole. It used to be reported as False, like a value that
+        had not changed, and saving went on without it (6.2)."""
         if self.document is None:
-            return False
+            return "failed"
+        index = self.page_index if page_index is None else page_index
+        checkpoint: tuple | None = None
         try:
-            page = self.document[self.page_index]
+            page = self.document[index]
             widget = next((w for w in page.widgets() if w.xref == xref), None)
             if widget is None:
-                return False
+                raise LookupError(f"form field {xref} is not on page {index + 1}")
+            if int(widget.field_flags or 0) & fitz.PDF_FIELD_IS_READ_ONLY:
+                self.status_label.setText(tr("この欄は読み取り専用です"))
+                return "unchanged"
+            maximum = int(widget.text_maxlen or 0)
+            if isinstance(value, str) and maximum > 0:
+                value = value[:maximum]
             if widget.field_value == value:
-                return False
-            self._snapshot_for_edit()
+                return "unchanged"
+            checkpoint = self._begin_edit()
             widget.field_value = value
             widget.update()
             if isinstance(value, str) and not value:
@@ -9096,15 +11650,17 @@ class FormFieldsMixin:
                 # the old text in place, so write /V directly to clear it.
                 self._clear_widget_value(widget.xref)
         except Exception as exc:
+            if checkpoint is not None:
+                self._rollback_edit(checkpoint)
             QMessageBox.critical(
                 self, APP_NAME, tr("フォームを編集できませんでした。\n\n{error}").format(error=exc)
             )
-            return False
+            return "failed"
         self._mark_dirty()
-        self._invalidate_render_cache(self.page_index)
+        self._invalidate_render_cache(index)
         self.schedule_render(immediate=True)
         self.status_label.setText(tr("フォームを更新しました"))
-        return True
+        return "changed"
 
     def _toggle_form_check_field(self, field: dict[str, Any]) -> bool:
         currently_on = field["value"] not in (False, "Off", None, "")
@@ -9117,6 +11673,8 @@ class FormFieldsMixin:
     def activate_form_field(self, field: dict[str, Any]) -> bool:
         """Click behaviour for a form field: buttons toggle straight away,
         the rest get an editor placed over the field itself."""
+        if self._refuse_read_only_field(field):
+            return False
         if field["type"] in (
             fitz.PDF_WIDGET_TYPE_CHECKBOX,
             fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
@@ -9126,12 +11684,24 @@ class FormFieldsMixin:
         return True
 
     def _show_form_editor(self, field: dict[str, Any]) -> None:
+        if self._refuse_read_only_field(field):
+            return
         self._close_form_editor()
         canvas = self._canvas_widget()
         rect = self._page_rect_to_screen(field["rect"])
         xref = field["xref"]
+        flags = int(field.get("flags") or 0)
+        maximum = int(field.get("maxlen") or 0)
         if field["type"] == fitz.PDF_WIDGET_TYPE_TEXT:
-            editor: QWidget = QLineEdit(str(field["value"] or ""), canvas)
+            text = str(field["value"] or "")
+            if flags & fitz.PDF_TX_FIELD_IS_MULTILINE:
+                editor: QWidget = FormTextEditor(text, canvas)
+            else:
+                editor = QLineEdit(text, canvas)
+                if maximum > 0:
+                    editor.setMaxLength(maximum)
+                if flags & fitz.PDF_TX_FIELD_IS_PASSWORD:
+                    editor.setEchoMode(QLineEdit.Password)
             # Enter, Tab or clicking elsewhere all finish the field. Only
             # Enter used to, so a value typed before clicking away stayed
             # uncommitted in a floating box.
@@ -9147,7 +11717,21 @@ class FormFieldsMixin:
                 choices = [str(field["value"] or "")]
             editor.addItems(choices)
             current = str(field["value"] or "")
-            if current in choices:
+            if flags & fitz.PDF_CH_FIELD_IS_EDIT:
+                # The field takes an entry of its own besides its choices.
+                editor.setEditable(True)
+                editor.setInsertPolicy(QComboBox.NoInsert)
+                editor.setCurrentText(current)
+                # Enter finishes an entry of its own (activated only comes
+                # for one of the choices); leaving the field finishes it as
+                # any edit is finished. Not on losing the focus: opening
+                # the list takes it, and would close the field.
+                editor.lineEdit().returnPressed.connect(
+                    lambda e=editor: self._commit_form_editor()
+                    if e is self._active_form_editor
+                    else None
+                )
+            elif current in choices:
                 editor.setCurrentText(current)
             editor.activated.connect(lambda _index: self._commit_form_editor())
         editor.setGeometry(rect.toRect().adjusted(0, 0, 0, 0))
@@ -9159,20 +11743,37 @@ class FormFieldsMixin:
         self._active_form_rect = fitz.Rect(field["rect"])
         self._active_form_page_index = self.page_index
 
-    def _commit_form_editor(self) -> None:
+    def _commit_form_editor(self) -> bool:
+        """Write the open field editor back. False when that failed: the
+        editor then stays open with what was typed, and the commit that
+        asked (a save, say) stops. It used to close first and lose the
+        value, and a save went on as though it had been written (6.2)."""
         editor = self._active_form_editor
         xref = self._active_form_xref
-        if editor is None or xref is None:
-            return
-        if isinstance(editor, QLineEdit):
+        if editor is None or xref is None or getattr(self, "_committing_form", False):
+            return True
+        if isinstance(editor, (QLineEdit, FormTextEditor)):
             value: Any = editor.text()
         elif isinstance(editor, QComboBox):
             value = editor.currentText()
         else:
             value = None
-        self._close_form_editor()
-        if value is not None:
-            self._commit_form_widget(xref, value)
+        if value is None:
+            self._close_form_editor()
+            return True
+        # The error dialog takes the focus, which finishes editing and asks
+        # for this commit again.
+        self._committing_form = True
+        try:
+            result = self._write_form_value(xref, value, getattr(self, "_active_form_page_index", None))
+        finally:
+            self._committing_form = False
+        if result == "failed":
+            self._overlay_commit_failed = True
+            return False
+        if self._active_form_editor is editor:
+            self._close_form_editor()
+        return True
 
     def _close_form_editor(self) -> None:
         editor = getattr(self, "_active_form_editor", None)
@@ -9182,8 +11783,11 @@ class FormFieldsMixin:
         self._active_form_xref = None
         self._active_form_rect = None
         if editor is not None:
-            editor.hide()
-            editor.deleteLater()
+            try:
+                editor.hide()
+                editor.deleteLater()
+            except RuntimeError:
+                pass  # went with its page label
 
     def _layout_active_form_editor(self) -> None:
         """Keep an open field's editor over its field when the page is drawn
@@ -9212,6 +11816,7 @@ class FormFieldsMixin:
                 if field["type"] not in (
                     fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
                 )
+                and not self._form_field_read_only(field)
             ]
             fields.sort(key=lambda field: (round(field["rect"].y0, 1), field["rect"].x0))
             order.extend((index, field) for field in fields)
@@ -9262,7 +11867,7 @@ class FormFieldsMixin:
             page = self.document[index]
             for field in self._page_form_fields(page):
                 # "Off" is a checkbox's *unset* state, not a value to clear.
-                if field["value"] not in (None, "", False, "Off"):
+                if field["value"] not in (None, "", False, "Off") and not self._form_field_read_only(field):
                     targets.append((index, field["xref"]))
         if not targets:
             return False
@@ -9297,6 +11902,7 @@ class FormFieldsMixin:
     def _form_field_context_menu(self, field: dict[str, Any]) -> QMenu:
         """Right-clicking a form field. It had no menu at all."""
         menu = QMenu(self)
+        writable = not self._form_field_read_only(field)
         if field["type"] in (
             fitz.PDF_WIDGET_TYPE_CHECKBOX,
             fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
@@ -9304,17 +11910,20 @@ class FormFieldsMixin:
             toggle = menu.addAction(
                 tr("切り替え"), lambda _checked=False, f=field: self._toggle_form_check_field(f)
             )
+            toggle.setEnabled(writable)
             menu.setDefaultAction(toggle)
         else:
             edit = menu.addAction(
                 tr("入力"), lambda _checked=False, f=field: self._show_form_editor(f)
             )
+            edit.setEnabled(writable)
             menu.setDefaultAction(edit)
         menu.addSeparator()
-        menu.addAction(
+        clear = menu.addAction(
             tr("この欄を消去"),
             lambda _checked=False, f=field: self._commit_form_widget(f["xref"], ""),
         )
+        clear.setEnabled(writable)
         menu.addAction(tr("すべての欄を消去"), self.clear_all_form_fields)
         menu.addSeparator()
         menu.addAction(self.act_fill_form)
@@ -9472,9 +12081,13 @@ class RedactionMixin:
             answer = QMessageBox.question(
                 self,
                 APP_NAME,
+                # What it does, truthfully: gone from the saved file, but a
+                # step in the edit history like any other. It said it could
+                # not be undone, and Undo took it back (6.2).
                 tr_n(
-                    "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄は"
-                    "完全に削除され、元に戻せません。\n\n実行しますか？",
+                    "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄が"
+                    "削除されます。保存したPDFには残らず、そこから取り戻すことはできません。"
+                    "編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？",
                     pending,
                 ).format(count=pending),
                 QMessageBox.Yes | QMessageBox.No,
@@ -9485,6 +12098,7 @@ class RedactionMixin:
         if not self._finish_active_overlays():
             self.status_label.setText(tr("編集を確定できなかったため中止しました"))
             return False
+        self._stop_ocr_for(self.document, tr("墨消しを適用したため、OCRを中止しました"))
         checkpoint = self._begin_edit()
         failed = 0
         try:
@@ -9511,6 +12125,11 @@ class RedactionMixin:
         self._invalidate_render_cache()
         self._mark_dirty()
         self._refresh_after_document_change(rebuild_navigation=False)
+        if session is not None:
+            # The crash-recovery copy on disk still holds what was just
+            # removed. It is replaced now rather than at the next two-minute
+            # tick (6.2).
+            self._write_recovery_snapshot(session)
         self.status_label.setText(
             tr_n("{count}件の墨消しを適用しました", pending).format(count=pending)
         )
@@ -9755,7 +12374,7 @@ ACCESS_KEYS = {
     "付箋を追加": "M", "フォント": "F", "印刷...": "P", "プロパティ": "R",
     "その他の色...": "M",
 }
-BRACKETED_ACCESS_KEYS = frozenset({"ja", "zh_CN", "ko"})
+BRACKETED_ACCESS_KEYS = frozenset({"ja", "zh_CN", "ko", "hi", "bn", "ur", "grc", "sa"})
 
 
 def _access_key_candidates(text: str) -> list[str]:
@@ -9957,8 +12576,8 @@ class ChromeMixin:
     # What these say about themselves, rather than the bare noun: what
     # they do is done to the text that is selected.
     SELECTION_DESCRIPTIONS = {
-        "act_unified_underline": "選択中の文字列に下線を追加",
-        "act_unified_strikeout": "選択中の文字列に取り消し線を追加",
+        "act_unified_underline": "選択中の文字列に下線を引く",
+        "act_unified_strikeout": "選択中の文字列に取り消し線を引く",
         "act_unified_highlight": "選択中の文字列をハイライト",
     }
 
@@ -10088,7 +12707,7 @@ class ChromeMixin:
         self.act_exit = self._action("終了", self.close)
         self.act_file_menu = self._action(
             "ファイル", lambda: self.file_button.showMenu(), "Alt+F",
-            tip="ファイル操作メニューを開く",
+            tip="ファイル メニューを開く",
         )
         self.act_shortcuts = self._action("キーボード ショートカット", self.show_shortcuts, "F1")
         self.act_license = self._action("ライセンス情報...", self.show_license_info)
@@ -10137,7 +12756,7 @@ class ChromeMixin:
         # Ctrl+Alt+O is PowerPoint's Zoom to Fit; the key tip adds Alt+E.
         self.act_fit_page = self._action("ページに合わせる", self.fit_page, "Ctrl+Alt+O")
         self.act_fit_width = self._action("幅に合わせる", self.fit_width, "Alt+W")
-        self.act_sidebar = self._action("サイドバーを表示/非表示", self.toggle_sidebar, "Alt+B")
+        self.act_sidebar = self._action("サイド バーを表示/非表示", self.toggle_sidebar, "Alt+B")
         self.act_refresh = self._action("更新", self.refresh_view, "F5")
         self.act_first_page = self._action("最初のページ", lambda: self.go_to_page(0), "Ctrl+Home")
         self.act_last_page = self._action("最後のページ", self.go_to_last_page, "Ctrl+End")
@@ -10154,7 +12773,7 @@ class ChromeMixin:
         # Win+Alt+P, but its runtime drops the Windows key when registering).
         self.act_focus_page = self._action("ページ番号へ移動", self.focus_page_entry, "Ctrl+G")
         # The zoom box had no key of its own, only zoom in and zoom out.
-        self.act_focus_zoom = self._action("ズーム率へ移動", self.focus_zoom_entry, "Alt+Z")
+        self.act_focus_zoom = self._action("ズーム率を入力", self.focus_zoom_entry, "Alt+Z")
         self.act_focus_text_size = self._action(
             "フォント サイズを選択", self._focus_text_size, "Alt+S"
         )
@@ -10223,7 +12842,7 @@ class ChromeMixin:
             "取り消し線の色を選択", lambda: self._open_markup_color_menu("strikeout"), "Alt+K"
         )
         self.act_drawing_color_menu = self._action(
-            "図形・手書き色を選択", self._open_drawing_color_menu, "Alt+X"
+            "図形・手書きの色を選択", self._open_drawing_color_menu, "Alt+X"
         )
         # Keyboard-first additions (v5.15). Ctrl+Alt+M and Ctrl+] / Ctrl+[
         # are Word's keys for a new comment and for font size.
@@ -10301,7 +12920,7 @@ class ChromeMixin:
         self.edit_actions["select"].setChecked(True)
         self.act_insert_image = self._action("画像を追加...", self.insert_image, "Alt+I")
         self.act_paste_image = self._action(
-            "クリップボード画像を貼り付け", self.paste_clipboard_image,
+            "クリップボードの画像を貼り付け", self.paste_clipboard_image,
             tip="貼り付け", keys=("Ctrl+V",),
         )
         # Ctrl+M and Ctrl+Shift+D are PowerPoint's New Slide and copy of the
@@ -10390,13 +13009,13 @@ class ChromeMixin:
         self.file_button = QToolButton()
         self.file_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.file_button.setText(tr("ファイル"))
-        self.file_button.setToolTip(self._tooltip_with_keys(tr("ファイル操作メニューを開く"), self.act_file_menu))
+        self.file_button.setToolTip(self._tooltip_with_keys(tr("ファイル メニューを開く"), self.act_file_menu))
         self.file_button.setPopupMode(QToolButton.InstantPopup)
         self.file_button.setStyleSheet("QToolButton { font-weight: 600; padding: 2px 8px; }")
         self._i18n_refresh_callbacks.append(
             lambda w=self.file_button: (
                 w.setText(tr("ファイル")),
-                w.setToolTip(self._tooltip_with_keys(tr("ファイル操作メニューを開く"), self.act_file_menu)),
+                w.setToolTip(self._tooltip_with_keys(tr("ファイル メニューを開く"), self.act_file_menu)),
             )
         )
         menu = QMenu(self.file_button)
@@ -10548,7 +13167,12 @@ class ChromeMixin:
         changes together: one application, one look."""
         if choice not in THEME_NAMES:
             return
-        self.theme_choice = choice
+        # The choice too, not only the look: another window still holding
+        # "follow the system" moved every window back to the system's
+        # colours when Windows changed them, and its menu showed the old
+        # choice (6.2).
+        for window in {*OPEN_WINDOWS, self}:
+            window.theme_choice = choice
         if persist:
             self.settings.data["theme"] = choice
             self.settings.save()
@@ -10615,11 +13239,17 @@ class ChromeMixin:
         install_qt_translations(code)
         # Arabic reads right to left: Qt mirrors layouts, menus and scroll
         # bars once told. The pages themselves are never mirrored.
-        QApplication.setLayoutDirection(Qt.RightToLeft if code == "ar" else Qt.LeftToRight)
+        QApplication.setLayoutDirection(
+            Qt.RightToLeft if code in RIGHT_TO_LEFT_LANGUAGES else Qt.LeftToRight
+        )
         if persist:
             self.settings.data["language"] = code
             self.settings.save()
-        self._retranslate_ui()
+        # Every window: the language belongs to the application, and the
+        # others kept their labels in the old one while what they said next
+        # came in the new one (6.2).
+        for window in [self, *(w for w in OPEN_WINDOWS if w is not self)]:
+            window._retranslate_ui()
 
     def _retranslate_ui(self) -> None:
         for callback in self._i18n_refresh_callbacks:
@@ -10644,6 +13274,21 @@ class ChromeMixin:
         else:
             session = self.sessions[self.current_session_index]
             self.setWindowTitle(f"{session.title} — {APP_NAME}")
+            # The line under the page stayed in the language switched from
+            # until the next page turn or view change (6.4).
+            self.status_label.setText(self._document_summary())
+
+    def _document_summary(self) -> str:
+        """The status bar's line about the open document: its name, the
+        continuous view when it is on, and how many pages it has."""
+        count = len(self.document) if self.document is not None else 0
+        name = Path(self.file_path).name if self.file_path else tr("無題.pdf")
+        key = (
+            "{name}  •  連続スクロール  •  {count}ページ"
+            if getattr(self, "continuous", False)
+            else "{name}  •  {count}ページ"
+        )
+        return tr_n(key, count).format(name=name, count=count)
 
     def _build_toolbar(self) -> None:
         self.page_edit = QLineEdit("-")
@@ -10861,9 +13506,9 @@ class ChromeMixin:
             widget.setFixedWidth(width)
 
     def _build_edit_toolbar(self) -> None:
-        toolbar = self._new_ribbon_toolbar(tr("メインツールバー"))
+        toolbar = self._new_ribbon_toolbar(tr("メイン ツール バー"))
         self._i18n_refresh_callbacks.append(
-            lambda w=toolbar: w.setWindowTitle(tr("メインツールバー"))
+            lambda w=toolbar: w.setWindowTitle(tr("メイン ツール バー"))
         )
         toolbar.setObjectName("mainToolbar")
         toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -10874,7 +13519,7 @@ class ChromeMixin:
         self._ribbon_toolbars["main"] = toolbar
         # Either Enter key: to Qt the main one is "Return" (see act_properties).
         self.act_finish_text = self._action(
-            "テキスト確定", self._commit_active_text_box, ("Ctrl+Return", "Ctrl+Enter")
+            "入力を確定", self._commit_active_text_box, ("Ctrl+Return", "Ctrl+Enter")
         )
         self.act_finish_text.setEnabled(False)
         self._install_home_icons()
@@ -11157,14 +13802,14 @@ class ChromeMixin:
         )
         self.fix_page_checkbox.toggled.connect(self._fix_page_checkbox_toggled)
         self._fix_page_checkbox_action = self._add_toolbar_widget(toolbar, self.fix_page_checkbox)
-        self.facing_cover_checkbox = QCheckBox(tr("表紙を単独"))
+        self.facing_cover_checkbox = QCheckBox(tr("表紙を分ける"))
         self.facing_cover_checkbox.setChecked(True)
         self.facing_cover_checkbox.setToolTip(
             tr("表紙を単独表示")
         )
         self._i18n_refresh_callbacks.append(
             lambda w=self.facing_cover_checkbox: (
-                w.setText(tr("表紙を単独")),
+                w.setText(tr("表紙を分ける")),
                 w.setToolTip(tr("表紙を単独表示")),
             )
         )
@@ -11209,9 +13854,9 @@ class ChromeMixin:
         # fell back to an unrelated grid position instead of following it.
         self._toolbar_row_installed = [True]
         for _ in range(3):
-            extra_row = QToolBar(tr("メインツールバー"), self)
+            extra_row = QToolBar(tr("メイン ツール バー"), self)
             self._i18n_refresh_callbacks.append(
-                lambda w=extra_row: w.setWindowTitle(tr("メインツールバー"))
+                lambda w=extra_row: w.setWindowTitle(tr("メイン ツール バー"))
             )
             extra_row.setMovable(False)
             extra_row.setFloatable(False)
@@ -11425,7 +14070,7 @@ class ChromeMixin:
         if entry is None:
             return key
         if I18N.current == "ja":
-            return key
+            return TEXT_BOX_FONT_LABELS_JA.get(key, key)
         # The second element is the font's own Latin family name, which is
         # what every non-Japanese locale calls it.
         return entry[0]
@@ -11578,7 +14223,7 @@ class ChromeMixin:
             for handle in self._active_line_handles:
                 handle.set_color(color)
             self._layout_line_endpoint_handles()
-            self.status_label.setText(tr("選択中の図形へ描画色を設定しました"))
+            self.status_label.setText(tr("選択中の図形の色を変更しました"))
             return
         if self.document is None or not self._selected_annotation_xrefs:
             return
@@ -11783,12 +14428,11 @@ class ChromeMixin:
                 char_format = box.editor.textCursor().charFormat()
             except RuntimeError:
                 return
-            background = char_format.background().color()
             states = {
                 "bold": char_format.fontWeight() > QFont.Normal,
                 "underline": char_format.fontUnderline(),
                 "strikeout": char_format.fontStrikeOut(),
-                "highlight": background.isValid() and background.alpha() > 0,
+                "highlight": char_format_highlighted(char_format),
             }
         else:
             target = self._current_markup_target()
@@ -12334,6 +14978,21 @@ class CentralUiMixin:
                 )
                 return
 
+        if current is not None and current.shrink_estimate is not None and current.dirty:
+            key = f"shrink:{current.recovery_id}"
+            if key not in self._dismissed_notices:
+                before, after = current.shrink_estimate
+                self._show_notice(
+                    key,
+                    "save_as",
+                    tr("以前の pdfNote で大きくなっていたファイルです。保存すると {before} から {after} になります").format(
+                        before=format_file_size(before), after=format_file_size(after)
+                    ),
+                    tr("上書き保存"),
+                    self.save_document,
+                )
+                return
+
         page = self.document[self.page_index]
         if self._page_form_fields(page) and "form" not in self._dismissed_notices:
             self._show_notice(
@@ -12346,24 +15005,15 @@ class CentralUiMixin:
             return
 
         if self._page_needs_ocr(page) and "ocr" not in self._dismissed_notices:
-            if self.ocr_available():
-                self._show_notice(
-                    "ocr",
-                    "find",
-                    tr("このページには文字データがありません。OCRで検索・コピーできるようになります"),
-                    self._premium_label(tr("OCRを実行")),
-                    self.ocr_document,
-                )
-            else:
-                # Language data dropped into pdfNote's own folder is all OCR
-                # needs, so the bar offers that folder (v5.20).
-                self._show_notice(
-                    "ocr",
-                    "find",
-                    tr("このページは画像だけです。OCRには言語データが必要です"),
-                    tr("言語データのフォルダーを開く"),
-                    self.open_ocr_data_folder,
-                )
+            # Without language data too: running OCR offers to download it
+            # (6.5), so there is no folder to send anyone to first.
+            self._show_notice(
+                "ocr",
+                "find",
+                tr("このページにはテキストがありません。OCRを実行すると、検索やコピーができるようになります"),
+                self._premium_label(tr("OCRを実行")),
+                self.ocr_document,
+            )
             return
 
         self.notice_bar.hide()
@@ -13412,7 +16062,7 @@ class KeyboardMixin:
             else widget.segment_for_page(self.page_index)
         )
         if number is None or not widget.select_segment(number):
-            self.status_label.setText(tr("このページには文字がありません"))
+            self.status_label.setText(tr("このページにはテキストがありません"))
             return False
         self._clear_annotation_selection()
         self._clear_other_carets(widget)
@@ -13432,7 +16082,7 @@ class KeyboardMixin:
         number = widget.segment_for_page(self.page_index)
         segments = widget._segments()
         if number is None or segments[number][2] <= segments[number][1]:
-            self.status_label.setText(tr("このページには文字がありません"))
+            self.status_label.setText(tr("このページにはテキストがありません"))
             return
         self._clear_annotation_selection()
         self._clear_other_carets(widget)
@@ -13475,7 +16125,7 @@ class KeyboardMixin:
             ("H", self.act_markup_color_menu, tr("ハイライトの色")),
             ("U", self.act_underline_color_menu, tr("下線の色")),
             ("K", self.act_strikeout_color_menu, tr("取り消し線の色")),
-            ("X", self.act_drawing_color_menu, tr("図形・手書き色")),
+            ("X", self.act_drawing_color_menu, tr("図形・手書きの色")),
             ("W", self.act_fit_width, tr("幅に合わせる")),
             ("E", self.act_fit_page, tr("ページ全体")),
             ("1", self.act_single_page, tr("単ページ表示")),
@@ -13483,7 +16133,7 @@ class KeyboardMixin:
             ("3", self.act_fix_page, tr("ページを固定")),
             ("B", self.act_sidebar, tr("ナビゲーション")),
             ("J", self.act_focus_page, tr("ページ番号へ移動")),
-            ("Z", self.act_focus_zoom, tr("ズーム率へ移動")),
+            ("Z", self.act_focus_zoom, tr("ズーム率を入力")),
         ]
         self._direct_alt_by_key = {
             key: (action, description)
@@ -14006,6 +16656,10 @@ class SessionsMixin:
         self._switching_tabs = False
         self.document_tabs_toolbar.show()
         self._load_session(index)
+        if session.autosave_pending_revision != -1:
+            # A snapshot of it was on its way to the disk: its outcome is
+            # this window's to take now.
+            QTimer.singleShot(3000, self._check_recovery_writer)
 
     def _transfer_session_from(
         self, source: Any, session_identity: int, target_index: int | None = None
@@ -14168,7 +16822,7 @@ class SessionsMixin:
                 # holding (v5.27 review F5-02).
                 QMessageBox.critical(self, APP_NAME, tr(
                     "ファイルのパスが長すぎます（260文字まで）。フォルダー名を短くするか、"
-                    "浅い場所へ移してください。"
+                    "ファイルを上の階層のフォルダーへ移動してください。"
                 ) if path_too_long(path) else tr("指定されたファイルが見つかりません。"))
             return False
         try:
@@ -14220,13 +16874,42 @@ class SessionsMixin:
 
         self.settings.add(path)
         self._rebuild_welcome()
-        self._append_session(DocumentSession(document=new_document, file_path=path, password=password))
+        shrink = self._shrink_on_open(new_document, path, password)
+        session = DocumentSession(
+            document=new_document, file_path=path, password=password, dirty=shrink is not None
+        )
+        session.shrink_estimate = shrink
+        self._append_session(session)
         self.status_label.setText(
             tr_n("{name}  •  {count}ページ", len(new_document)).format(
                 name=Path(path).name, count=len(new_document)
             )
         )
         return True
+
+    def _shrink_on_open(
+        self, document: fitz.Document, path: str, password: str | None
+    ) -> tuple[int, int] | None:
+        """For a file pdfNote has edited: undo what an older pdfNote made large
+        and say what saving would bring. (size on disk, size once saved), or
+        None when the file is already about as small as it gets.
+
+        Only files with pdfNote's marks are looked at, and measured only when
+        something was tidied or the file is over a megabyte: the measure is
+        a serialisation, half a second for 100 MB."""
+        try:
+            if not _pages_with_pdfnote_marks(document):
+                return None
+            changes = tidy_pdfnote_leftovers(document)
+            before = Path(path).stat().st_size
+            if not changes and before < 1024 * 1024:
+                return None
+            after = len(serialize_document(document, password=password))
+        except Exception:
+            return None
+        if before - after >= max(SHRINK_NOTICE_MIN_BYTES, before // 20):
+            return before, after
+        return None
 
     def _unlock_document(self, document: fitz.Document) -> str | None:
         """Ask for the password of a locked document. None when it is not
@@ -14528,7 +17211,7 @@ class RenderingMixin:
                 pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
             ).copy()
             if image.isNull():
-                raise MemoryError(tr("ページ画像の作成に失敗しました"))
+                raise MemoryError(tr("ページの画像を作成できませんでした"))
             image.setDevicePixelRatio(ratio)
             covers = [cover for cover in hidden.values() if cover is not None]
             if covers:
@@ -14582,7 +17265,7 @@ class RenderingMixin:
             try:
                 images = [self._render_page_image(index, scale, ratio) for index in indices]
                 if any(image.isNull() for image in images):
-                    raise MemoryError(tr("空のページ画像が返されました"))
+                    raise MemoryError(tr("ページの画像が空でした"))
                 break
             except (MemoryError, RuntimeError, ValueError) as exc:
                 last_error = exc
@@ -14614,7 +17297,7 @@ class RenderingMixin:
             max_height = max(image.height() for image in images)
             combined = QPixmap(total_width, max_height)
             if combined.isNull():
-                raise MemoryError(tr("表示用画像を確保できませんでした"))
+                raise MemoryError(tr("表示用の画像のメモリーを確保できませんでした"))
             combined.setDevicePixelRatio(ratio)
             combined.fill(QColor(COLORS["canvas"]))
             painter = QPainter(combined)
@@ -14822,6 +17505,11 @@ class RenderingMixin:
         # is shown again.
         container = self.continuous_container
         was_visible = container.isVisible()
+        # An open text box, picture or shape lives on its page's label, which
+        # the rebuild deletes -- and the box with it, its unwritten text
+        # lost (6.2). It waits on the container, out of sight, and goes onto
+        # the new label of its page.
+        parked = self._park_canvas_boxes()
         if was_visible:
             container.hide()
         try:
@@ -14829,6 +17517,7 @@ class RenderingMixin:
         finally:
             if was_visible:
                 container.show()
+            self._unpark_canvas_boxes(parked)
         self._continuous_layout_signature = signature
         QTimer.singleShot(
             0,
@@ -14846,6 +17535,56 @@ class RenderingMixin:
                 count=len(self.document),
             )
         )
+
+    def _park_canvas_boxes(self) -> list[tuple[QWidget, int, bool]]:
+        """Take the open canvas boxes off the continuous page labels:
+        (box, page index, whether it had the keyboard focus)."""
+        labels = getattr(self, "_continuous_labels", {})
+        focus = QApplication.focusWidget()
+        parked: list[tuple[QWidget, int, bool]] = []
+        for box, page_index in (
+            (self._active_text_box, self._active_text_page_index),
+            (self._active_image_box, self._active_image_page_index),
+            (self._active_object_box, self._active_object_page_index),
+        ):
+            if box is None:
+                continue
+            try:
+                if box.parent() not in labels:
+                    continue
+            except RuntimeError:
+                continue  # already deleted
+            had_focus = focus is not None and (focus is box or box.isAncestorOf(focus))
+            box.hide()
+            box.setParent(self.continuous_container)
+            parked.append((box, page_index, had_focus))
+        return parked
+
+    def _unpark_canvas_boxes(self, parked: list[tuple[QWidget, int, bool]]) -> None:
+        """Put parked boxes onto the new label of their page, at the new
+        scale. A box whose page is gone is written back instead."""
+        orphaned = False
+        for box, page_index, had_focus in parked:
+            label = self._continuous_label_for(page_index)
+            if label is None:
+                orphaned = True
+                continue
+            box.setParent(label)
+            if page_index == self.page_index:
+                self._active_canvas_widget = label
+                self._active_canvas_page_origin = QPointF(0, 0)
+                self._active_canvas_scale = self._continuous_labels[label][1]
+            box.show()
+            box.raise_()
+            if had_focus:
+                editor = getattr(box, "editor", None)
+                (editor if editor is not None else box).setFocus()
+        if parked:
+            self._layout_active_text_box()
+            self._layout_active_image_box()
+            self._layout_active_object_box()
+        if orphaned:
+            self._finish_active_overlays()
 
     def _fill_continuous_layout(self, carried: tuple | None) -> None:
         """Replace the page column with a placeholder label for each page."""
@@ -15299,7 +18038,7 @@ class RenderingMixin:
             answer = QMessageBox.question(
                 self,
                 APP_NAME,
-                tr("外部アプリが起動する可能性があります。\n\n{uri}\n\n開きますか？")
+                tr("別のアプリが起動することがあります。\n\n{uri}\n\n開きますか？")
                 .format(uri=uri),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -15530,7 +18269,7 @@ class NavigationMixin:
         self._focus_main_view()
         # After the redraw, which writes the ordinary status line as it
         # finishes and would otherwise wipe this off.
-        QTimer.singleShot(0, lambda: self.status_label.setText(tr("画面を更新しました")))
+        QTimer.singleShot(0, lambda: self.status_label.setText(tr("表示を更新しました")))
 
     def toggle_continuous_view(self, checked: bool | None = None) -> None:
         self._finish_active_overlays()
@@ -15803,6 +18542,15 @@ class NavigationMixin:
                 pass
         dialog = StickyNoteEditDialog(self, title, text, html)
         self._active_note_dialog = dialog
+        # Where the note belongs. The editor is not modal: by the time it is
+        # accepted the window may show another tab or page, and the note was
+        # written there -- a new one onto the page on screen, an edit onto
+        # whatever note had the same number in the other document (6.2).
+        session = self._current_session()
+        document = self.document
+        page_xref = (
+            self._page_object_xref(document, self.page_index) if document is not None else None
+        )
 
         def done(result: int) -> None:
             written, rich = dialog.plain_text(), dialog.rich_html()
@@ -15811,7 +18559,15 @@ class NavigationMixin:
             self._sync_format_action_states()
             self._update_controls()
             if result == QDialog.Accepted:
-                on_accept(written, rich)
+                if self._return_to_note_target(session, document, page_xref):
+                    on_accept(written, rich)
+                elif written.strip():
+                    QApplication.clipboard().setText(written)
+                    QMessageBox.warning(
+                        self, APP_NAME,
+                        tr("付箋を追加できませんでした。書き始めた文書またはページがなくなっています。"
+                           "入力した内容はクリップボードにコピーしました。"),
+                    )
             dialog.deleteLater()
 
         dialog.finished.connect(done)
@@ -15825,17 +18581,44 @@ class NavigationMixin:
         self._update_controls()
         return dialog
 
+    def _return_to_note_target(
+        self, session: "DocumentSession | None", document: Any, page_xref: int | None
+    ) -> bool:
+        """Show the tab and page a note editor was opened for, so that its
+        note is written there. False when that tab or page is gone.
+
+        The tab's document may have been replaced meanwhile by one read
+        back from a save, or by a step of undo; its pages keep their object
+        numbers through both, so the page is looked for by its number."""
+        if session is None or document is None or session not in self.sessions:
+            return False
+        current = session.document
+        if current is None or current.is_closed:
+            return False
+        index = next(
+            (number for number in range(len(current)) if current.page_xref(number) == page_xref),
+            None,
+        )
+        if index is None:
+            return False
+        if self._current_session() is not session:
+            self.document_tabs.setCurrentIndex(self.sessions.index(session))
+        if self.page_index != index:
+            self.go_to_page(index)
+        return self.document is current and self.page_index == index
+
     def _edit_note_annotation(self, annotation: fitz.Annot) -> None:
         if self.document is None:
             return
         original = str(annotation.info.get("content") or "")
         original_html = self._note_rich_html(annotation)
-        page_index = self.page_index
         xref = annotation.xref
+        # The page is read when the edit is accepted: _open_note_editor has
+        # gone back to the note's page by then, wherever it has moved to.
         self._open_note_editor(
             tr("付箋を編集"), original, original_html,
             lambda text, html: self._apply_note_edit(
-                page_index, xref, text, html, original, original_html
+                self.page_index, xref, text, html, original, original_html
             ),
         )
 
@@ -16053,6 +18836,10 @@ class NavigationMixin:
             return
         if new_order == list(range(len(self.document))):
             return
+        if not self._commit_open_edits():
+            # The list has moved the thumbnail already: show the real order.
+            self._start_thumbnails()
+            return
         self._suspend_thumbnail_reorder = True
         checkpoint: tuple | None = None
         try:
@@ -16082,6 +18869,8 @@ class NavigationMixin:
         )
 
     def _copy_current_page_to_clipboard(self) -> bool:
+        if not self._commit_open_edits():
+            return False
         if self.document is None:
             return False
         piece = fitz.open()
@@ -16089,7 +18878,7 @@ class NavigationMixin:
             # Straight from the open document: its serialised copy is locked
             # when the PDF needs a password, and the insert raised.
             piece.insert_pdf(self.document, from_page=self.page_index, to_page=self.page_index)
-            self._page_clipboard = piece.tobytes()
+            self._page_clipboard = piece.tobytes(**compact_page_copy(piece))
             # Pasted into another document, the page does not take this
             # PDF's usage restrictions along; the paste says so.
             self._page_clipboard_origin = (self._current_session(), pdf_is_protected(self.document))
@@ -16105,10 +18894,12 @@ class NavigationMixin:
             piece.close()
 
     def _cut_current_page_to_clipboard(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         if len(self.document) <= 1:
-            QMessageBox.information(self, APP_NAME, tr("PDFには最低1ページ必要です。"))
+            QMessageBox.information(self, APP_NAME, tr("PDFには1ページ以上必要です。"))
             return
         if not self._copy_current_page_to_clipboard():
             # Not on the clipboard, so not taken off the page either.
@@ -16120,12 +18911,19 @@ class NavigationMixin:
         self.status_label.setText(tr("ページを切り取りました"))
 
     def _paste_page_from_clipboard(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None or self._page_clipboard is None:
             return
         source = fitz.open(stream=self._page_clipboard, filetype="pdf")
         try:
             self._snapshot_for_edit()
             self.document.insert_pdf(source, start_at=self.page_index + 1)
+            # Pasted back into the document it came from, the page draws
+            # the pictures already here instead of second copies (6.1).
+            share_identical_images(
+                self.document, range(self.page_index + 1, self.page_index + 1 + len(source))
+            )
             session = self._current_session()
             origin = self._page_clipboard_origin
             if session is not None and origin is not None and origin[1] and origin[0] is not session:
@@ -16428,17 +19226,7 @@ class HistoryMixin:
         except Exception as exc:
             self._report_recovery_failure(str(exc) or exc.__class__.__name__)
             return
-        meta = json.dumps(
-            {
-                "original_path": session.file_path,
-                "title": session.title,
-                "saved_at": datetime.now().isoformat(),
-                # Which process owns this snapshot, so another pdfNote
-                # started meanwhile leaves it alone (see owner_is_running).
-                "owner": process_identity(),
-            },
-            ensure_ascii=False,
-        )
+        meta = self._recovery_meta(session)
         # Counted as written only once the writer says so
         # (_check_recovery_writer). It was counted here, before the write:
         # a write that failed was never tried again until the next edit.
@@ -16450,10 +19238,45 @@ class HistoryMixin:
         # Look for the outcome shortly, rather than two minutes from now.
         QTimer.singleShot(3000, self._check_recovery_writer)
 
+    @staticmethod
+    def _recovery_meta(session: DocumentSession) -> str:
+        return json.dumps(
+            {
+                "original_path": session.file_path,
+                "title": session.title,
+                "saved_at": datetime.now().isoformat(),
+                # Which process owns this snapshot, so another pdfNote
+                # started meanwhile leaves it alone (see owner_is_running).
+                "owner": process_identity(),
+            },
+            ensure_ascii=False,
+        )
+
+    def _write_recovery_now(self) -> None:
+        """Every unsaved tab of this window into the recovery folder, written
+        here and now: a crash is about to end the process, and the writer
+        thread would not get to it (6.5)."""
+        if self.test_mode:
+            return
+        for session in list(self.sessions):
+            if not session.dirty or session.revision == session.autosaved_revision:
+                continue
+            try:
+                pdf_path, meta_path = self._recovery_paths(session)
+                RecoverySnapshotWriter._write(
+                    pdf_path.with_suffix(".part"), pdf_path, meta_path,
+                    serialize_session(session), self._recovery_meta(session),
+                )
+            except Exception:
+                continue
+
     def _check_recovery_writer(self) -> None:
+        # Only this window's tabs: the writer is shared, and a tab moved
+        # away has its outcome taken by the window that holds it now.
+        paths = [self._recovery_paths(session)[0] for session in self.sessions]
         take_results = getattr(self._recovery_writer, "take_results", None)
         if take_results is not None:
-            for pdf_path, revision, failure in take_results():
+            for pdf_path, revision, failure in take_results(paths):
                 for session in self.sessions:
                     if self._recovery_paths(session)[0] != pdf_path:
                         continue
@@ -16461,7 +19284,7 @@ class HistoryMixin:
                         session.autosave_pending_revision = -1
                     if failure is None and revision is not None:
                         session.autosaved_revision = max(session.autosaved_revision, revision)
-        failure = self._recovery_writer.take_failure()
+        failure = self._recovery_writer.take_failure(paths)
         if failure:
             self._report_recovery_failure(failure)
 
@@ -16522,20 +19345,23 @@ class HistoryMixin:
             self,
             APP_NAME,
             tr(
-                "前回、正常に終了せずに閉じられた未保存の変更が見つかりました。復元しますか？\n\n{names}"
+                "前回 pdfNote が正常に終了しなかったため、保存されていない変更が残っています。復元しますか？\n\n{names}"
             ).format(names=names),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
         for pdf_path, meta_path, meta in entries:
-            restored = True
             if answer == QMessageBox.Yes:
-                restored = self._restore_recovery_entry(pdf_path, meta)
-            if not restored:
-                # Authentication was refused or failed: keep the snapshot on
-                # disk so the unsaved work is still offered next time rather
-                # than being thrown away because it could not be unlocked.
+                # Restored or not, the files stay. A restored tab takes them
+                # over: they are its snapshot until it writes a newer one,
+                # is saved, or is closed without saving. They were deleted
+                # as soon as the document was open in memory, and a second
+                # crash before the next snapshot -- two minutes later --
+                # lost what had just been recovered (6.2). One that could
+                # not be unlocked is still offered next time.
+                self._restore_recovery_entry(pdf_path, meta)
                 continue
+            # No: the user threw them away.
             try:
                 pdf_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
@@ -16568,14 +19394,28 @@ class HistoryMixin:
         if len(document) == 0:
             document.close()
             return False
-        self._append_session(
-            DocumentSession(
-                document=document,
-                file_path=str(meta.get("original_path") or ""),
-                password=password,
-                dirty=True,
-            )
+        session = DocumentSession(
+            document=document,
+            file_path=str(meta.get("original_path") or ""),
+            password=password,
+            dirty=True,
+            # The snapshot's files become this tab's own (_recovery_paths).
+            recovery_id=pdf_path.stem,
         )
+        # What is on disk is what is open: nothing to write until it changes.
+        session.autosaved_revision = session.revision
+        self._append_session(session)
+        # This process owns the snapshot now, so a pdfNote started meanwhile
+        # does not offer to restore it a second time (owner_is_running).
+        meta_path = pdf_path.with_suffix(".json")
+        try:
+            claimed = dict(meta, owner=process_identity())
+            RecoverySnapshotWriter._replace_atomically(
+                meta_path.with_suffix(".json.part"), meta_path,
+                json.dumps(claimed, ensure_ascii=False).encode("utf-8"),
+            )
+        except OSError:
+            pass
         return True
 
     @staticmethod
@@ -16597,6 +19437,134 @@ class HistoryMixin:
                     del stack[: position + 1]
                     break
 
+    def _schedule_history_upkeep(self) -> None:
+        """Look at the journal once the window is idle again (compact_history)."""
+        if getattr(self, "_history_upkeep_pending", False):
+            return
+        self._history_upkeep_pending = True
+        QTimer.singleShot(400, self._history_upkeep)
+
+    def _history_upkeep(self) -> None:
+        self._history_upkeep_pending = False
+        session = self._current_session()
+        if session is None or not session.journal:
+            return
+        grown = False
+        memory = process_memory_bytes()
+        if memory is not None and session.journal_memory_at_check:
+            grown = memory - session.journal_memory_at_check >= JOURNAL_CHECK_GROWTH
+        if session.journal_steps_since_check >= JOURNAL_CHECK_STEPS or grown:
+            if not self.compact_history():
+                # Not now (something is open) or not needed: try again
+                # after the next edit rather than on a clock.
+                pass
+
+    @staticmethod
+    def _journal_marks(session: DocumentSession, stack: list[tuple]) -> list[JournalMark]:
+        return [
+            entry[0] for entry in stack
+            if isinstance(entry[0], JournalMark) and entry[0].document is session.document
+        ]
+
+    def compact_history(self, force: bool = False) -> bool:
+        """Keep the undo history of the tab on screen within its limits.
+
+        The limits are 8 steps and 64 MB whether undo runs on copies of
+        the document or on MuPDF's journal; with the journal, only the
+        number of steps was kept to, and the journal kept everything
+        (6.3). Steps whose data is over 64 MB are dropped, oldest first, and
+        once what no undo can reach any more is worth it, the journal is
+        moved onto a copy of the document that holds only what can still
+        be undone and redone (rebase_journal). True when that happened.
+
+        Nothing is done while an edit is under way, a box or field is
+        open, a dialog is up or OCR runs on the document, on a document
+        read from its file as it is needed (over OPEN_IN_MEMORY_BYTES), or
+        on a PyMuPDF the journal's format was not checked with."""
+        session = self._current_session()
+        if session is None or not session.journal or self.document is not session.document:
+            return False
+        document = session.document
+        if (
+            session.edit_open
+            or not journal_layout_tested()
+            or document.is_closed
+            or document.name
+            or QApplication.activeModalWidget() is not None
+            or QThread.currentThread().loopLevel() > 1
+            or self._active_text_box is not None
+            or self._active_image_box is not None
+            or self._active_object_box is not None
+            or getattr(self, "_active_form_editor", None) is not None
+            or (self._ocr_worker is not None and self._ocr_document is document)
+        ):
+            return False
+        session.journal_steps_since_check = 0
+        session.journal_memory_at_check = process_memory_bytes() or 0
+        document.journal_stop_op()
+        active = document
+        try:
+            steps = journal_steps(document)
+            if steps is None:
+                return False
+            position, total = document.journal_position()
+            sizes = [size for _name, _numbers, size in steps]
+
+            def reachable(mark: JournalMark) -> bool:
+                return 0 <= mark.position <= total and (
+                    mark.position == 0
+                    or document.journal_op_name(mark.position - 1) == mark.step
+                )
+
+            # The byte limit of the history, for the journal too: the
+            # oldest undo steps go until what undo needs fits in it.
+            while session.undo_stack:
+                marks = [m for m in self._journal_marks(session, session.undo_stack) if reachable(m)]
+                low = min([m.position for m in marks] + [position])
+                if sum(sizes[low:position]) <= MAX_HISTORY_BYTES:
+                    break
+                session.undo_stack.pop(0)
+            undo_marks = [m for m in self._journal_marks(session, session.undo_stack) if reachable(m)]
+            redo_marks = [m for m in self._journal_marks(session, session.redo_stack) if reachable(m)]
+            low = min([m.position for m in undo_marks] + [position])
+            high = max([m.position for m in redo_marks] + [position])
+            unreachable = sum(sizes[:low]) + sum(sizes[high:])
+            slack = JOURNAL_SLACK_BYTES
+            if session.file_path:
+                try:
+                    slack = max(slack, Path(session.file_path).stat().st_size)
+                except OSError:
+                    pass
+            if (low == 0 and high == total) or (unreachable < slack and not force):
+                return False
+            copy = rebase_journal(document, low, high, steps, session.password)
+            if copy is None:
+                return False
+            for mark in (*undo_marks, *redo_marks):
+                mark.document = copy
+                mark.position -= low
+            session.document = copy
+            self.document = copy
+            active = copy
+            for capture in getattr(self, "_annotation_clipboard", None) or []:
+                if capture.get("document") == id(document):
+                    capture["document"] = id(copy)
+            try:
+                document.close()
+            except Exception:
+                pass
+            # Marks the copy does not hold (cut off, or into nothing) go.
+            self._forget_history_of_closed_documents(session)
+            self._invalidate_render_cache()
+            self._invalidate_continuous_images()
+            self._notes_scan_document_id = 0
+            self.schedule_render(immediate=True)
+            self._update_controls()
+            return True
+        finally:
+            if not active.is_closed:
+                active.journal_start_op(_next_journal_operation())
+
     @staticmethod
     def _trim_history(stack: list[tuple[bytes, int]]) -> None:
         # Note the `stack` (not `len(stack) > 1`) guard: a lone snapshot that
@@ -16617,6 +19585,9 @@ class HistoryMixin:
             # A place in the journal: no copy, however long the document.
             stack.append((journal_mark(session.document), self.page_index, session.state_id))
             self._trim_history(stack)
+            if stack is session.undo_stack:
+                # An edit starts; _mark_dirty() says when it is done.
+                session.edit_open = True
             return True
         if session.history_suspended:
             return False
@@ -16682,7 +19653,7 @@ class HistoryMixin:
         if self.document is not None:
             self._mark_dirty()
             self.status_label.setText(
-                tr("処理を途中まで行った状態を元に戻せませんでした。文書の一部が変更されている可能性があります。")
+                tr("途中まで行った処理を元に戻せませんでした。文書の一部が変更されたままになっている可能性があります。")
             )
         return False
 
@@ -16783,6 +19754,10 @@ class HistoryMixin:
         session.dirty = True
         session.revision += 1
         session.state_id = next(DOCUMENT_STATE_IDS)
+        if session.journal:
+            session.edit_open = False
+            session.journal_steps_since_check += 1
+            self._schedule_history_upkeep()
         self._invalidate_render_cache(self.page_index)
         self.document_tabs.setTabText(self.current_session_index, session.title)
         self.setWindowTitle(f"{session.title} — {APP_NAME}")
@@ -16828,8 +19803,8 @@ class CanvasEditingMixin:
                 self.continuous_timer.start(1)
         labels = {
             "select": tr("クリックで選択、ドラッグで範囲選択"),
-            "note": tr("ページ上をクリックして付箋を追加"),
-            "text": tr("ページ上をクリックしてテキスト ボックスを追加"),
+            "note": tr("ページをクリックして付箋を追加"),
+            "text": tr("ページをクリックしてテキスト ボックスを追加"),
             "ink": tr("ページ上をドラッグして手書き"),
             "rectangle": tr("ドラッグして四角形を追加"),
             "arrow": tr("ドラッグして矢印を追加"),
@@ -17223,7 +20198,7 @@ class CanvasEditingMixin:
         )
         # The part of a drag that is on the page: a drag above or beside it
         # came out inside out (y1 < y0), and the box could not be committed.
-        on_page = fitz.Rect(dragged) & page.rect
+        on_page = fitz.Rect(dragged) & self._unrotated_bounds(page)
         if (
             dragged.width >= 12 and dragged.height >= 12
             and not on_page.is_empty and on_page.width >= 12 and on_page.height >= 12
@@ -17265,7 +20240,7 @@ class CanvasEditingMixin:
         annotation = self._freetext_at_point(page, self._screen_point_to_page(screen_point))
         if annotation is None:
             if not quiet:
-                self.status_label.setText(tr("クリック位置に編集できるテキスト ボックスがありません"))
+                self.status_label.setText(tr("クリックした位置に編集できるテキスト ボックスがありません"))
             return False
         self._reopen_freetext_annotation(annotation)
         return True
@@ -17626,7 +20601,7 @@ class CanvasEditingMixin:
             box.editor.width(),
             box.editor.height(),
         )
-        page_rect = self._screen_rect_to_page(screen_rect) & self.document[self.page_index].rect
+        page_rect = self._screen_rect_to_page(screen_rect) & self._unrotated_bounds(self.document[self.page_index])
         if page_rect.width >= 5 and page_rect.height >= 5:
             self._active_text_rect = page_rect
 
@@ -17826,13 +20801,10 @@ class CanvasEditingMixin:
         """
         if self.document is None:
             return False
-        names = {
-            str(item[7])
-            for item in page.get_images(full=True)
-            if int(item[0]) == image_xref and len(item) > 7 and item[7]
-        }
+        names = self._image_names(page, image_xref)
         if not names:
             return False
+        content_xref = self._own_content_xref(page, content_xref)
         streams = [content_xref] if content_xref is not None else list(page.get_contents())
         removed = False
         for xref in streams:
@@ -17913,6 +20885,38 @@ class CanvasEditingMixin:
         return added[-1] if added else None
 
     @staticmethod
+    def _own_content_xref(page: fitz.Page, xref: int | None) -> int | None:
+        """`xref` if it is one of this page's content streams. A mark copied
+        with its page -- duplicated, pasted, merged -- still named the
+        original page's stream, and moving the copy's picture took the
+        original's off its page (6.1)."""
+        if xref is None:
+            return None
+        return xref if xref in page.get_contents() else None
+
+    def _image_drawn_elsewhere(self, page_index: int, image_xref: int) -> bool:
+        if self.document is None:
+            return False
+        for index in range(len(self.document)):
+            if index == page_index:
+                continue
+            try:
+                if any(int(item[0]) == image_xref for item in self.document.get_page_images(index)):
+                    return True
+            except Exception:
+                return True
+        return False
+
+    @staticmethod
+    def _image_names(page: fitz.Page, image_xref: int) -> set[str]:
+        """The names this page's resources give the picture `image_xref`."""
+        return {
+            str(item[7])
+            for item in page.get_images(full=True)
+            if int(item[0]) == image_xref and len(item) > 7 and item[7]
+        }
+
+    @staticmethod
     def _qimage_png_bytes(image: QImage) -> bytes:
         encoded = QByteArray()
         buffer = QBuffer(encoded)
@@ -17921,15 +20925,112 @@ class CanvasEditingMixin:
         buffer.close()
         return bytes(encoded)
 
+    @staticmethod
+    def _qimage_jpeg_bytes(image: QImage, quality: int = IMAGE_JPEG_QUALITY) -> bytes:
+        if image.format() != QImage.Format_Grayscale8:
+            image = image.convertToFormat(QImage.Format_RGB888)
+        encoded = QByteArray()
+        buffer = QBuffer(encoded)
+        if not buffer.open(QIODevice.WriteOnly) or not image.save(buffer, "JPG", quality):
+            return b""
+        buffer.close()
+        return bytes(encoded)
+
+    def _cropped_image_bytes(self, source_xref: int, crop: QRectF) -> bytes:
+        """The part `crop` of the picture `source_xref`, ready to insert: a
+        photo stays a JPEG and a picture with transparency keeps it.
+
+        Every crop used to be stored as PNG, which made a 3.6 MB photo
+        21 MB; and the mask was not read, so a transparent picture came
+        back with a black or white background."""
+        assert self.document is not None
+        info = self.document.extract_image(source_xref)
+        source = QImage.fromData(info.get("image", b""))
+        if source.isNull():
+            raise ValueError(tr("画像データを読み取れません"))
+        mask_xref = int(info.get("smask") or 0)
+        if mask_xref > 0:
+            try:
+                mask = QImage.fromData(self.document.extract_image(mask_xref).get("image", b""))
+                if not mask.isNull():
+                    mask = mask.convertToFormat(QImage.Format_Grayscale8).scaled(
+                        source.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+                    )
+                    source = source.convertToFormat(QImage.Format_ARGB32)
+                    source.setAlphaChannel(mask)
+            except Exception:
+                pass
+        pixel_rect = QRect(
+            round(crop.left() * source.width()),
+            round(crop.top() * source.height()),
+            max(1, round(crop.width() * source.width())),
+            max(1, round(crop.height() * source.height())),
+        ) & source.rect()
+        cropped = source.copy(pixel_rect)
+        if str(info.get("ext") or "").lower() in ("jpg", "jpeg") and not cropped.hasAlphaChannel():
+            encoded = self._qimage_jpeg_bytes(cropped)
+        else:
+            encoded = self._qimage_png_bytes(cropped)
+        if not encoded:
+            raise ValueError(tr("画像を作り直せませんでした"))
+        return encoded
+
+    def _keep_image_source(self, marker_xref: int, source_xref: int, visible_xref: int) -> None:
+        """Refer to the untouched original from the mark itself while the page
+        shows another copy. Kept by number alone it was reachable only
+        through the page's resources, where the copy it replaced now is not:
+        the save would leave it out, and cropping again with it."""
+        if self.document is None:
+            return
+        if source_xref and source_xref != visible_xref:
+            self.document.xref_set_key(marker_xref, "SumiSource", f"{source_xref} 0 R")
+        elif self.document.xref_get_key(marker_xref, "SumiSource")[0] != "null":
+            delete_pdf_key(self.document, marker_xref, "SumiSource")
+
+    def _checked_image_source(
+        self, metadata: tuple[int, int | None, int, QRectF], page: fitz.Page | None = None
+    ) -> tuple[int, int | None, int, QRectF]:
+        """The mark's metadata, with an original that cannot be the one the
+        picture was cut from replaced by the picture itself, whole
+        (image_source_fits). A picture number that `page` does not draw --
+        a file another program saved with its objects numbered anew -- is
+        blanked, so the picture under the mark is looked for instead."""
+        image_xref, content_xref, source_xref, crop = metadata
+        if page is not None and image_xref > 0:
+            try:
+                drawn = {int(item[0]) for item in page.get_images(full=True)}
+            except Exception:
+                drawn = {image_xref}
+            if image_xref not in drawn:
+                return 0, None, 0, QRectF(0.0, 0.0, 1.0, 1.0)
+        if (
+            self.document is not None
+            and image_xref > 0
+            and source_xref != image_xref
+            and _image_size(self.document, image_xref) is not None
+            and not image_source_fits(
+                self.document, image_xref, source_xref,
+                (crop.left(), crop.top(), crop.right(), crop.bottom()),
+            )
+        ):
+            return image_xref, content_xref, image_xref, QRectF(0.0, 0.0, 1.0, 1.0)
+        return metadata
+
     def _open_canvas_image_box(self, marker: fitz.Annot) -> bool:
         if self.document is None:
             return False
         metadata = self._image_edit_metadata(marker)
         if metadata is None:
             return False
-        image_xref, _content_xref, source_xref, crop = metadata
         try:
-            image_data = self.document.extract_image(source_xref).get("image", b"")
+            marker_page = marker.parent
+        except Exception:
+            marker_page = None
+        image_xref, _content_xref, source_xref, crop = self._checked_image_source(metadata, marker_page)
+        try:
+            image_data = (
+                self.document.extract_image(source_xref).get("image", b"") if source_xref > 0 else b""
+            )
         except Exception:
             image_data = b""
         if not image_data:
@@ -17999,7 +21100,7 @@ class CanvasEditingMixin:
         """Entering says what the handles are for -- where the removed Crop
         button's tooltip used to. Leaving writes the crop to the page."""
         if cropping:
-            self.status_label.setText(tr("8方向のハンドルで切り抜き範囲を指定"))
+            self.status_label.setText(tr("ハンドルをドラッグしてトリミングの範囲を指定"))
             return
         self.status_label.setText(tr("画像を選択中"))
         if self._committing_image_box or self.document is None:
@@ -18096,6 +21197,7 @@ class CanvasEditingMixin:
         if self.document is None:
             return
         self._active_image_restore = {}
+        content_xref = self._own_content_xref(page, content_xref)
         streams = [content_xref] if content_xref is not None else list(page.get_contents())
         for xref in streams:
             if xref is None:
@@ -18175,7 +21277,7 @@ class CanvasEditingMixin:
                 crop.width() * screen_rect.width(),
                 crop.height() * screen_rect.height(),
             )
-        rect = self._screen_rect_to_page(screen_rect) & self.document[self.page_index].rect
+        rect = self._screen_rect_to_page(screen_rect) & self._unrotated_bounds(self.document[self.page_index])
         if rect.width >= 5 and rect.height >= 5:
             self._active_image_rect = rect
 
@@ -18271,27 +21373,38 @@ class CanvasEditingMixin:
                 marker_page.load_annot(marker_xref)
             )
             old_content_xref = marker_reference[1] if marker_reference is not None else None
-            source = QImage.fromData(self.document.extract_image(source_xref).get("image", b""))
-            if source.isNull():
-                raise ValueError(tr("画像データを読み取れません"))
-            pixel_rect = QRect(
-                round(crop.left() * source.width()),
-                round(crop.top() * source.height()),
-                max(1, round(crop.width() * source.width())),
-                max(1, round(crop.height() * source.height())),
-            ) & source.rect()
-            cropped = source.copy(pixel_rect)
-            encoded = self._qimage_png_bytes(cropped)
-            if not encoded:
-                raise ValueError(tr("画像の再生成に失敗しました"))
+            # Only moved or resized: the picture on the page already is the
+            # right one, and it is drawn again where it now goes. It used to
+            # be decoded and stored once more as PNG -- a 3.6 MB photo added
+            # 21 MB each time it was moved (6.1).
+            drawn_xref: int | None = image_xref
+            if not self._crop_close(crop, original_crop):
+                # Cropped back to the whole picture, that is the original;
+                # anything else is cut out of it anew.
+                drawn_xref = (
+                    source_xref if self._crop_close(crop, QRectF(0.0, 0.0, 1.0, 1.0)) else None
+                )
+            if drawn_xref is not None and self.document.xref_get_key(drawn_xref, "Subtype")[1] != "/Image":
+                drawn_xref = None
+            encoded = None if drawn_xref is not None else self._cropped_image_bytes(source_xref, crop)
             checkpoint = self._begin_edit()
             page = self.document[page_index]
             contents_before = set(page.get_contents())
-            new_xref = page.insert_image(rect, stream=encoded, keep_proportion=False, overlay=True)
+            if encoded is None:
+                new_xref = page.insert_image(
+                    rect, xref=drawn_xref, keep_proportion=False, overlay=True
+                )
+            else:
+                new_xref = page.insert_image(
+                    rect, stream=encoded, keep_proportion=False, overlay=True
+                )
             new_content_xref = self._new_page_content_xref(page, contents_before)
             # Take out only the old copy's drawing, and only from streams
             # that were already there before the new copy was added.
             self._hide_page_image(page, image_xref, old_content_xref, allowed=contents_before)
+            # A copy no longer drawn leaves the resources, so the save leaves
+            # it out; the same picture drawn anew keeps its own new name.
+            drop_undrawn_xobjects(self.document, page_index, self._image_names(page, image_xref))
             marker = page.load_annot(marker_xref)
             marker.set_rect(rect)
             marker.set_border(width=0)
@@ -18300,13 +21413,14 @@ class CanvasEditingMixin:
                 subject=self._image_subject(new_xref, new_content_xref, source_xref, crop)
             )
             marker.update()
+            self._keep_image_source(marker_xref, source_xref, new_xref)
         except Exception as exc:
             # The new copy may be on the page while the old one is still
             # drawn, or the old one gone and the mark not updated.
             self._rollback_edit(checkpoint)
             self._overlay_commit_failed = True
             QMessageBox.critical(
-                self, APP_NAME, tr("画像編集を保存できませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME, tr("画像の変更を保存できませんでした。\n\n{error}").format(error=exc)
             )
             return
         self.page_index = page_index
@@ -18417,7 +21531,7 @@ class CanvasEditingMixin:
                     is_head=endpoint_index == 1,
                 )
                 if kind == "line":
-                    handle.setToolTip(tr("直線の端点を360度自由に移動"))
+                    handle.setToolTip(tr("ドラッグして線の終点を移動"))
                 handle.set_color(QColor.fromRgbF(*color))
                 handle.moved.connect(self._active_line_endpoint_moved)
                 self._active_line_handles.append(handle)
@@ -18794,7 +21908,7 @@ class CanvasEditingMixin:
             top_left.x() - image_origin.x(), top_left.y() - image_origin.y(),
             max(5, box.width() - 4), max(5, box.height() - 22),
         )
-        rect = self._screen_rect_to_page(screen_rect) & self.document[self.page_index].rect
+        rect = self._screen_rect_to_page(screen_rect) & self._unrotated_bounds(self.document[self.page_index])
         if rect.width >= 3 and rect.height >= 3:
             self._active_object_rect = rect
         self._active_object_box_geometry = QRect(box.geometry())
@@ -19040,6 +22154,17 @@ class AnnotationsMixin:
         elif rotation == 270:
             x, y = width - y, x
         return fitz.Point(x, y) * page.derotation_matrix
+
+    @staticmethod
+    def _unrotated_bounds(page: fitz.Page) -> fitz.Rect:
+        """The page's area in the coordinates _screen_point_to_page gives,
+        which are those of the page before its /Rotate. page.rect is the
+        page as turned: a portrait page turned 90 degrees is 842 wide and
+        595 high there, and clipping an unturned point to it took the lower
+        third of the page away -- a text box drawn there vanished (6.2)."""
+        if page.rotation % 360 == 0:
+            return fitz.Rect(page.rect)
+        return fitz.Rect(page.rect * page.derotation_matrix).normalize()
 
     def _screen_rect_to_page(self, rect: QRectF) -> fitz.Rect:
         corners = [
@@ -19339,7 +22464,7 @@ class AnnotationsMixin:
         self._invalidate_render_cache(page.number)
         self.schedule_render(immediate=True)
         self.status_label.setText(
-            tr_n("{count}文字を選択して{operation}を追加しました", character_count).format(
+            tr_n("{count}文字に{operation}を追加しました", character_count).format(
                 count=character_count, operation=operation_name
             )
         )
@@ -19903,7 +23028,7 @@ class AnnotationsMixin:
             self._selected_annotation_xrefs = selected
             self._sync_annotation_selection()
             self.status_label.setText(
-            tr_n("{count}個の注釈を範囲選択", len(self._selected_annotation_xrefs)).format(
+            tr_n("{count}個の注釈を選択中", len(self._selected_annotation_xrefs)).format(
                 count=len(self._selected_annotation_xrefs)
             )
         )
@@ -20113,6 +23238,8 @@ class AnnotationsMixin:
             menu.addSeparator()
             font_menu = self._submenu(menu, "フォント", "font")
             for display_name in TEXT_BOX_FONTS:
+                if display_name not in MAIN_TEXT_BOX_FONT_KEYS:
+                    continue  # the toolbar's list has every font
                 font_menu.addAction(
                     self.font_display_name(display_name),
                     lambda _checked=False, xref=text_box_xref, name=display_name:
@@ -20370,7 +23497,7 @@ class AnnotationsMixin:
             crop = QRectF(0.0, 0.0, 1.0, 1.0)
             image_xref = source_xref = 0
             if metadata is not None:
-                image_xref, _content_xref, source_xref, crop = metadata
+                image_xref, _content_xref, source_xref, crop = self._checked_image_source(metadata, page)
             if image_xref <= 0:
                 resolved = self._resolve_image_marker(annotation, page)
                 if resolved is None:
@@ -20378,14 +23505,22 @@ class AnnotationsMixin:
                 image_xref, _content_xref, source_xref = resolved
                 crop = QRectF(0.0, 0.0, 1.0, 1.0)
             try:
-                data = self.document.extract_image(image_xref).get("image", b"")
+                extracted = self.document.extract_image(image_xref)
+                data = extracted.get("image", b"")
+                mask_xref = int(extracted.get("smask") or 0)
+                mask = (
+                    self.document.extract_image(mask_xref).get("image", b"") if mask_xref > 0 else b""
+                )
             except Exception:
                 return None
             if not data:
                 return None
             return {
-                "kind": "image", "rect": rect, "data": data,
+                "kind": "image", "rect": rect, "data": data, "mask": mask,
                 "source": source_xref or 0, "crop": QRectF(crop),
+                # Pasted into this same document, the copy draws the very
+                # same picture rather than a second copy of it (6.1).
+                "document": id(self.document), "xref": image_xref,
             }
         if subject.startswith("SumiRichText"):
             html = self._freetext_rich_html(annotation)
@@ -20457,9 +23592,26 @@ class AnnotationsMixin:
         crop = QRectF(capture.get("crop") or QRectF(0.0, 0.0, 1.0, 1.0))
         rect = fitz.Rect(capture["rect"]) + shift
         contents_before = set(page.get_contents())
-        new_image_xref = page.insert_image(
-            rect, stream=data, keep_proportion=False, overlay=True
-        )
+        same_document = capture.get("document") == id(self.document)
+        reuse = int(capture.get("xref") or 0) if same_document else 0
+        if reuse and self.document.xref_get_key(reuse, "Subtype")[1] != "/Image":
+            reuse = 0  # undone or deleted since it was copied
+        if reuse:
+            new_image_xref = page.insert_image(
+                rect, xref=reuse, keep_proportion=False, overlay=True
+            )
+        else:
+            mask = capture.get("mask") or None
+            new_image_xref = page.insert_image(
+                rect, stream=data, mask=mask, keep_proportion=False, overlay=True
+            )
+        if not same_document or (
+            source_xref and self.document.xref_get_key(source_xref, "Subtype")[1] != "/Image"
+        ):
+            # The original's number belongs to the document it was copied
+            # from: here it named some other object, and cropping the copy
+            # again cut a stranger's picture. The copy is its own original.
+            source_xref, crop = 0, QRectF(0.0, 0.0, 1.0, 1.0)
         copy = page.add_rect_annot(rect)
         copy.set_border(width=0)
         copy.set_colors(stroke=[])
@@ -20473,6 +23625,7 @@ class AnnotationsMixin:
             )
         )
         copy.update()
+        self._keep_image_source(copy.xref, source_xref or new_image_xref, new_image_xref)
         return copy.xref
 
     def _create_captured_rich_text(
@@ -20582,7 +23735,7 @@ class AnnotationsMixin:
         self._mark_dirty()
         self.schedule_render(immediate=True)
         return self._report_annotation_outcome(
-            changed, total, "{count}個の注釈の線の太さを変えました"
+            changed, total, "{count}個の注釈の線の太さを変更しました"
         )
 
     def save_selected_image(self, marker_xref: int, target: str | None = None) -> str | None:
@@ -20690,7 +23843,7 @@ class AnnotationsMixin:
         self._mark_dirty()
         self.schedule_render(immediate=True)
         return self._report_annotation_outcome(
-            changed, total, "{count}個の注釈の色を変えました"
+            changed, total, "{count}個の注釈の色を変更しました"
         )
 
     def _start_image_crop(self, marker_xref: int) -> None:
@@ -20740,7 +23893,7 @@ class AnnotationsMixin:
         self.status_label.setText(
             tr("注釈を選択中")
             if count == 1
-            else tr_n("{count}個の注釈を範囲選択", count).format(count=count)
+            else tr_n("{count}個の注釈を選択中", count).format(count=count)
         )
 
     def _select_at_screen_point(self, screen_point: QPointF) -> None:
@@ -20856,8 +24009,18 @@ class AnnotationsMixin:
         failures: list[str] = []
         for image_xref, content_xref in image_references:
             try:
-                if not self._hide_page_image(page, image_xref, content_xref):
+                if self._hide_page_image(page, image_xref, content_xref):
+                    # Drawn by nothing now: out of the resources, so the
+                    # save leaves it out (6.1).
+                    drop_undrawn_xobjects(
+                        self.document, page_index, self._image_names(page, image_xref)
+                    )
+                elif not self._image_drawn_elsewhere(page_index, image_xref):
                     page.delete_image(image_xref)
+                else:
+                    # delete_image() blanks the picture itself: every page
+                    # showing it -- a duplicated page, a logo -- lost it.
+                    failures.append(f"image {image_xref} is shown on other pages too")
             except Exception as exc:
                 failures.append(str(exc))
         for baked_rect, baked_content_xref in baked_boxes:
@@ -21092,7 +24255,7 @@ class AnnotationsMixin:
             focus.cut()
             return
         if not self._has_edit_selection():
-            self.status_label.setText(tr("切り取り対象を選択してください"))
+            self.status_label.setText(tr("切り取るものを選択してください"))
             return
         self.copy_selection()
         self.delete_selected_annotations()
@@ -21201,7 +24364,7 @@ class TextBoxBakingMixin:
                 )
         if not rules:
             return "", None
-        return "\n".join(rules), fitz.Archive(str(_windows_fonts_dir()))
+        return "\n".join(rules), text_box_font_archive()
 
     def _bake_rich_text_box(
         self, page: fitz.Page, rect: fitz.Rect, html: str, families: set[str],
@@ -21223,22 +24386,31 @@ class TextBoxBakingMixin:
             rect.x0 + max(rect.width, width), rect.y0 + max(rect.height, height + 1.0),
         )
         contents_before = set(page.get_contents())
-        for attempt in (box, fitz.Rect(box.x0, box.y0, box.x1, max(box.y1, page.rect.y1))):
+
+        def write(target: fitz.Rect, scale_low: float, scale_word_width: bool) -> float:
+            # insert_htmlbox's steps with the fonts cut down to the
+            # characters of the box (6.1): it embedded each font whole, a
+            # Japanese one several megabytes, in every box and every edit.
             try:
-                # A line a hair wider than the box is not scaled down either.
-                spare, _scale = page.insert_htmlbox(
-                    attempt, html, css=css, archive=archive, scale_low=1,
-                    _scale_word_width=False,
+                spare, _scale = insert_html_subset(
+                    page, target, html, css=css, archive=archive,
+                    scale_low=scale_low, scale_word_width=scale_word_width,
                 )
-            except TypeError:
+            except (AttributeError, TypeError):
+                # A PyMuPDF without the Story calls used: whole fonts, but
+                # the box is on the page.
                 spare, _scale = page.insert_htmlbox(
-                    attempt, html, css=css, archive=archive, scale_low=1
+                    target, html, css=css, archive=archive, scale_low=scale_low
                 )
-            if spare >= 0:
+            return spare
+
+        for attempt in (box, fitz.Rect(box.x0, box.y0, box.x1, max(box.y1, page.rect.y1))):
+            # A line a hair wider than the box is not scaled down either.
+            if write(attempt, 1, False) >= 0:
                 break
         else:
             # Nothing was written: better smaller than lost.
-            page.insert_htmlbox(box, html, css=css, archive=archive)
+            write(box, 0, True)
         return self._new_page_content_xref(page, contents_before)
 
     @staticmethod
@@ -21293,7 +24465,7 @@ class TextBoxBakingMixin:
         if self.document is None:
             return 1.0
         xref = self._rich_text_content_xref(annotation)
-        if xref is None:
+        if xref is None or xref not in page.get_contents():
             return 1.0
         try:
             stream = self.document.xref_stream(xref).decode("latin-1")
@@ -21386,6 +24558,11 @@ class TextBoxBakingMixin:
         """
         if self.document is None:
             return
+        if content_xref is not None and content_xref not in page.get_contents():
+            # The number came with the mark from another page -- a duplicated
+            # or pasted page, a merged file -- and named that page's box:
+            # writing the copy again emptied the original (6.1).
+            content_xref = None
         if content_xref is None:
             content_xref = self._probe_rich_text_content_xref(page, rect)
         if content_xref is None:
@@ -21393,9 +24570,17 @@ class TextBoxBakingMixin:
             # than risk erasing content this box does not own.
             return
         try:
+            drawn = pdf_names_in(self.document.xref_stream(content_xref))
+        except Exception:
+            drawn = set()
+        try:
             self.document.update_stream(content_xref, b"")
         except Exception:
-            pass
+            return
+        # The form the stream drew, and the font in it, are drawn by nothing
+        # now. Left in the resources they went out with every save -- a
+        # whole font per edit (6.1).
+        drop_undrawn_xobjects(self.document, page.number, drawn)
 
 
 class ImagesMixin:
@@ -21435,11 +24620,11 @@ class ImagesMixin:
             return
         image = clipboard.image() if clipboard is not None else QImage()
         if image.isNull():
-            self.status_label.setText(tr("クリップボードに貼り付け可能な画像がありません"))
+            self.status_label.setText(tr("クリップボードに画像がありません"))
             return
-        encoded = self._qimage_png_bytes(image)
+        encoded = self._clipboard_image_bytes(image)
         if not encoded:
-            self.status_label.setText(tr("クリップボード画像を読み取れませんでした"))
+            self.status_label.setText(tr("クリップボードの画像を読み取れませんでした"))
             return
         aspect_ratio = image.width() / image.height() if image.height() else 1.4
         self._insert_page_image(
@@ -21447,6 +24632,32 @@ class ImagesMixin:
             aspect_ratio=aspect_ratio,
             source_name=tr("クリップボード画像"),
         )
+
+    @staticmethod
+    def _fully_opaque(image: QImage) -> bool:
+        if not image.hasAlphaChannel():
+            return True
+        alpha = image.convertToFormat(QImage.Format_Alpha8)
+        data = bytes(alpha.constBits())
+        stride, width = alpha.bytesPerLine(), alpha.width()
+        full = b"\xff" * width
+        return all(data[row * stride:row * stride + width] == full for row in range(alpha.height()))
+
+    def _clipboard_image_bytes(self, image: QImage) -> bytes:
+        """A picture from the clipboard as it is stored in the PDF.
+
+        It comes with an alpha channel whether it uses one or not, and as
+        PNG that meant a mask for nothing; a fully opaque picture leaves it
+        out. A photo -- a PNG three times the size of a good JPEG -- is
+        stored as JPEG; a screenshot, which PNG keeps small and sharp,
+        stays PNG (6.1)."""
+        if self._fully_opaque(image):
+            image = image.convertToFormat(QImage.Format_RGB888)
+        encoded = self._qimage_png_bytes(image)
+        if image.hasAlphaChannel() or len(encoded) < 512 * 1024:
+            return encoded
+        photo = self._qimage_jpeg_bytes(image)
+        return photo if photo and len(photo) * 3 <= len(encoded) else encoded
 
     def _insert_page_image(
         self,
@@ -21531,6 +24742,18 @@ class ImagesMixin:
 class PageOperationsMixin:
     """Whole-page commands: insert, delete, duplicate, rotate, extract, merge, split."""
 
+    def _commit_open_edits(self) -> bool:
+        """Write back an open text box, picture, shape or form field before a
+        command that takes pages out or moves them. Extracting a page or
+        splitting the document left what was being typed out of the file,
+        and a box left open over a page that moved was written to whichever
+        page took its place (6.2). False, with the reason on the status
+        bar, when the edit could not be written."""
+        if self._finish_active_overlays():
+            return True
+        self.status_label.setText(tr("編集を確定できなかったため中止しました"))
+        return False
+
     def _refresh_after_document_change(self, rebuild_navigation: bool = True) -> None:
         if self.document is None:
             return
@@ -21542,6 +24765,14 @@ class PageOperationsMixin:
         self.current_match_index = -1
         self.results_list.clear()
         self.match_label.clear()
+        if self.search_timer.isActive() and self.search_query:
+            # A search still going through the pages starts over. It went on
+            # from where it was, its earlier results gone and the pages
+            # shifted under it, and then gave its count as if it had read
+            # the whole document (6.2).
+            self._search_page_index = 0
+            self.match_label.setText(tr("検索中…"))
+            self.search_timer.start(1)
         if rebuild_navigation:
             self._populate_outline()
             self._start_thumbnails()
@@ -21551,6 +24782,8 @@ class PageOperationsMixin:
         self.schedule_render(immediate=True)
 
     def insert_blank_page(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         page = self.document[self.page_index]
@@ -21564,6 +24797,8 @@ class PageOperationsMixin:
         self._refresh_after_document_change()
 
     def insert_pdf_pages(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         path, _filter = QFileDialog.getOpenFileName(self, tr("追加するPDFを選択"), str(Path.home()), tr("PDFファイル (*.pdf)"))
@@ -21573,10 +24808,14 @@ class PageOperationsMixin:
         try:
             source = fitz.open(path)
             if source.needs_pass:
-                QMessageBox.warning(self, APP_NAME, tr("パスワード保護されたPDFのページ追加には対応していません。"))
+                QMessageBox.warning(self, APP_NAME, tr("パスワードで保護されたPDFからはページを追加できません。"))
                 return
             self._snapshot_for_edit()
             self.document.insert_pdf(source, start_at=self.page_index + 1)
+            # Marks made by pdfNote in that file name its objects, not ours.
+            neutralize_marker_xrefs_on(
+                self.document, range(self.page_index + 1, self.page_index + 1 + len(source))
+            )
             session = self._current_session()
             if session is not None and pdf_is_protected(source):
                 session.pages_from_protected_pdf = True
@@ -21591,10 +24830,12 @@ class PageOperationsMixin:
                 source.close()
 
     def delete_current_page(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         if len(self.document) <= 1:
-            QMessageBox.information(self, APP_NAME, tr("PDFには最低1ページ必要です。"))
+            QMessageBox.information(self, APP_NAME, tr("PDFには1ページ以上必要です。"))
             return
         self._snapshot_for_edit()
         self.document.delete_page(self.page_index)
@@ -21602,6 +24843,8 @@ class PageOperationsMixin:
         self._refresh_after_document_change()
 
     def duplicate_current_page(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         # Through a one-page copy of the open document. Serialising the whole
@@ -21614,6 +24857,13 @@ class PageOperationsMixin:
             piece.insert_pdf(self.document, from_page=self.page_index, to_page=self.page_index)
             checkpoint = self._begin_edit()
             self.document.insert_pdf(piece, start_at=self.page_index + 1)
+            # The copy draws the original's own pictures and fonts: it used
+            # to carry a second copy of each, a scanned page a second scan.
+            # And its marks name its own objects -- they named the
+            # original's, and writing the copy's text box again emptied the
+            # original's (6.1).
+            share_resources_with(self.document, self.page_index, self.page_index + 1)
+            remap_copied_marks(self.document, self.page_index, self.page_index + 1)
         except Exception as exc:
             # A damaged page (its contents missing, say) cannot be copied.
             self._page_edit_failed(checkpoint, exc)
@@ -21624,6 +24874,8 @@ class PageOperationsMixin:
         self._refresh_after_document_change()
 
     def rotate_pdf_page(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         checkpoint = self._begin_edit()
@@ -21636,6 +24888,8 @@ class PageOperationsMixin:
         self._refresh_after_document_change()
 
     def extract_current_page(self) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         selected, _filter = QFileDialog.getSaveFileName(
@@ -21647,8 +24901,16 @@ class PageOperationsMixin:
         try:
             output.insert_pdf(self.document, from_page=self.page_index, to_page=self.page_index)
             # A page taken out of a protected PDF keeps its encryption and
-            # usage restrictions (see protection_options).
-            output.save(selected, **protection_options(self.document, self.password))
+            # usage restrictions (see protection_options). Through a
+            # temporary file, as a save is: it was written straight over the
+            # file chosen, and a failure halfway left half a PDF there (6.2).
+            write_file_atomically(
+                selected,
+                output.tobytes(
+                    **compact_page_copy(output),
+                    **protection_options(self.document, self.password),
+                ),
+            )
             self.status_label.setText(
             tr("ページを書き出しました: {path}").format(path=selected)
         )
@@ -21661,7 +24923,7 @@ class PageOperationsMixin:
 
     def merge_pdfs(self) -> None:
         paths, _filter = QFileDialog.getOpenFileNames(
-            self, tr("結合するPDFを選択（2つ以上、複数選択可）"), str(Path.home()), tr("PDFファイル (*.pdf)")
+            self, tr("結合するPDFを選択（2つ以上）"), str(Path.home()), tr("PDFファイル (*.pdf)")
         )
         if len(paths) < 2:
             return
@@ -21676,7 +24938,7 @@ class PageOperationsMixin:
                         QMessageBox.warning(
                             self,
                             APP_NAME,
-                            tr("パスワード保護されたPDFは結合に使用できません: {name}").format(
+                            tr("パスワードで保護されたPDFは結合できません: {name}").format(
                                 name=Path(path).name
                             ),
                         )
@@ -21685,7 +24947,10 @@ class PageOperationsMixin:
                     if pdf_is_protected(source):
                         protected = True
                         permissions &= pdf_permissions(source)
+                    first = len(merged)
                     merged.insert_pdf(source)
+                    # Marks made by pdfNote in that file name its objects.
+                    neutralize_marker_xrefs_on(merged, range(first, len(merged)))
                 finally:
                     source.close()
             if protected:
@@ -21768,6 +25033,8 @@ class PageOperationsMixin:
         self._show_light_dismiss_dialog(dialog)
 
     def _run_split_pdf(self, page_count: int, split_each_page: bool, range_text: str) -> None:
+        if not self._commit_open_edits():
+            return
         if self.document is None:
             return
         if split_each_page:
@@ -21778,12 +25045,12 @@ class PageOperationsMixin:
                 QMessageBox.warning(
                     self,
                     APP_NAME,
-                    tr("無効なページ範囲です: {range}").format(range=range_text),
+                    tr("ページ範囲が正しくありません: {range}").format(range=range_text),
                 )
                 return
             ranges = parsed
         folder = QFileDialog.getExistingDirectory(
-            self, tr("分割したファイルの保存先フォルダを選択"), str(Path.home())
+            self, tr("分割したファイルの保存先フォルダーを選択"), str(Path.home())
         )
         if not folder:
             return
@@ -21811,19 +25078,32 @@ class PageOperationsMixin:
             if answer != QMessageBox.Yes:
                 return
         protection = protection_options(self.document, self.password)
-        try:
-            for (start, end), name in zip(ranges, names):
-                piece = fitz.open()
-                try:
-                    piece.insert_pdf(self.document, from_page=start, to_page=end)
-                    piece.save(str(output_dir / name), **protection)
-                finally:
-                    piece.close()
-        except Exception as exc:
-            QMessageBox.critical(
-                self, APP_NAME, tr("PDFを分割できませんでした。\n\n{error}").format(error=exc)
-            )
-            return
+        # Each file is written whole or not at all (write_file_atomically):
+        # they were written straight to their names, and a failure left a
+        # broken file -- over one that had been asked to be replaced -- and
+        # did not say which had been written (6.2). The files written stay;
+        # the message says how far it got.
+        written = 0
+        for (start, end), name in zip(ranges, names):
+            piece = fitz.open()
+            try:
+                piece.insert_pdf(self.document, from_page=start, to_page=end)
+                write_file_atomically(
+                    output_dir / name, piece.tobytes(**compact_page_copy(piece), **protection)
+                )
+            except Exception as exc:
+                if written:
+                    message = tr(
+                        "PDFを分割できませんでした。{total}個のうち{done}個のファイルは書き出しました。"
+                        "「{name}」から先は書き出していません。\n\n{error}"
+                    ).format(total=len(ranges), done=written, name=name, error=exc)
+                else:
+                    message = tr("PDFを分割できませんでした。\n\n{error}").format(error=exc)
+                QMessageBox.critical(self, APP_NAME, message)
+                return
+            finally:
+                piece.close()
+            written += 1
         self.status_label.setText(
             tr_n("{count}個のファイルに分割しました: {folder}", len(ranges)).format(
                 count=len(ranges), folder=output_dir
@@ -21964,6 +25244,7 @@ class SavePrintMixin:
             # save and undo snapshot pays for a full garbage-collecting
             # rewrite it no longer needs.
             session.needs_full_rewrite = False
+            session.shrink_estimate = None
             self._clear_recovery_snapshot(session)
             self.settings.add(str(target))
             self.document_tabs.setTabText(self.current_session_index, session.title)
@@ -22024,17 +25305,324 @@ class SavePrintMixin:
         if not page_indices:
             self.status_label.setText(tr("印刷するページがありません"))
             return
-        # A file-based destination (Microsoft Print to PDF and similar) makes
-        # Windows show its own native "Save As" prompt the moment painter.begin()
-        # below actually starts the job -- a second, OS-level dialog the user
-        # must also complete. Raise the window and say so, so it doesn't look
-        # like printing silently did nothing while that prompt is waiting
-        # (possibly not on top) for input.
+        # A file-based destination makes Windows show its own native "Save
+        # As" prompt the moment painter.begin() below actually starts the job
+        # -- a second, OS-level dialog the user must also complete. Raise the
+        # window and say so, so it doesn't look like printing silently did
+        # nothing while that prompt is waiting (possibly not on top) for
+        # input. Microsoft Print to PDF is not printed to at all (6.1):
+        # pdfNote asks where to save and writes the PDF itself.
         self.raise_()
         self.activateWindow()
         self.status_label.setText(tr("印刷を準備しています…"))
         QApplication.processEvents()
+        if is_pdf_writer_printer(printer.printerName()):
+            self._print_to_pdf_file(printer, page_indices, layout_options)
+            return
         self._run_print(printer, page_indices, layout_options)
+
+    def _print_to_pdf_file(
+        self,
+        printer: QPrinter,
+        page_indices: list[int],
+        layout_options: dict[str, object] | None = None,
+    ) -> bool:
+        """Microsoft Print to PDF: pdfNote writes the PDF itself.
+
+        Printing hands a printer each page as one picture the size of the
+        sheet (up to 12 million pixels), and Microsoft Print to PDF puts
+        that picture in its file as it is: a page of text a few kilobytes
+        long became several hundred, a page with a photo several megabytes,
+        and none of the text could be selected or found any more. The PDF
+        written here has the same sheets -- paper, margins, pages per
+        sheet, scaling, order, copies, grayscale -- with the pages on them
+        as they are, text and all."""
+        if self.document is None or not page_indices:
+            return False
+        stem = Path(self.file_path).stem if self.file_path else Path(tr("無題.pdf")).stem
+        folder = Path(
+            QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
+        )
+        open_paths = {
+            str(Path(session.file_path).resolve()) for session in self.sessions if session.file_path
+        }
+        initial = folder / f"{stem}.pdf"
+        if str(initial.resolve()) in open_paths:
+            initial = folder / f"{stem} ({tr('印刷')}).pdf"
+        selected, _filter = QFileDialog.getSaveFileName(
+            self, tr("PDFとして保存"), str(initial), tr("PDFファイル (*.pdf)")
+        )
+        if not selected:
+            self.status_label.setText(tr("印刷を取り消しました"))
+            return False
+        if not selected.lower().endswith(".pdf"):
+            selected += ".pdf"
+        target = Path(selected).resolve()
+        if str(target) in open_paths:
+            QMessageBox.warning(
+                self, APP_NAME, tr("開いているPDFには上書きできません。別の名前を指定してください。")
+            )
+            return False
+        layout = printer.pageLayout()
+        full = layout.fullRect(QPageLayout.Point)
+        paint = layout.paintRect(QPageLayout.Point)
+        temp_path: Path | None = None
+        try:
+            data = self._build_print_pdf(
+                page_indices,
+                (full.width(), full.height()),
+                fitz.Rect(paint.left(), paint.top(), paint.right(), paint.bottom()),
+                grayscale=printer.colorMode() == QPrinter.GrayScale,
+                copies=max(1, printer.copyCount()),
+                collate=printer.collateCopies(),
+                **(layout_options or {}),
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Through a temporary file, as a save does: an interrupted write
+            # never leaves half a file where the user asked for one.
+            file_descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
+            )
+            temp_path = Path(temp_name)
+            with os.fdopen(file_descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, target)
+            temp_path = None
+        except Exception as exc:
+            QMessageBox.critical(
+                self, APP_NAME, tr("PDFを書き出せませんでした。\n\n{error}").format(error=exc)
+            )
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.status_label.setText(tr("PDFに書き出しました: {path}").format(path=target))
+        return True
+
+    def _build_print_pdf(
+        self,
+        page_indices: list[int],
+        sheet_size: tuple[float, float],
+        paint_rect: fitz.Rect,
+        per_sheet: int = 1,
+        scale_mode: str = "fit",
+        scale_percent: float = 100.0,
+        grid: tuple[int, int] | None = None,
+        order: str = "across",
+        grayscale: bool = False,
+        copies: int = 1,
+        collate: bool = True,
+    ) -> bytes:
+        """The sheets of a print job as a PDF, laid out exactly as
+        _paint_pages_to_printer() lays them on paper, in points.
+
+        Each page goes onto its sheet as itself (show_pdf_page), so its text
+        is still text. Annotations are drawn into the pages, as printed;
+        pdfNote's marks, which draw nothing, are left out, so nothing on the
+        result moves or edits as pdfNote's objects any more -- this is a
+        print. Then it is made as small as it goes: pictures no finer than
+        the sheet needs, fonts cut down to the characters shown, nothing
+        the sheets do not draw, every object once and compressed. A
+        protected PDF's restrictions stay on it (protection_options)."""
+        if self.document is None or not page_indices:
+            raise ValueError(tr("印刷するページがありません"))
+        unique = sorted(set(page_indices))
+        position = {page: index for index, page in enumerate(unique)}
+        source = fitz.open()
+        output = fitz.open()
+        try:
+            runs: list[list[int]] = []
+            for page in unique:
+                if runs and runs[-1][1] == page - 1:
+                    runs[-1][1] = page
+                else:
+                    runs.append([page, page])
+            for start, end in runs:
+                source.insert_pdf(self.document, from_page=start, to_page=end)
+            for page in source:
+                marks = [
+                    xref for xref, _kind, _name in page.annot_xrefs()
+                    if source.xref_get_key(xref, "Subj")[1].startswith(
+                        ("SumiRichText", "SumiEditableImage")
+                    )
+                ]
+                for xref in marks:
+                    page.delete_annot(page.load_annot(xref))
+            source.bake(annots=True, widgets=True)
+            for page in source:
+                # show_pdf_page() does not turn a page by its own /Rotate:
+                # turned into its content here, only the view's turn is left.
+                if page.rotation:
+                    page.remove_rotation()
+
+            target = fitz.Rect(paint_rect)
+            columns, rows = self._nup_grid(
+                max(1, per_sheet),
+                QRect(0, 0, max(1, round(target.width)), max(1, round(target.height))),
+                grid,
+            )
+            slots = columns * rows
+            sheets = [page_indices[start:start + slots] for start in range(0, len(page_indices), slots)]
+            gutter = 0.0 if slots == 1 else min(target.width, target.height) * 0.012
+            cell_width = target.width / columns
+            cell_height = target.height / rows
+            turned = self.extra_rotation in (90, 270)
+            placements: list[tuple[int, int, fitz.Rect, fitz.Rect]] = []
+            largest = 0.0
+            for sheet_number, sheet in enumerate(sheets):
+                for slot, page_index in enumerate(sheet):
+                    if order == "down":
+                        column, row = divmod(slot, rows)
+                    else:
+                        row, column = divmod(slot, columns)
+                    cell = fitz.Rect(
+                        target.x0 + column * cell_width + gutter,
+                        target.y0 + row * cell_height + gutter,
+                        target.x0 + (column + 1) * cell_width - gutter,
+                        target.y0 + (row + 1) * cell_height - gutter,
+                    )
+                    bounds = source[position[page_index]].rect
+                    width, height = (bounds.height, bounds.width) if turned else (bounds.width, bounds.height)
+                    if scale_mode == "fit":
+                        ratio = min(cell.width / max(1.0, width), cell.height / max(1.0, height))
+                    else:
+                        ratio = scale_percent / 100.0 if scale_mode == "percent" else 1.0
+                    left = cell.x0 + (cell.width - width * ratio) / 2.0
+                    top = cell.y0 + (cell.height - height * ratio) / 2.0
+                    drawn = fitz.Rect(left, top, left + width * ratio, top + height * ratio)
+                    placements.append((sheet_number, position[page_index], cell, drawn))
+                    if source[position[page_index]].get_images():
+                        largest = max(largest, ratio)
+
+            # Pictures finer than the sheet shows them: the largest a page
+            # is drawn decides, so no page gets less than the target.
+            try:
+                source.rewrite_images(
+                    options=self._print_image_options(PRINT_PDF_IMAGE_DPI * max(largest, 0.05))
+                )
+            except Exception:
+                pass
+
+            sheet_width, sheet_height = sheet_size
+            for _sheet in sheets:
+                output.new_page(width=sheet_width, height=sheet_height)
+            for sheet_number, source_index, cell, drawn in placements:
+                page = output[sheet_number]
+                before = set(page.get_contents())
+                page.show_pdf_page(
+                    drawn, source, source_index, rotate=-self.extra_rotation, keep_proportion=False
+                )
+                if drawn.x0 < cell.x0 - 0.01 or drawn.y0 < cell.y0 - 0.01 or (
+                    drawn.x1 > cell.x1 + 0.01 or drawn.y1 > cell.y1 + 0.01
+                ):
+                    # Larger than its cell: cut off at the cell, as on paper.
+                    clip = b"q %.3f %.3f %.3f %.3f re W n\n" % (
+                        cell.x0, sheet_height - cell.y1, cell.width, cell.height
+                    )
+                    for xref in page.get_contents():
+                        if xref not in before:
+                            output.update_stream(xref, clip + output.xref_stream(xref) + b"\nQ\n")
+            if grayscale:
+                self._grey_sheets(output)
+            copies = max(1, int(copies))
+            if copies > 1:
+                count = len(output)
+                output.select(
+                    list(range(count)) * copies
+                    if collate
+                    else [index for index in range(count) for _copy in range(copies)]
+                )
+            prune_unused_resources(output)
+            try:
+                output.subset_fonts()
+            except Exception:
+                pass
+            output.set_metadata(
+                {
+                    "title": Path(self.file_path).stem if self.file_path else "",
+                    "creator": APP_NAME,
+                }
+            )
+            return output.tobytes(
+                garbage=4,
+                deflate=True,
+                deflate_images=True,
+                deflate_fonts=True,
+                use_objstms=1,
+                **protection_options(self.document, self.password),
+            )
+        finally:
+            source.close()
+            output.close()
+
+    @staticmethod
+    def _grey_sheets(output: fitz.Document) -> None:
+        """Print in grayscale: every sheet ends with a rectangle over it that
+        keeps the lightness of what is under it and takes its colour away
+        (blend mode Saturation, with a grey of no saturation). The pages
+        stay as they are -- text, vectors, pictures -- and show grey.
+        MuPDF's recolor() striped photos and lost a highlight's blending."""
+        state = output.get_new_xref()
+        output.update_object(state, "<< /Type /ExtGState /BM /Saturation >>")
+        for page in output:
+            kind, value = output.xref_get_key(page.xref, "Resources")
+            if kind != "xref":
+                continue
+            resources = int(value.split()[0])
+            states = output.xref_get_key(resources, "ExtGState")
+            if states[0] == "xref":
+                output.xref_set_key(int(states[1].split()[0]), "pdfNoteGrey", f"{state} 0 R")
+            elif states[0] == "dict":
+                output.xref_set_key(
+                    resources, "ExtGState", states[1].rstrip(">").rstrip() + f" /pdfNoteGrey {state} 0 R >>"
+                )
+            else:
+                output.xref_set_key(resources, "ExtGState", f"<< /pdfNoteGrey {state} 0 R >>")
+            bounds = page.mediabox
+            area = f"{bounds.x0:.3f} {bounds.y0:.3f} {bounds.width:.3f} {bounds.height:.3f} re f"
+            # The paper first: where nothing is drawn the blend needs white
+            # under it, or a sheet with transparency came out grey all over.
+            paper, cover = output.get_new_xref(), output.get_new_xref()
+            for xref, stream in ((paper, f"q 1 g {area} Q"), (cover, f"q /pdfNoteGrey gs 0.5 g {area} Q")):
+                output.update_object(xref, "<<>>")
+                output.update_stream(xref, stream.encode("ascii"))
+            contents = [paper] + page.get_contents() + [cover]
+            output.xref_set_key(
+                page.xref, "Contents", "[" + " ".join(f"{xref} 0 R" for xref in contents) + "]"
+            )
+
+    @staticmethod
+    def _print_image_options(dpi: float) -> Any:
+        """How the pictures of a print to PDF are rewritten: those finer than
+        `dpi` brought down to it, photos as JPEG, the rest losslessly,
+        black-and-white as fax; a picture only replaced when that is smaller."""
+        from pymupdf import mupdf
+
+        options = mupdf.PdfImageRewriterOptions()
+        target = max(36, round(dpi))
+        threshold = round(target * 1.5) + 1
+        for kind, method, quality in (
+            ("color_lossy", mupdf.FZ_RECOMPRESS_JPEG, PRINT_PDF_JPEG_QUALITY),
+            ("gray_lossy", mupdf.FZ_RECOMPRESS_JPEG, PRINT_PDF_JPEG_QUALITY),
+            ("color_lossless", mupdf.FZ_RECOMPRESS_LOSSLESS, 0),
+            ("gray_lossless", mupdf.FZ_RECOMPRESS_LOSSLESS, 0),
+        ):
+            setattr(options, f"{kind}_image_recompress_method", method)
+            setattr(options, f"{kind}_image_subsample_method", mupdf.FZ_SUBSAMPLE_AVERAGE)
+            setattr(options, f"{kind}_image_subsample_threshold", threshold)
+            setattr(options, f"{kind}_image_subsample_to", target)
+            setattr(options, f"{kind}_image_recompress_quality", str(quality))
+        options.bitonal_image_recompress_method = mupdf.FZ_RECOMPRESS_FAX
+        options.bitonal_image_subsample_method = mupdf.FZ_SUBSAMPLE_AVERAGE
+        options.bitonal_image_subsample_threshold = threshold * 2
+        options.bitonal_image_subsample_to = target * 2
+        options.recompress_when = mupdf.FZ_RECOMPRESS_WHEN_SMALLER
+        return options
 
 
     # Sheets are filled left to right, top to bottom. The wider arrangement
@@ -22126,8 +25714,18 @@ class SavePrintMixin:
             cell_width = target.width() / columns
             cell_height = target.height() / rows
             for sheet_number, sheet in enumerate(sheets):
-                if sheet_number > 0:
-                    printer.newPage()
+                # The printer says when it cannot take another sheet -- a
+                # full disk under a PDF printer, a driver error. That went
+                # unheard and the print was reported sent (6.2).
+                if sheet_number > 0 and not printer.newPage():
+                    if not preview:
+                        QMessageBox.critical(
+                            self,
+                            APP_NAME,
+                            tr("プリンターが {sheet} 枚目を受け付けませんでした。"
+                               "印刷データは最後まで送信されていません。").format(sheet=sheet_number + 1),
+                        )
+                    return False
                 for slot, page_index in enumerate(sheet):
                     if order == "down":
                         # Fill the first column top to bottom, then move to
@@ -22188,7 +25786,15 @@ class SavePrintMixin:
                     )
                     painter.restore()
         finally:
-            painter.end()
+            ended = painter.end()
+        if not ended or printer.printerState() in (QPrinter.Error, QPrinter.Aborted):
+            if not preview:
+                QMessageBox.critical(
+                    self,
+                    APP_NAME,
+                    tr("印刷データを最後まで送信できませんでした。プリンターの状態をご確認ください。"),
+                )
+            return False
         return True
 
     def _run_print(
@@ -22200,7 +25806,7 @@ class SavePrintMixin:
         if self._paint_pages_to_printer(
             printer, page_indices, **(layout_options or {})
         ):
-            self.status_label.setText(tr("印刷を送信しました"))
+            self.status_label.setText(tr("プリンターに送信しました"))
 
 
 class InfoDialogsMixin:
@@ -22352,6 +25958,17 @@ class InfoDialogsMixin:
         buttons.button(QDialogButtonBox.Close).setText(tr("閉じる"))
         buttons.rejected.connect(dialog.reject)
         outer.addWidget(buttons)
+        # Wide enough for the longest row, so that no description hides
+        # behind a horizontal scroll bar: Russian, German, Latin and Ancient
+        # Greek ran past 560 (6.4). Never wider than the screen.
+        margins = outer.contentsMargins()
+        wanted = (
+            content.sizeHint().width() + scroll.verticalScrollBar().sizeHint().width()
+            + margins.left() + margins.right() + 2 * scroll.frameWidth()
+        )
+        screen = self.screen() or QApplication.primaryScreen()
+        limit = screen.availableGeometry().width() - 40 if screen is not None else wanted
+        dialog.resize(max(560, min(wanted, limit)), 620)
         dialog._guide_rows = guide_rows  # type: ignore[attr-defined]
         return dialog
 
@@ -22378,8 +25995,8 @@ class InfoDialogsMixin:
             + "<p>"
             + html.escape(
                 tr(
-                    "マウスは猫に、あなたの手はキーボードに。"
-                    "あなたの情熱で未来を動かすショートカット志向のPDFエディターです。"
+                    "マウスはにゃんこに、あなたの手はキーボードに。"
+                    "情熱で未来を動かすショートカット志向のPDFエディターです。"
                 ).format(app=APP_NAME)
             )
             + "</p>"
@@ -22444,6 +26061,66 @@ class InfoDialogsMixin:
             ("OpenSSL", openssl, "Apache-2.0"),
             ("PyInstaller bootloader", PYINSTALLER_VERSION, "GPL-2.0-or-later WITH Bootloader-exception"),
         ]
+
+    def offer_default_pdf_app(self, force: bool = False) -> str:
+        """At start: when PDFs do not open with pdfNote, ask whether to make
+        it the default, unless asked never to again. What happened, for the
+        test suite: "skipped", "never", "default", "unknown", "declined",
+        "opened" (Settings is open) or "failed"."""
+        if not force and (self.test_mode or sys.platform != "win32"):
+            return "skipped"
+        if self.settings.data.get("default_app_prompt") == "never":
+            return "never"
+        status = pdfnote_is_default_pdf_app()
+        if status is None:
+            return "unknown"
+        if status:
+            return "default"
+        make_default, never_again = self._ask_default_pdf_app()
+        if never_again:
+            self.settings.data["default_app_prompt"] = "never"
+            self.settings.save()
+        if not make_default:
+            return "declined"
+        if not open_default_apps_settings():
+            self.status_label.setText(tr("Windows の設定を開けませんでした"))
+            return "failed"
+        self.status_label.setText(tr("Windows の設定で「.pdf」に pdfNote を選んでください"))
+        self._watch_default_pdf_app()
+        return "opened"
+
+    def _ask_default_pdf_app(self) -> tuple[bool, bool]:
+        """The question: (make it the default, never ask again)."""
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Question)
+        box.setText(tr("PDF を開く既定のアプリが pdfNote ではありません。"))
+        box.setInformativeText(
+            tr("PDF をダブルクリックしたときに pdfNote で開くようにしますか？"
+               "Windows の設定が開くので、「.pdf」に pdfNote を選んでください。")
+        )
+        make_default = box.addButton(tr("既定のアプリにする"), QMessageBox.AcceptRole)
+        box.addButton(tr("今はしない"), QMessageBox.RejectRole)
+        box.setDefaultButton(make_default)
+        never_again = QCheckBox(tr("今後このメッセージを表示しない"))
+        box.setCheckBox(never_again)
+        self._default_app_box = box
+        try:
+            box.exec()
+            return box.clickedButton() is make_default, never_again.isChecked()
+        finally:
+            self._default_app_box = None
+            box.deleteLater()
+
+    def _watch_default_pdf_app(self, tries: int = 90) -> None:
+        """Look every two seconds, for three minutes, for the choice made
+        in Settings, and say so when it is made."""
+        if tries <= 0:
+            return
+        if pdfnote_is_default_pdf_app():
+            self.status_label.setText(tr("PDF を開く既定のアプリを pdfNote にしました"))
+            return
+        QTimer.singleShot(2000, lambda: self._watch_default_pdf_app(tries - 1))
 
     def show_license_info(self) -> None:
         """Licence, third-party notices, full licence texts and the usage
@@ -22523,14 +26200,14 @@ class InfoDialogsMixin:
         # cover what is inside them (MuPDF's fonts, Qt's libraries).
         pointer = QLabel(
             tr(
-                "各ソフトウェアに含まれるライブラリやフォントを含む詳しい一覧と、"
-                "ソースコードの入手先は、「{tab}」タブの「{document}」にあります。"
+                "各ソフトウェアに含まれるライブラリやフォントまで載せた一覧と、"
+                "ソース コードの入手先は、「{tab}」タブの「{document}」にあります。"
             ).format(tab=tr("ライセンス全文"), document="Third-Party Software Notices")
         )
         pointer.setWordWrap(True)
         pointer.setStyleSheet(f"color: {COLORS['muted']};")
         third_layout.addWidget(pointer)
-        tabs.addTab(third_party, tr("サードパーティ製ソフトウェア"))
+        tabs.addTab(third_party, tr("サード パーティ製ソフトウェア"))
 
         texts = QWidget()
         texts_layout = QVBoxLayout(texts)
@@ -22907,7 +26584,9 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         # Widgets whose own stylesheet names a palette colour, so a theme
         # change can re-run them (see _themed).
         self._themed_styles: list[tuple[Any, Callable[[], str]]] = []
-        self.settings = RecentFiles(disabled=test_mode)
+        self.settings = RecentFiles.shared(disabled=test_mode)
+        # Every font installed on this PC, before the toolbar lists them.
+        extend_text_box_fonts()
         # Dark, light, or whatever Windows is set to. Read before anything is
         # built: the stylesheet and every painted icon take their colours
         # from the palette this puts in place.
@@ -22973,8 +26652,9 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         self._last_click_on_page: tuple[int, fitz.Point] | None = None
         self._active_form_editor: QWidget | None = None
         self._active_form_xref: int | None = None
-        self._ocr_thread: QThread | None = None
-        self._ocr_worker: OcrWorker | None = None
+        self._ocr_worker: OcrProcess | None = None
+        self._ocr_download: OcrDataDownload | None = None
+        self._ocr_download_dialog: QProgressDialog | None = None
         self._ocr_applied_pages = 0
         self._ocr_session: "DocumentSession | None" = None
         self._ocr_language = ""
@@ -23019,9 +26699,6 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         self._annotation_clipboard_stamp: bytes | None = None
         # Set by a canvas commit that failed, read by the save path.
         self._overlay_commit_failed = False
-        # OCR threads that outlived their stop request: kept referenced
-        # so Qt never destroys a QThread that is still running.
-        self._abandoned_ocr_threads: list[QThread] = []
         self._moving_note_xref: int | None = None
         self._active_object_box: CanvasObjectBox | None = None
         self._active_object_xref: int | None = None
@@ -23134,7 +26811,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         self.continuous_timer = QTimer(self)
         self.continuous_timer.setSingleShot(True)
         self.continuous_timer.timeout.connect(self._render_visible_continuous_pages)
-        self._recovery_writer = RecoverySnapshotWriter()
+        self._recovery_writer = shared_recovery_writer()
         self.auto_save_timer = QTimer(self)
         self.auto_save_timer.setInterval(120_000)
         self.auto_save_timer.timeout.connect(self._auto_save_tick)
@@ -23794,10 +27471,15 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
                 return
         self._cancel_jobs()
         self.cancel_ocr()
-        self._stop_ocr_thread()
+        self._stop_ocr_process()
+        if self._ocr_download is not None:
+            self._ocr_download.cancel()
+            self._ocr_download.wait(2.0)
         # Let any queued recovery snapshot finish landing on disk before the
         # process goes away -- that is the whole point of having written it.
-        self._recovery_writer.close()
+        # The writer serves every window: the last one to close closes it.
+        if not any(window is not self for window in OPEN_WINDOWS):
+            self._recovery_writer.close()
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
@@ -23834,15 +27516,6 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
-        # A thread still inside a page would go with the window, running.
-        for thread in self._abandoned_ocr_threads:
-            try:
-                if thread.isRunning():
-                    thread.setParent(None)
-                    ORPHANED_OCR_THREADS.append(thread)
-            except RuntimeError:
-                continue
-        self._abandoned_ocr_threads = []
         # The Store asks about the licence through one window. If it was
         # this one, a window that stays takes over.
         client = StoreClient._shared
@@ -24403,6 +28076,36 @@ def _self_test_ocr(app: QApplication, temp_dir: Path) -> None:
         app.processEvents()
 
 
+def _self_test_ocr_process(app: QApplication, temp_dir: Path) -> None:
+    """OCR runs in a child process: pdfNote itself, started again with
+    --ocr-worker (6.2). The child has to start from this very executable
+    and report back -- a build that cannot would leave OCR doing nothing.
+    The page already has text, so it is skipped and Tesseract is not
+    needed."""
+    source = temp_dir / "ocr_child.pdf"
+    document = fitz.open()
+    document.new_page(width=595, height=842).insert_text(
+        (72, 100), "This page already has its text. " * 3, fontsize=11
+    )
+    document.save(source)
+    document.close()
+    process = OcrProcess(source.read_bytes(), [0], "eng", None, skip_threshold=1)
+    outcome: dict[str, Any] = {}
+    process.failed.connect(lambda message: outcome.setdefault("failed", message))
+    process.finished.connect(lambda cancelled: outcome.setdefault("finished", cancelled))
+    process.start()
+    deadline = time.monotonic() + 90
+    while "finished" not in outcome and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    if "finished" not in outcome:
+        process.stop()
+    assert "finished" in outcome, "the OCR child process did not finish"
+    assert "failed" not in outcome, f"the OCR child process failed: {outcome['failed']}"
+    assert process._worker_finished, "the OCR child process ended without reporting back"
+    process.deleteLater()
+
+
 def _self_test_journal() -> None:
     """Every mutation pdfNote makes must be journal-compatible for undo to
     run on the journal -- see journal_compatibility()."""
@@ -24448,6 +28151,20 @@ def _self_test_legal() -> None:
         assert QApplication.translate("QPlatformTheme", "&Yes") != "&Yes"
     finally:
         install_qt_translations(previous)
+
+
+def _self_test_languages() -> None:
+    """Every interface language is complete inside the executable: the
+    languages kept in i18n/ are data files a build can silently drop, and a
+    language without its file would show English (6.4)."""
+    for code, _name in LANGUAGES:
+        if code == "ja":
+            continue
+        missing = [key for key, values in TRANSLATIONS.items() if not values.get(code)]
+        assert not missing, f"{code}: {len(missing)} strings missing, first {missing[0]!r}"
+    for code in LANGUAGE_FILES:
+        assert install_qt_translations(code), f"Qt's own words missing for {code}"
+    install_qt_translations(I18N.current)
 
 
 def _self_test_store_projection() -> None:
@@ -24733,8 +28450,10 @@ def _run_self_test_steps(app: QApplication) -> int:
         _self_test_sanitize(app, temp_dir)
         _self_test_forms(app, temp_dir)
         _self_test_ocr(app, temp_dir)
+        _self_test_ocr_process(app, temp_dir)
         _self_test_journal()
         _self_test_legal()
+        _self_test_languages()
         _self_test_store_projection()
         return 0
     except Exception:
@@ -24941,25 +28660,55 @@ def window_for_request() -> Any:
     return OPEN_WINDOWS[-1] if OPEN_WINDOWS else None
 
 
-def when_no_dialog_is_up(action: Any, attempts: int = 300) -> None:
+# Requests from other launches waiting for a dialog to close, oldest first.
+PENDING_REQUESTS: list[Callable[[], None]] = []
+_REQUESTS_STATE = {"waiting": False, "running": False, "ticks": 0}
+
+
+def when_no_dialog_is_up(action: Any) -> None:
     """Run this once the reader is not in the middle of a dialog.
 
     A request from another launch arrives through the event loop, and a
     modal dialog is spinning that loop: acting now would load a document
     underneath Save As or Print. It is worth waiting for -- the launch has
-    already been told its file will open.
+    already been told its file will open. Requests wait in the order they
+    came for as long as the dialog stays up: they were dropped without a
+    word after two minutes (6.2).
     """
+    PENDING_REQUESTS.append(action)
+    if not _REQUESTS_STATE["waiting"]:
+        _run_pending_requests()
+
+
+def _run_pending_requests() -> None:
+    state = _REQUESTS_STATE
+    state["waiting"] = False
+    if state["running"]:
+        # A request being carried out has a dialog of its own up (a
+        # password, say); the loop below takes this one when it is done.
+        return
+    if QApplication.activeModalWidget() is None:
+        state["ticks"] = 0
+        state["running"] = True
+        try:
+            while PENDING_REQUESTS and QApplication.activeModalWidget() is None:
+                action = PENDING_REQUESTS.pop(0)
+                try:
+                    action()
+                except Exception:
+                    traceback.print_exc()
+        finally:
+            state["running"] = False
+    if not PENDING_REQUESTS:
+        return
     blocker = QApplication.activeModalWidget()
-    if blocker is None:
-        action()
-        return
-    if attempts <= 0:
-        return
-    if attempts % 8 == 0:
+    if blocker is not None and state["ticks"] % 8 == 4 and state["ticks"] < 300:
         # Show what is in the way, or double-clicking a PDF looks as
         # though nothing happened at all.
         present_window(blocker)
-    QTimer.singleShot(400, lambda: when_no_dialog_is_up(action, attempts - 1))
+    state["ticks"] += 1
+    state["waiting"] = True
+    QTimer.singleShot(400, _run_pending_requests)
 
 
 def open_in_running_instance(file_path: str) -> None:
@@ -25024,6 +28773,9 @@ def consent_language(settings: RecentFiles) -> str:
     if system.startswith("zh"):
         # Only Simplified Chinese exists; Traditional readers get English.
         return "zh_CN" if system in ("zh_CN", "zh_SG") else "en"
+    if system.startswith("pt"):
+        # Brazil's Portuguese for Brazil, Portugal's everywhere else.
+        return "pt_BR" if system == "pt_BR" else "pt_PT"
     code = system.split("_")[0]
     return code if code in dict(LANGUAGES) else "en"
 
@@ -25045,7 +28797,9 @@ class TermsNoticeDialog(QDialog):
         self.setWindowTitle(APP_NAME)
         if Path(resource_path("pdfNote.ico")).exists():
             self.setWindowIcon(app_icon())
-        self.setLayoutDirection(Qt.RightToLeft if I18N.current == "ar" else Qt.LeftToRight)
+        self.setLayoutDirection(
+            Qt.RightToLeft if I18N.current in RIGHT_TO_LEFT_LANGUAGES else Qt.LeftToRight
+        )
         self.resize(760, 640)
         layout = QVBoxLayout(self)
         heading = QLabel(tr("{app}をお使いいただく前に").format(app=APP_NAME))
@@ -25143,7 +28897,9 @@ def show_legal_document(parent: QWidget, title: str, files: dict[str, str]) -> N
     """One of the legal documents in a window of its own, over `parent`."""
     viewer = QDialog(parent)
     viewer.setWindowTitle(title)
-    viewer.setLayoutDirection(Qt.RightToLeft if I18N.current == "ar" else Qt.LeftToRight)
+    viewer.setLayoutDirection(
+        Qt.RightToLeft if I18N.current in RIGHT_TO_LEFT_LANGUAGES else Qt.LeftToRight
+    )
     viewer.resize(720, 560)
     layout = QVBoxLayout(viewer)
     layout.addWidget(legal_markdown_view(files), 1)
@@ -25186,7 +28942,9 @@ class PurchaseDialog(QDialog):
         self.offers: list[StoreOffer] = []
         self.chosen: StoreOffer | None = None
         self.setWindowTitle(tr("プレミアムの購入"))
-        self.setLayoutDirection(Qt.RightToLeft if I18N.current == "ar" else Qt.LeftToRight)
+        self.setLayoutDirection(
+            Qt.RightToLeft if I18N.current in RIGHT_TO_LEFT_LANGUAGES else Qt.LeftToRight
+        )
         self.resize(660, 640)
         layout = QVBoxLayout(self)
         self.status = QLabel(tr("Microsoft Store から商品と価格を読み込んでいます…"))
@@ -25321,7 +29079,7 @@ class PurchaseDialog(QDialog):
             ).format(renewal=store_renewal_text(offer))))
         rows.append((tr("返品・返金"), tr(
             "購入後の返金は、法令又は Microsoft の返金の規定による場合を除き、お受けできません。"
-            "pdfNote は GNU AGPL の下で提供され、そのソースコードは公開されています。"
+            "pdfNote は GNU AGPL の下で提供され、そのソース コードは公開されています。"
             "このことは返金の理由となりません。"
         )))
         cells = "".join(
@@ -25350,7 +29108,109 @@ class PurchaseDialog(QDialog):
         show_legal_document(self, title, files)
 
 
+# ---- crash reports (6.5) -------------------------------------------------
+# A crash reaches Microsoft through Windows Error Reporting, as far as the
+# Windows diagnostic-data setting allows, and the Store shows it in Partner
+# Center's Health report. A native crash (in MuPDF or Qt) already went that
+# way. An exception Python did not handle was printed to a console a windowed
+# program does not have, and pdfNote carried on in whatever state it left.
+# Now its traceback goes to crash.log on this PC, the open documents to the
+# recovery folder, and the process ends with a fail-fast whose code comes
+# from where the exception was raised, so Partner Center keeps different
+# faults apart. pdfNote itself sends nothing.
+CRASH_LOG_LIMIT = 256 * 1024
+# The tests record instead of ending the process ("fail": None).
+CRASH_HANDLER: dict[str, Any] = {"fail": None}
+UNHANDLED_EXCEPTIONS: list[str] = []
+
+
+def crash_code(tb: Any) -> int:
+    """0xE0000000 and 28 bits of the innermost app.py frame (function and
+    line): one fault, one failure name in Partner Center, and
+    tools/crash_code.py finds the place again from the code alone."""
+    name, line = "?", 0
+    for frame, number in traceback.walk_tb(tb):
+        if os.path.basename(frame.f_code.co_filename) == "app.py":
+            name, line = frame.f_code.co_name, number
+    return 0xE0000000 | (zlib.crc32(f"{name}:{line}".encode("utf-8")) & 0x0FFFFFFF)
+
+
+def write_crash_log(details: str) -> None:
+    """Kept on this PC only, the newest at the end, at most CRASH_LOG_LIMIT."""
+    try:
+        target = app_data_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / "crash.log"
+        previous = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        path.write_text((previous + details)[-CRASH_LOG_LIMIT:], encoding="utf-8")
+    except OSError:
+        pass
+
+
+def fail_fast(code: int) -> None:
+    """End the process as a crash Windows Error Reporting reports."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class EXCEPTION_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("ExceptionCode", wintypes.DWORD),
+                ("ExceptionFlags", wintypes.DWORD),
+                ("ExceptionRecord", ctypes.c_void_p),
+                ("ExceptionAddress", ctypes.c_void_p),
+                ("NumberParameters", wintypes.DWORD),
+                ("ExceptionInformation", ctypes.c_size_t * 15),
+            ]
+
+        record = EXCEPTION_RECORD()
+        record.ExceptionCode = code
+        record.ExceptionFlags = 1  # EXCEPTION_NONCONTINUABLE
+        ctypes.windll.kernel32.RaiseFailFastException(ctypes.byref(record), None, 0)
+    os.abort()
+
+
+def report_unhandled_exception(exc_type: Any, exc: Any, tb: Any) -> None:
+    if exc_type is not None and issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    code = crash_code(tb)
+    details = (
+        f"{datetime.now().isoformat()} {APP_NAME} {APP_VERSION} 0x{code:08X}\n"
+        + "".join(traceback.format_exception(exc_type, exc, tb))
+        + "\n"
+    )
+    UNHANDLED_EXCEPTIONS.append(details)
+    write_crash_log(details)
+    print(details, file=sys.stderr)
+    handler = CRASH_HANDLER["fail"]
+    if handler is None:
+        return
+    # Only the GUI thread may touch the documents; a crash elsewhere keeps
+    # what the last automatic recovery save wrote.
+    app = QApplication.instance()
+    if app is not None and threading.current_thread() is threading.main_thread():
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, PDFReaderWindow):
+                try:
+                    widget._write_recovery_now()
+                except Exception:
+                    pass
+    handler(code)
+
+
+def install_crash_reporting(fail: Callable[[int], None] | None = fail_fast) -> None:
+    CRASH_HANDLER["fail"] = fail
+    sys.excepthook = report_unhandled_exception
+    threading.excepthook = lambda args: report_unhandled_exception(
+        args.exc_type, args.exc_value, args.exc_traceback
+    )
+
+
 def main() -> int:
+    # The OCR child (OcrProcess): no window, no single-instance hand-off.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--ocr-worker":
+        return ocr_worker_main(sys.argv[2])
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("pdf", nargs="?")
     parser.add_argument("--self-test", action="store_true")
@@ -25367,6 +29227,7 @@ def main() -> int:
         app.setWindowIcon(app_icon())
     if args.self_test:
         return run_self_test(app)
+    install_crash_reporting()
     # One pdfNote per user: hand the launch to the one already running, so
     # every window belongs to the same program and tabs can move between
     # them. Nobody listening means this is that pdfNote.
@@ -25385,12 +29246,14 @@ def main() -> int:
     # The Terms of Use before anything else, once per version. A PDF handed
     # over by a second launch while they are on screen waits for them
     # (when_no_dialog_is_up) and opens once they are closed.
-    present_terms(RecentFiles())
+    present_terms(RecentFiles.shared())
     window = PDFReaderWindow()
     window.show()
     if args.pdf:
         QTimer.singleShot(80, lambda: window.open_document(args.pdf))
     QTimer.singleShot(150, window._offer_recovery_restore)
+    # After the recovery question, if it is asked (when_no_dialog_is_up).
+    QTimer.singleShot(1200, lambda: when_no_dialog_is_up(window.offer_default_pdf_app))
     return app.exec()
 
 
@@ -25401,11 +29264,6 @@ if __name__ == "__main__":
         raise
     except Exception:
         details = traceback.format_exc()
-        try:
-            target = app_data_dir()
-            target.mkdir(parents=True, exist_ok=True)
-            (target / "crash.log").write_text(details, encoding="utf-8")
-        except OSError:
-            pass
+        write_crash_log(f"{datetime.now().isoformat()} {APP_NAME} {APP_VERSION}\n{details}\n")
         print(details, file=sys.stderr)
         raise

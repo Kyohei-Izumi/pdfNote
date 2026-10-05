@@ -1,6 +1,6 @@
 # pdfNote Terms of Use
 
-Last updated: September 25, 2026
+Last updated: October 4, 2026
 
 **PLEASE READ THESE TERMS CAREFULLY. SECTION 6 (PURCHASES ARE FINAL; REFUNDS), SECTION 13 (DISCLAIMER OF WARRANTIES) AND SECTION 14 (LIMITATION OF LIABILITY) LIMIT YOUR REMEDIES.**
 
@@ -144,7 +144,7 @@ Last updated: September 25, 2026
 
 ## 12. Third-Party Components and Services
 
-12.1 The Software includes components supplied by third parties, such as PyMuPDF and MuPDF, Qt and Python, which are provided under their own licenses. The OCR language data used by the Store Edition is not part of the Software, and the terms of its provider apply to it.
+12.1 The Software includes components supplied by third parties, such as PyMuPDF and MuPDF, Qt and Python, which are provided under their own licenses. The OCR language data used by the Store Edition, including the data it downloads with your agreement from where the Tesseract OCR project publishes it, is not part of the Software, and the terms of its provider apply to it.
 
 12.2 Printing, opening links and similar operations rely on Windows, printer drivers and other applications, which are subject to their own terms. We are not responsible for them.
 

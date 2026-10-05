@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import glob
 import os
 
 # The folder this spec file is in (PyInstaller sets SPECPATH), so the
@@ -80,7 +81,10 @@ a = Analysis(
         for name in ('pdfNote-logo-dark.png',)
         if os.path.exists(f'{ROOT}/{name}')
     ]
-    + [(f'{ROOT}/legal/{name}', 'legal') for name in LEGAL_FILES],
+    + [(f'{ROOT}/legal/{name}', 'legal') for name in LEGAL_FILES]
+    # The interface languages kept one file a language (6.4); the
+    # self-test fails an executable that left one out.
+    + [(path, 'i18n') for path in sorted(glob.glob(f'{ROOT}/i18n/*.json'))],
     hiddenimports=STORE_MODULES,
     hookspath=[],
     hooksconfig={},
