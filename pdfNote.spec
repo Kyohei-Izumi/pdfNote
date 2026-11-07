@@ -12,7 +12,7 @@ ROOT = SPECPATH
 LEGAL_FILES = [
     'LICENSE_NOTICE.txt',
     'AGPL-3.0.txt', 'THIRD_PARTY_NOTICES.txt', 'THIRD_PARTY_LICENSES.txt',
-    'LGPL-3.0.txt', 'GPL-3.0.txt',
+    'EXPORT_LIBRARY_LICENSES.txt', 'LGPL-3.0.txt', 'LGPL-2.1.txt', 'GPL-3.0.txt',
     'Apache-2.0.txt', 'Python-LICENSE.txt', 'PyInstaller-COPYING.txt',
     'TERMS_OF_USE_ja.md', 'TERMS_OF_USE_en.md',
     'PRIVACY_POLICY_ja.md', 'PRIVACY_POLICY_en.md',
@@ -32,10 +32,20 @@ STORE_MODULES = [
 # Modules and Qt plugins pdfNote never loads. PyInstaller's hooks pulled them
 # in anyway; leaving them out makes the executable smaller and keeps software
 # under other licences -- the Qt Virtual Keyboard is GPL-3.0-only -- out of
-# the distribution altogether. Pillow is only used by PyMuPDF functions
-# pdfNote does not call.
+# the distribution altogether.
+# Pillow came in with File > Export (6.7): python-pptx reads the slides'
+# pictures with its core module, and imports ImageFont (plain Python, which
+# loads its FreeType part only when used). Its compiled modules for AVIF,
+# WebP, FreeType, colour management, image maths and Tk, and the libraries
+# built into them, stay out. pdf2docx's command line (fire, termcolor) is
+# never run.
 EXCLUDED_MODULES = [
-    'PIL', 'tkinter',
+    'tkinter',
+    'PIL._avif', 'PIL.AvifImagePlugin', 'PIL._webp', 'PIL.WebPImagePlugin',
+    'PIL._imagingft', 'PIL._imagingcms', 'PIL.ImageCms',
+    'PIL._imagingmath', 'PIL.ImageMath', 'PIL._imagingmorph', 'PIL.ImageMorph',
+    'PIL._imagingtk', 'PIL.ImageTk',
+    'fire', 'termcolor',
     'PySide6.QtQml', 'PySide6.QtQuick', 'PySide6.QtOpenGL',
     'PySide6.QtPdf', 'PySide6.QtVirtualKeyboard',
 ]
@@ -55,6 +65,8 @@ EXCLUDED_BINARIES = (
     'translations\\qt_help_',
     # TUIO touch input over the network: never requested.
     'plugins\\generic',
+    # OpenCV's FFmpeg (LGPL) reads video, which pdfNote never does (6.7).
+    'opencv_videoio_ffmpeg',
 )
 
 

@@ -1,0 +1,400 @@
+{
+ "_comment": "The release notes of each version, as the Store's \"What's new in this version\" said them, in every display language of pdfNote (6.52). The current version's notes must match store/listing/listing_<language>.md word for word (functional_qa). Old Norse is in runes, made by tools/runes.py from docs/l10n/non_normalized.json.",
+ "versions": [
+  {
+   "version": "1.1.0",
+   "notes": {
+    "ja": [
+     "PDF を Word・PowerPoint・Excel に変換できるようになりました。",
+     "目次（しおり）を追加・編集できるようになりました。",
+     "OCR（文字認識）で読み取る言語を選べるようになりました。",
+     "注釈フィルターで、ハイライトや付箋を種類や色で絞り込めるようになりました。",
+     "画像や図形の複製や、大きさ・角度の数値での指定ができるようになりました。",
+     "アプリの中で更新の履歴を見て、新しい版があるかを確かめられるようになりました。",
+     "各言語の表示を見直し、保存や変換の不具合を直しました。",
+     "このアプリを最初に有償購入してくれたのはデンマークの方でした。彼または彼女への最大限の感謝の印にデンマーク語とその祖先の古ノルド語対応をしました。"
+    ],
+    "en": [
+     "Convert PDFs to Word, PowerPoint and Excel.",
+     "Add and edit bookmarks (table of contents entries).",
+     "Choose the languages OCR recognizes.",
+     "Annotation filter: narrow highlights and notes by type and color.",
+     "Duplicate pictures and shapes, and set their exact size and angle.",
+     "See the update history and check for a newer version from within the app.",
+     "Refined the wording in every language and fixed issues with saving and conversion.",
+     "The first person to buy this app was from Denmark. As a token of my deepest gratitude to him or her, I added Danish and its ancestor, Old Norse."
+    ],
+    "zh_CN": [
+     "可将 PDF 转换为 Word、PowerPoint 和 Excel。",
+     "可添加和编辑书签（目录条目）。",
+     "可选择 OCR 识别的语言。",
+     "批注筛选器：按类型和颜色筛选突出显示和便笺。",
+     "可复制图片和图形，并精确设置其大小和角度。",
+     "可在应用内查看更新历史记录，并检查是否有新版本。",
+     "改进了所有语言的文字，并修复了保存和转换时的问题。",
+     "第一位付费购买本应用的是一位丹麦用户。为了向他或她表达最深切的感谢，我为本应用加入了丹麦语及其祖先语言古诺尔斯语。"
+    ],
+    "ko": [
+     "PDF를 Word, PowerPoint, Excel로 변환할 수 있습니다.",
+     "책갈피(목차 항목)를 추가하고 편집할 수 있습니다.",
+     "OCR로 인식할 언어를 선택할 수 있습니다.",
+     "주석 필터: 강조 표시와 스티커 메모를 종류와 색으로 걸러 볼 수 있습니다.",
+     "이미지와 도형을 복제하고 크기와 각도를 정확하게 지정할 수 있습니다.",
+     "앱 안에서 업데이트 기록을 보고 새 버전이 있는지 확인할 수 있습니다.",
+     "모든 언어의 문구를 다듬고 저장과 변환 문제를 해결했습니다.",
+     "이 앱을 처음으로 유료 구매해 주신 분은 덴마크 분이었습니다. 그분께 최대한의 감사를 전하고자 덴마크어와 그 조상인 고대 노르드어를 지원하게 되었습니다."
+    ],
+    "es": [
+     "Convierte PDF a Word, PowerPoint y Excel.",
+     "Añade y edita marcadores (entradas de la tabla de contenido).",
+     "Elige los idiomas que reconoce el OCR.",
+     "Filtro de anotaciones: filtra resaltados y notas adhesivas por tipo y color.",
+     "Duplica imágenes y formas, y define con precisión su tamaño y su ángulo.",
+     "Consulta el historial de actualizaciones y busca una versión nueva desde la propia aplicación.",
+     "Textos revisados en todos los idiomas y errores corregidos al guardar y convertir.",
+     "La primera persona que compró esta aplicación era de Dinamarca. Como muestra de mi más profundo agradecimiento hacia él o ella, he añadido el danés y su antepasado, el nórdico antiguo."
+    ],
+    "fr": [
+     "Conversion des PDF en Word, PowerPoint et Excel.",
+     "Ajout et modification de signets (entrées du sommaire).",
+     "Choix des langues reconnues par l'OCR.",
+     "Filtre d'annotations : surlignages et pense-bêtes filtrés par type et par couleur.",
+     "Duplication des images et des formes, et réglage précis de leur taille et de leur angle.",
+     "Historique des mises à jour et recherche d'une nouvelle version depuis l'application.",
+     "Textes revus dans toutes les langues et corrections lors de l'enregistrement et de la conversion.",
+     "La toute première personne à acheter cette application venait du Danemark. En témoignage de ma plus profonde gratitude envers elle, j'ai ajouté le danois et son ancêtre, le vieux norrois."
+    ],
+    "ru": [
+     "Преобразование PDF в Word, PowerPoint и Excel.",
+     "Добавление и изменение закладок (пунктов оглавления).",
+     "Выбор языков для распознавания текста (OCR).",
+     "Фильтр аннотаций: выделения и записки можно отбирать по типу и цвету.",
+     "Дублирование изображений и фигур и точная настройка их размера и угла.",
+     "Журнал обновлений и проверка новой версии прямо в приложении.",
+     "Обновлены тексты на всех языках и исправлены ошибки при сохранении и преобразовании.",
+     "Первым покупателем этого приложения стал человек из Дании. В знак глубочайшей благодарности ему или ей в приложение добавлены датский язык и его предок — древнескандинавский."
+    ],
+    "ar": [
+     "حوّل ملفات PDF إلى Word وPowerPoint وExcel.",
+     "أضف الإشارات المرجعية (عناصر جدول المحتويات) وحرّرها.",
+     "اختر اللغات التي يتعرف عليها OCR.",
+     "عامل تصفية التعليقات: قم بتصفية التمييزات والملاحظات الملصقة حسب النوع واللون.",
+     "كرّر الصور والأشكال، وحدّد حجمها وزاويتها بدقة.",
+     "اطّلع على سجل التحديثات وتحقق من وجود إصدار أحدث من داخل التطبيق.",
+     "تحسين النصوص في جميع اللغات وإصلاح مشكلات الحفظ والتحويل.",
+     "كان أول من اشترى هذا التطبيق شخصاً من الدنمارك. وتعبيراً عن أعمق امتناني له أو لها، أضفت اللغة الدنماركية وسلفها اللغة النوردية القديمة."
+    ],
+    "de": [
+     "PDFs in Word, PowerPoint und Excel umwandeln.",
+     "Lesezeichen (Einträge im Inhaltsverzeichnis) hinzufügen und bearbeiten.",
+     "Die Sprachen für die Texterkennung (OCR) auswählen.",
+     "Anmerkungsfilter: Hervorhebungen und Kurznotizen nach Typ und Farbe filtern.",
+     "Bilder und Formen duplizieren und ihre Größe und ihren Winkel genau festlegen.",
+     "Den Updateverlauf direkt in der App ansehen und nach einer neueren Version suchen.",
+     "Überarbeitete Texte in allen Sprachen und behobene Fehler beim Speichern und Umwandeln.",
+     "Die erste Person, die diese App gekauft hat, kam aus Dänemark. Als Zeichen meiner tiefsten Dankbarkeit ihm oder ihr gegenüber habe ich Dänisch und seinen Vorfahren, das Altnordische, hinzugefügt."
+    ],
+    "pt_BR": [
+     "Converta PDFs para Word, PowerPoint e Excel.",
+     "Adicione e edite marcadores (entradas do sumário).",
+     "Escolha os idiomas que o OCR reconhece.",
+     "Filtro de anotações: filtre realces e notas autoadesivas por tipo e cor.",
+     "Duplique imagens e formas e defina com precisão o tamanho e o ângulo delas.",
+     "Veja o histórico de atualizações e verifique se há uma versão nova no próprio aplicativo.",
+     "Textos revisados em todos os idiomas e correções ao salvar e converter.",
+     "A primeira pessoa a comprar este aplicativo era da Dinamarca. Como sinal da minha mais profunda gratidão a ele ou ela, adicionei o dinamarquês e seu ancestral, o nórdico antigo."
+    ],
+    "pt_PT": [
+     "Converta PDFs para Word, PowerPoint e Excel.",
+     "Adicione e edite marcadores (entradas do índice).",
+     "Escolha os idiomas que o OCR reconhece.",
+     "Filtro de anotações: filtre realces e notas autocolantes por tipo e cor.",
+     "Duplique imagens e formas e defina com precisão o respetivo tamanho e ângulo.",
+     "Consulte o histórico de atualizações e procure uma nova versão na própria aplicação.",
+     "Textos revistos em todos os idiomas e correções ao guardar e converter.",
+     "A primeira pessoa a comprar esta aplicação era da Dinamarca. Como sinal da minha mais profunda gratidão para com ele ou ela, adicionei o dinamarquês e o seu antepassado, o nórdico antigo."
+    ],
+    "hi": [
+     "PDF को Word, PowerPoint और Excel में बदलें.",
+     "बुकमार्क (सामग्री तालिका की प्रविष्टियाँ) जोड़ें और संपादित करें.",
+     "वे भाषाएँ चुनें जिन्हें OCR पहचानता है.",
+     "टिप्पणी फ़िल्टर: हाइलाइट और स्टिकी नोट को प्रकार और रंग के अनुसार फ़िल्टर करें.",
+     "चित्रों और आकृतियों की प्रतिलिपि बनाएँ और उनका आकार और कोण सटीक रूप से तय करें.",
+     "ऐप में ही अपडेट इतिहास देखें और नए संस्करण की जाँच करें.",
+     "सभी भाषाओं के टेक्स्ट बेहतर किए गए और सहेजने व बदलने की समस्याएँ ठीक की गईं.",
+     "इस ऐप को सबसे पहले खरीदने वाले व्यक्ति डेनमार्क से थे. उनके प्रति अपनी गहरी कृतज्ञता के प्रतीक के रूप में, मैंने डेनिश भाषा और उसकी पूर्वज, प्राचीन नॉर्स भाषा, जोड़ी हैं."
+    ],
+    "bn": [
+     "PDF-কে Word, PowerPoint ও Excel-এ রূপান্তর করুন।",
+     "বুকমার্ক (সূচিপত্রের এন্ট্রি) যোগ ও সম্পাদনা করুন।",
+     "OCR যে ভাষাগুলো শনাক্ত করবে, সেগুলো বেছে নিন।",
+     "মন্তব্য ফিল্টার: হাইলাইট ও স্টিকি নোটকে ধরন ও রং অনুযায়ী ফিল্টার করুন।",
+     "ছবি ও আকৃতির প্রতিলিপি তৈরি করুন এবং এগুলোর আকার ও কোণ নিখুঁতভাবে নির্ধারণ করুন।",
+     "অ্যাপের ভেতরেই আপডেটের ইতিহাস দেখুন এবং নতুন সংস্করণ আছে কিনা যাচাই করুন।",
+     "সব ভাষার লেখা উন্নত করা হয়েছে এবং সংরক্ষণ ও রূপান্তরের সমস্যা ঠিক করা হয়েছে।",
+     "এই অ্যাপটি প্রথম যিনি কিনেছিলেন, তিনি ডেনমার্কের মানুষ। তাঁর প্রতি গভীরতম কৃতজ্ঞতার নিদর্শন হিসেবে আমি ড্যানিশ ভাষা এবং তার পূর্বসূরি প্রাচীন নর্স ভাষা যোগ করেছি।"
+    ],
+    "ur": [
+     "PDF کو Word، PowerPoint اور Excel میں تبدیل کریں۔",
+     "بُک مارکس (فہرست مضامین کے اندراجات) شامل کریں اور ان میں ترمیم کریں۔",
+     "وہ زبانیں منتخب کریں جنہیں OCR پہچانے۔",
+     "تبصروں کا فلٹر: نمایاں کاری اور اسٹکی نوٹس کو قسم اور رنگ کے لحاظ سے فلٹر کریں۔",
+     "تصاویر اور اشکال کی نقل بنائیں اور ان کا سائز اور زاویہ درست طور پر طے کریں۔",
+     "ایپ کے اندر ہی اپ ڈیٹ کی سرگزشت دیکھیں اور نئے ورژن کی جانچ کریں۔",
+     "تمام زبانوں کی عبارتیں بہتر کی گئیں اور محفوظ کرنے اور تبدیل کرنے کے مسائل حل کیے گئے۔",
+     "اس ایپ کو سب سے پہلے خریدنے والے ڈنمارک سے تھے۔ ان کے لیے انتہائی شکرگزاری کے اظہار کے طور پر ڈینش زبان اور اس کی آبائی زبان، قدیم نارس، شامل کی گئی ہیں۔"
+    ],
+    "la": [
+     "PDF in Word, PowerPoint vel Excel converte.",
+     "Indicem capitum adde et muta.",
+     "Linguas elige quas OCR legat.",
+     "Cribro adnotationum illuminationes et schedulas genere et colore secerne.",
+     "Imagines et figuras duplica, earumque magnitudinem et angulum numeris statue.",
+     "Seriem editionum in ipso instrumento vide, et quaere num nova editio sit.",
+     "Verba in omnibus linguis emendata sunt, et vitia in servando convertendoque correcta.",
+     "Qui primus hoc instrumentum emit, e Dania erat. In signum summae gratiae erga eum eamve linguam Danicam eiusque parentem, linguam Norrenam antiquam, addidi."
+    ],
+    "grc": [
+     "Μετάβαλλε PDF εἰς Word, PowerPoint ἢ Excel.",
+     "Πρόσθες τὸν πίνακα τῶν κεφαλαίων καὶ διόρθωσον.",
+     "Αἱροῦ τὰς γλώσσας ἃς τὸ OCR ἀναγνώσεται.",
+     "Τῷ ἠθμῷ τῶν σχολίων διάκρινε τὰς ἐπισημάνσεις καὶ τὰ σημειώματα κατὰ γένος καὶ χρῶμα.",
+     "Διπλασίαζε τὰς εἰκόνας καὶ τὰ σχήματα, καὶ τὸ μέγεθος καὶ τὴν γωνίαν αὐτῶν ἀριθμοῖς τάττε.",
+     "Ἐν αὐτῷ τῷ ὀργάνῳ ὅρα τὴν ἱστορίαν τῶν ἐκδόσεων, καὶ ζήτει εἰ νεωτέρα ἔκδοσις ἔστιν.",
+     "Τὰ ῥήματα ἐν πάσαις ταῖς γλώσσαις διωρθώθη, καὶ τὰ περὶ τὴν φυλακὴν καὶ τὴν μεταβολὴν ἁμαρτήματα ἐπηνωρθώθη.",
+     "Ὁ πρῶτος ὠνησάμενος τόδε τὸ ὄργανον ἐκ Δανίας ἦν. Σημεῖον δὲ τῆς μεγίστης πρὸς αὐτὸν ἢ αὐτὴν χάριτος τὴν Δανικὴν γλῶσσαν καὶ τὴν πρόγονον αὐτῆς, τὴν παλαιὰν Νορρηνικήν, προσέθηκα."
+    ],
+    "sa": [
+     "PDF Word, PowerPoint, Excel वा इति रूपेषु परिवर्त्यताम्।",
+     "अनुक्रमणिका योज्यतां संशोध्यतां च।",
+     "OCR-इत्यनेन पठनीयाः भाषाः व्रियन्ताम्।",
+     "टिप्पणीचालन्या उद्दीपनानि आसक्तटिप्पण्यः च प्रकारेण वर्णेन च विविच्यन्ताम्।",
+     "चित्राणि आकृतयः च द्विगुणीक्रियन्ताम्, तेषां परिमाणं कोणः च सङ्ख्याभिः निर्दिश्येताम्।",
+     "साधनस्य अन्तः एव संस्करणानाम् इतिहासः दृश्यताम्, नूतनं संस्करणम् अस्ति न वेति च अन्विष्यताम्।",
+     "सर्वासु भाषासु वचनानि संशोधितानि, रक्षणे परिवर्तने च दोषाः निवारिताः।",
+     "अस्य साधनस्य प्रथमः क्रेता डेन्मार्कदेशीयः आसीत्। तस्मै तस्यै वा परमकृतज्ञतायाः चिह्नरूपेण डेनिशभाषा तस्याः पूर्वजा प्राचीननॉर्सभाषा च योजिते।"
+    ],
+    "da": [
+     "Konvertér PDF-filer til Word, PowerPoint og Excel.",
+     "Tilføj og redigér bogmærker (punkter i indholdsfortegnelsen).",
+     "Vælg de sprog, som OCR genkender.",
+     "Kommentarfilter: Filtrér fremhævninger og huskesedler efter type og farve.",
+     "Duplikér billeder og figurer, og angiv deres størrelse og vinkel præcist.",
+     "Se opdateringshistorikken, og søg efter en nyere version direkte i appen.",
+     "Teksterne på alle sprog er gennemgået, og fejl ved gemning og konvertering er rettet.",
+     "Den allerførste, der købte denne app, var fra Danmark. Som tegn på min dybeste taknemmelighed over for ham eller hende har jeg tilføjet dansk og dets stamfader, oldnordisk."
+    ],
+    "non": [
+     "ᛋᚿᚢ PDF ᛁ Word, PowerPoint ᛂᚦᛆ Excel.",
+     "ᚵᛂᚱ ᚴᛆᛔᛁᛐᚢᛚᛆᛋᚴᚱᛆ ᚮᚴ ᛒᚱᛂᛦᛐ ᚼᛂᚿᛁ.",
+     "ᚡᛂᛚ ᛐᚢᚿᚵᚢᚱ ᚦᛅᚱ ᛂᚱ OCR ᛋᚴᛆᛚ ᛚᛂᛋᛆ.",
+     "ᛘᛂᚦ ᛋᚴᛦᚱᛁᚿᚵᛆᛋᚴᛁᛚᛁᚢ ᚵᚱᛂᛁᚿ ᛚᛦᛋᛁᚿᚵᛆᚱ ᚮᚴ ᛋᛂᚦᛚᛆ ᛂᛔᛐᛁᚱ ᚴᛦᚿᛁ ᚮᚴ ᛚᛁᛐ.",
+     "ᛐᚡᛁᚠᛆᛚᛑᛆ ᛘᛦᚿᛑᛁᚱ ᚮᚴ ᛚᛁᚴᛁ, ᚮᚴ ᛋᛂᛐ ᛋᛐᛅᚱᚦ ᚦᛂᛁᚱᛆ ᚮᚴ ᚼᚮᚱᚿ ᛘᛂᚦ ᛐᚰᛚᚢᛘ.",
+     "ᛋᛂ ᛋᚰᚵᚢ ᚢᛐᚵᛆᚠᚿᛆ ᛁ ᛋᛁᛆᛚᚠᚢ ᛐᚮᛚᛁᚿᚢ, ᚮᚴ ᛚᛂᛁᛐᛆ ᚼᚡᛆᚱᛐ ᚿᛦᚱᛁ ᚢᛐᚵᛆᚠᛆ ᛋᛂ ᛐᛁᛚ.",
+     "ᚮᚱᚦ ᛐᚮᛚᛋᛁᚿᛋ ᛒᚯᛐ ᛆ ᚰᛚᚢᛘ ᛐᚢᚿᚵᚢᛘ, ᚮᚴ ᛚᛦᛐᛁ ᛁ ᚵᛂᛦᛘᛋᛚᚢ ᚮᚴ ᛋᚿᚢᚿᛁᚿᚵᛁ ᛒᚯᛐ.",
+     "ᛋᛆ ᛂᚱ ᚠᛦᚱᛋᛐᚱ ᚴᛂᛦᛔᛐᛁ ᚦᛂᛐᛆ ᛐᚮᛚ, ᚡᛆᚱ ᚮᚱ ᛑᛆᚿᛘᚰᚱᚴᚢ. ᛁ ᛁᛆᚱᛐᛂᚵᚿ ᛘᛂᛋᛐᚱᛆᚱ ᚦᛆᚴᛆᚱ ᚡᛁᚦ ᚼᛆᚿ ᛂᚦᛆ ᚼᛆᚿᛆ ᛚᛂᛐ ᛂᚴ ᛐᚮᛚᛁᛐ ᛘᛅᛚᛆ ᛆ ᛑᛆᚿᛋᚴᛆ ᛐᚢᚿᚵᚢ ᚮᚴ ᛆ ᚿᚮᚱᚯᚿᚢ, ᛂᚱ ᚼᚮᚿ ᛂᚱ ᛆᚠ ᚴᚮᛘᛁᚿ."
+    ]
+   }
+  },
+  {
+   "version": "1.0.1",
+   "notes": {
+    "ja": [
+     "表示言語に、ドイツ語、ポルトガル語（ブラジル・ポルトガル）、ヒンディー語、ベンガル語、ウルドゥー語、ラテン語、古代ギリシア語、サンスクリットを加え、全 17 言語になりました。",
+     "OCR の高精度な言語データを、ボタンひとつでダウンロードできるようになりました。",
+     "保存した PDF のファイル サイズを小さくしました。",
+     "テキスト ボックスで、PC にインストールされているフォントを使えるようになりました。",
+     "そのほかの不具合の修正と改善。"
+    ],
+    "en": [
+     "New interface languages: German, Portuguese (Brazil and Portugal), Hindi, Bengali, Urdu, Latin, Ancient Greek and Sanskrit, for 17 in all.",
+     "High-accuracy OCR language data now downloads in one click.",
+     "Saved PDFs are smaller.",
+     "Text boxes can use any font installed on your PC.",
+     "Other fixes and improvements."
+    ],
+    "zh_CN": [
+     "新增德语、葡萄牙语（巴西和葡萄牙）、印地语、孟加拉语、乌尔都语、拉丁语、古希腊语和梵语界面，共支持 17 种语言。",
+     "OCR 高精度语言数据现在一键即可下载。",
+     "保存的 PDF 文件更小。",
+     "文本框可以使用电脑上安装的任何字体。",
+     "其他问题修复和改进。"
+    ],
+    "ko": [
+     "독일어, 포르투갈어(브라질 및 포르투갈), 힌디어, 벵골어, 우르두어, 라틴어, 고대 그리스어, 산스크리트어를 추가하여 모두 17개 언어를 지원합니다.",
+     "OCR 고정밀 언어 데이터를 버튼 하나로 다운로드할 수 있습니다.",
+     "저장한 PDF의 파일 크기가 작아졌습니다.",
+     "텍스트 상자에서 PC에 설치된 모든 글꼴을 사용할 수 있습니다.",
+     "그 밖의 문제 수정 및 개선."
+    ],
+    "es": [
+     "Nuevos idiomas de la interfaz: alemán, portugués (Brasil y Portugal), hindi, bengalí, urdu, latín, griego antiguo y sánscrito; ya son 17.",
+     "Los datos de idioma de alta precisión para el OCR se descargan con un clic.",
+     "Los PDF guardados ocupan menos.",
+     "Los cuadros de texto pueden usar cualquier fuente instalada en tu PC.",
+     "Otras correcciones y mejoras."
+    ],
+    "fr": [
+     "Nouvelles langues d'interface : allemand, portugais (Brésil et Portugal), hindi, bengali, ourdou, latin, grec ancien et sanskrit, soit 17 langues en tout.",
+     "Les données de langue haute précision de l'OCR se téléchargent en un clic.",
+     "Les PDF enregistrés sont plus légers.",
+     "Les zones de texte acceptent toutes les polices installées sur votre PC.",
+     "Autres corrections et améliorations."
+    ],
+    "ru": [
+     "Новые языки интерфейса: немецкий, португальский (Бразилия и Португалия), хинди, бенгальский, урду, латынь, древнегреческий и санскрит — всего 17 языков.",
+     "Высокоточные языковые данные для OCR загружаются одной кнопкой.",
+     "Сохраненные PDF стали меньше.",
+     "В текстовых полях можно использовать любые шрифты, установленные на компьютере.",
+     "Прочие исправления и улучшения."
+    ],
+    "ar": [
+     "لغات واجهة جديدة: الألمانية والبرتغالية (البرازيل والبرتغال) والهندية والبنغالية والأردية واللاتينية واليونانية القديمة والسنسكريتية، ليصبح المجموع 17 لغة.",
+     "أصبح تنزيل بيانات اللغة عالية الدقة للتعرف الضوئي على الحروف بنقرة واحدة.",
+     "أصبحت ملفات PDF المحفوظة أصغر حجمًا.",
+     "يمكن لمربعات النص استخدام أي خط مثبت على جهازك.",
+     "إصلاحات وتحسينات أخرى."
+    ],
+    "de": [
+     "pdfNote gibt es jetzt auf Deutsch! Neu sind außerdem Portugiesisch (Brasilien und Portugal), Hindi, Bengalisch, Urdu, Latein, Altgriechisch und Sanskrit – insgesamt 17 Sprachen.",
+     "Hochgenaue Sprachdaten für die OCR lassen sich mit einem Klick herunterladen.",
+     "Gespeicherte PDFs sind kleiner.",
+     "Textfelder können jede auf Ihrem PC installierte Schriftart verwenden.",
+     "Weitere Fehlerbehebungen und Verbesserungen."
+    ],
+    "pt_BR": [
+     "O pdfNote agora está em português (Brasil e Portugal)! Também chegaram alemão, hindi, bengali, urdu, latim, grego antigo e sânscrito, totalizando 17 idiomas.",
+     "Os dados de idioma de alta precisão do OCR agora são baixados com um clique.",
+     "Os PDFs salvos ficaram menores.",
+     "As caixas de texto podem usar qualquer fonte instalada no seu PC.",
+     "Outras correções e melhorias."
+    ],
+    "pt_PT": [
+     "O pdfNote já está disponível em português (Portugal e Brasil)! Foram também adicionados alemão, hindi, bengali, urdu, latim, grego antigo e sânscrito, num total de 17 idiomas.",
+     "Os dados de idioma de alta precisão do OCR passam a ser transferidos com um clique.",
+     "Os PDFs guardados ficaram mais pequenos.",
+     "As caixas de texto podem utilizar qualquer tipo de letra instalado no seu PC.",
+     "Outras correções e melhorias."
+    ],
+    "hi": [
+     "pdfNote अब हिंदी में! साथ ही जर्मन, पुर्तगाली (ब्राज़ील और पुर्तगाल), बांग्ला, उर्दू, लैटिन, प्राचीन यूनानी और संस्कृत भी जोड़ी गई हैं, अब कुल 17 भाषाएँ.",
+     "OCR का उच्च सटीकता वाला भाषा डेटा अब एक क्लिक में डाउनलोड होता है.",
+     "सहेजे गए PDF अब छोटे होते हैं.",
+     "टेक्स्ट बॉक्स में आपके PC पर इंस्टॉल किया गया कोई भी फ़ॉन्ट उपयोग किया जा सकता है.",
+     "अन्य समस्याओं का समाधान और सुधार."
+    ],
+    "bn": [
+     "pdfNote এখন বাংলায়! সঙ্গে জার্মান, পর্তুগিজ (ব্রাজিল ও পর্তুগাল), হিন্দি, উর্দু, লাতিন, প্রাচীন গ্রিক ও সংস্কৃতও যোগ হয়েছে, এখন মোট 17টি ভাষা।",
+     "OCR-এর উচ্চ নির্ভুলতার ভাষার ডেটা এখন এক ক্লিকে ডাউনলোড করা যায়।",
+     "সংরক্ষিত PDF এখন আকারে ছোট।",
+     "টেক্সট বক্সে আপনার PC-তে ইনস্টল করা যেকোনো ফন্ট ব্যবহার করা যায়।",
+     "অন্যান্য সমস্যার সমাধান ও উন্নতি।"
+    ],
+    "ur": [
+     "pdfNote اب اردو میں! ساتھ ہی جرمن، پرتگالی (برازیل اور پرتگال)، ہندی، بنگالی، لاطینی، قدیم یونانی اور سنسکرت بھی شامل کی گئی ہیں، اب کل 17 زبانیں۔",
+     "OCR کا اعلیٰ درستی والا زبان کا ڈیٹا اب ایک کلک میں ڈاؤن لوڈ ہوتا ہے۔",
+     "محفوظ کی گئی PDF فائلیں اب چھوٹی ہوتی ہیں۔",
+     "ٹیکسٹ باکس میں آپ کے PC پر انسٹال شدہ کوئی بھی فونٹ استعمال کیا جا سکتا ہے۔",
+     "دیگر خرابیوں کی درستی اور بہتریاں۔"
+    ],
+    "la": [
+     "Novae linguae instrumenti: Germanica, Lusitana (Brasiliae et Lusitaniae), Hindica, Bengalica, Urdu, Latina, Graeca antiqua, Sanscrita; nunc XVII in summa.",
+     "Data linguae ad OCR accurata uno ictu deponuntur.",
+     "PDF servata minora sunt.",
+     "Capsae textus omnibus litterarum formis in machina tua institutis uti possunt.",
+     "Aliae correctiones et emendationes."
+    ],
+    "grc": [
+     "Νέαι γλῶσσαι τοῦ ὀργάνου· Γερμανική, Λυσιτανική (Βραζιλίας τε καὶ Λυσιτανίας), Ἰνδική, Βεγγαλική, Οὐρδοῦ, Λατίνη, Ἀρχαία Ἑλληνική, Σανσκριτική· νῦν ἑπτακαίδεκα αἱ πᾶσαι.",
+     "Τὰ ἀκριβῆ γλωσσικὰ δεδομένα τοῦ OCR μιᾷ πληγῇ κατάγεται.",
+     "Τὰ φυλαχθέντα PDF ἐλάττω ἐστίν.",
+     "Τὰ πλαίσια τοῦ κειμένου πᾶσι τοῖς τύποις τῶν γραμμάτων τοῖς ἐν τῇ σῇ μηχανῇ χρῆσθαι δύναται.",
+     "Ἄλλαι ἐπανορθώσεις καὶ βελτιώσεις."
+    ],
+    "sa": [
+     "साधनस्य नूतनाः भाषाः — जर्मन्, पोर्तुगीज् (ब्राजील्-पोर्तुगाल्), हिन्दी, बाङ्ला, उर्दू, लातिनी, प्राचीनग्रीक्, संस्कृतम् — इदानीं सप्तदश भाषाः।",
+     "OCR-अर्थं सूक्ष्मः भाषादत्तांशः एकेन स्पर्शेन अवतार्यते।",
+     "रक्षितानि PDF लघुतराणि।",
+     "पाठपेटिकाः सङ्गणके प्रतिष्ठापितान् सर्वान् अक्षराकारान् उपयोक्तुं शक्नुवन्ति।",
+     "अन्यानि संशोधनानि परिष्काराश्च।"
+    ],
+    "da": [
+     "Nye sprog i brugerfladen: tysk, portugisisk (Brasilien og Portugal), hindi, bengali, urdu, latin, oldgræsk og sanskrit – i alt 17.",
+     "OCR-sprogdata med høj nøjagtighed downloades nu med ét klik.",
+     "Gemte PDF-filer fylder mindre.",
+     "Tekstfelter kan bruge alle skrifttyper, der er installeret på din pc.",
+     "Andre rettelser og forbedringer."
+    ],
+    "non": [
+     "ᚿᛦᛁᛆᚱ ᛐᚢᚿᚵᚢᚱ ᛐᚮᛚᛋᛁᚿᛋ: ᚦᛦᚦᚡᛂᚱᛋᚴᛆ, ᛔᚮᚱᛐᚢᚵᛆᛚᛋᚴᛆ (ᛒᚱᛆᛋᛁᛚᛁᚢ ᚮᚴ ᛔᚮᚱᛐᚢᚵᛆᛚᛋ), ᚼᛁᚿᛑᛁ, ᛒᛂᚿᚵᛆᛚᛋᚴᛆ, ᚢᚱᛑᚢ, ᛚᛆᛐᛁᚿᛆ, ᚠᚮᚱᚿᚵᚱᛁᚴᛋᚴᛆ ᚮᚴ ᛋᛆᚿᛋᚴᚱᛁᛐ; ᚿᚢ ᛋᛁᛆᚢᛐᛁᛆᚿ ᛆᛚᛋ.",
+     "ᚿᛆᚴᚡᛅᛘ ᛐᚢᚿᚵᚢᚵᚰᚵᚿ OCR ᛋᚯᚴᛁᛆᛋᚴ ᛘᛂᚦ ᛂᛁᚿᚢ ᚼᛆᚿᛑᛐᛆᚴᛁ.",
+     "ᚵᛂᛦᛘᛑ PDF ᛂᚱᚢ ᛘᛁᚿᛁ.",
+     "ᚱᛁᛐᚱᛂᛁᛐᛁᚱ ᛘᛂᚵᛆ ᚿᛦᛐᛆ ᛆᛚᛆᚱ ᛋᛐᛆᚠᛆᚵᛂᚱᚦᛁᚱ ᛂᚱ ᛋᛂᛐᛆᚱ ᛂᚱᚢ ᛁ ᚡᛂᛚ ᚦᛁᚿᛆ.",
+     "ᛆᚦᚱᛆᚱ ᛒᚯᛐᚱ."
+    ]
+   }
+  },
+  {
+   "version": "1.0.0",
+   "notes": {
+    "ja": [
+     "pdfNote の最初の版です。"
+    ],
+    "en": [
+     "The first release of pdfNote."
+    ],
+    "zh_CN": [
+     "pdfNote 的第一个版本。"
+    ],
+    "ko": [
+     "pdfNote의 첫 번째 버전입니다."
+    ],
+    "es": [
+     "Primera versión de pdfNote."
+    ],
+    "fr": [
+     "Première version de pdfNote."
+    ],
+    "ru": [
+     "Первая версия pdfNote."
+    ],
+    "ar": [
+     "أول إصدار من pdfNote."
+    ],
+    "de": [
+     "Die erste Version von pdfNote."
+    ],
+    "pt_BR": [
+     "A primeira versão do pdfNote."
+    ],
+    "pt_PT": [
+     "A primeira versão do pdfNote."
+    ],
+    "hi": [
+     "pdfNote का पहला संस्करण."
+    ],
+    "bn": [
+     "pdfNote-এর প্রথম সংস্করণ।"
+    ],
+    "ur": [
+     "pdfNote کا پہلا ورژن۔"
+    ],
+    "la": [
+     "Prima editio pdfNote."
+    ],
+    "grc": [
+     "Ἡ πρώτη ἔκδοσις τοῦ pdfNote."
+    ],
+    "sa": [
+     "pdfNote-इत्यस्य प्रथमं संस्करणम्।"
+    ],
+    "da": [
+     "Den første version af pdfNote."
+    ],
+    "non": [
+     "ᚠᛦᚱᛋᛐᛆ ᚢᛐᚵᛆᚠᛆ pdfNote."
+    ]
+   }
+  }
+ ]
+}

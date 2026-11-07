@@ -2,12 +2,12 @@
  "language": "la",
  "strings": {
   "ファイル": "Fasciculus",
-  "ファイル メニューを開く": "Tabellam Fasciculi aperi",
+  "ファイル メニューを開く": "Tabellam “Fasciculus” aperi",
   "最近使ったファイル": "Fasciculi recentes",
   "ページ": "Pagina",
   "文書タブ": "Pittacia scriptorum",
   "最近使ったファイルはありません": "Nulli fasciculi recentes",
-  "未保存の新規PDF": "Novum PDF sine titulo",
+  "未保存の新規PDF": "Novum PDF (nondum servatum)",
   "無題.pdf": "Sine titulo.pdf",
   "新規PDF": "Novum PDF",
   "新しい空白PDFを作成": "Novum PDF vacuum crea",
@@ -44,7 +44,7 @@
   "ハイライトの色を選択": "Colorem illuminationis elige",
   "下線の色を選択": "Colorem lineae subiectae elige",
   "取り消し線の色を選択": "Colorem lineae transversae elige",
-  "図形・手書きの色を選択": "Colorem figurarum et manus liberae elige",
+  "図形・手書きの色を選択": "Colorem delineationis elige",
   "選択": "Elige",
   "ハイライト": "Illuminatio",
   "下線": "Linea subiecta",
@@ -73,14 +73,13 @@
   "書式": "Formatio",
   "フォントの色...": "Color litterarum...",
   "幅": "Latitudo",
-  "選択中の図形の幅をpt単位で指定": "Latitudinem figurae selectae punctis constitue",
+  "選択中のオブジェクトの幅をpt単位で指定": "Latitudinem rei impositae selectae punctis constitue",
   "高さ": "Altitudo",
-  "選択中の図形の高さをpt単位で指定": "Altitudinem figurae selectae punctis constitue",
+  "選択中のオブジェクトの高さをpt単位で指定": "Altitudinem rei impositae selectae punctis constitue",
   "回転": "Conversio",
   "画像": "Imago",
   "コピー": "Exscribe",
   "表紙を分ける": "Tegumentum seorsum",
-  "選択中の図形の色を変更しました": "Color delineandi figurae selectae adhibitus est",
   "黒": "Niger",
   "赤": "Ruber",
   "青": "Caeruleus",
@@ -91,15 +90,13 @@
   "黄": "Flavus",
   "ピンク": "Roseus",
   "ナビゲーション": "Navigatio",
-  "ナビゲーションを閉じる ({key}で再表示)": "Navigationem claude ({key} ut iterum ostendatur)",
+  "ナビゲーションを閉じる ({key}で再表示)": "Navigationem claude (preme {key} ut iterum ostendatur)",
   "文書内を検索": "In scripto quaere",
   "目次": "Index capitum",
   "検索結果": "Inventa quaestionis",
   "この文書には目次がありません": "Hoc scriptum indicem capitum non habet",
   "(無題)": "(Sine titulo)",
   "（空の付箋）": "(Schedula adhaerens vacua)",
-  "注釈": "Adnotationes",
-  "注釈はありません": "Nullae adnotationes",
   "このページにはテキストがありません": "Haec pagina textum non habet",
   "フォント サイズの拡大": "Litteras auge",
   "フォント サイズの縮小": "Litteras minue",
@@ -117,7 +114,6 @@
   "選択範囲を拡張": "Selectionem extende",
   "単語単位で選択": "Per verba elige",
   "リンクを開く": "Nexum aperi",
-  "注釈を編集": "Adnotationem muta",
   "選択した項目へ移動": "Ad rem selectam i",
   "ページを上下に移動": "Paginam sursum / deorsum move",
   "ページの切り取り・コピー・貼り付け": "Paginam excide / exscribe / agglutina",
@@ -126,20 +122,19 @@
   "タブに移動": "Ad pittacium i",
   "付箋を編集": "Schedulam adhaerentem muta",
   "ユーザー": "Utens",
-  "検索を終了しました": "Quaestio clausa est",
   "検索中…": "Quaeritur…",
-  "{keys}で切り替え": "{keys} ut commutes",
-  "前回 pdfNote が正常に終了しなかったため、保存されていない変更が残っています。復元しますか？\n\n{names}": "Mutationes non servatae inventae sunt ex sessione priore, quae non rite clausa est. Visne eas restituere?\n\n{names}",
+  "{keys}で切り替え": "{keys} ad commutandum",
+  "前回 pdfNote が正常に終了しなかったため、保存されていない変更が残っています。復元しますか？\n\n{names}": "pdfNote proxime non rite clausum est, et mutationes non servatae supersunt. Visne eas restituere?\n\n{names}",
   "表示テーマ": "Species",
   "システムの設定に従う": "Optionem systematis sequere",
   "ライト": "Clara",
   "ダーク": "Obscura",
   "テキスト ボックスの挿入": "Capsam textus insere",
   "付箋の挿入": "Schedulam adhaerentem insere",
-  "四角形の挿入": "Rectangulum insere",
-  "矢印の挿入": "Sagittam insere",
-  "直線の挿入": "Lineam insere",
-  "ズーム率を入力": "Ad gradum amplificationis i",
+  "四角形の挿入": "Rectangulum describe",
+  "矢印の挿入": "Sagittam describe",
+  "直線の挿入": "Lineam duc",
+  "ズーム率を入力": "Gradum amplificationis constitue",
   "言語": "Lingua",
   "PDFを結合...": "PDF coniunge...",
   "複数のPDFファイルを1つに結合": "Plures fasciculos PDF in unum coniunge",
@@ -147,13 +142,29 @@
   "パスワードで保護されたPDFは結合できません: {name}": "PDF tessera munita coniungi non possunt: {name}",
   "PDFを結合できませんでした。\n\n{error}": "PDF coniungi non potuerunt.\n\n{error}",
   "PDFを分割...": "PDF divide...",
+  "エクスポート": "Exporta",
+  "Word 文書...": "Scriptum Word...",
+  "PowerPoint プレゼンテーション...": "Tabulae PowerPoint...",
+  "Excel ブック...": "Liber Excel...",
+  "Word 文書": "Scriptum Word",
+  "PowerPoint プレゼンテーション": "Tabulae PowerPoint",
+  "Excel ブック": "Liber Excel",
+  "Word 文書 (*.docx)": "Scriptum Word (*.docx)",
+  "PowerPoint プレゼンテーション (*.pptx)": "Tabulae PowerPoint (*.pptx)",
+  "Excel ブック (*.xlsx)": "Liber Excel (*.xlsx)",
+  "{format}としてエクスポート": "Exporta ut {format}",
+  "{format}にエクスポートしています…": "Exportatur ut {format}…",
+  "{format}にエクスポートできませんでした。\n\n{error}": "Exportari ut {format} non potuit.\n\n{error}",
+  "エクスポートの処理が途中で終了しました（終了コード {code}）": "Opus exportandi praemature finitum est (numerus exitus {code})",
+  "{format}にエクスポートしましたが、次のページは変換できませんでした: {pages}": "Exportatum ut {format}, sed hae paginae converti non potuerunt: {pages}",
+  "ページ {page}": "Pagina {page}",
+  "ほかのアプリでこのファイルを開いている場合は、閉じてからもう一度お試しください。": "Si fasciculus alio instrumento apertus est, claude eum et iterum conare.",
   "現在のPDFをページ単位またはページ範囲で分割": "PDF praesens per paginas vel intervalla paginarum divide",
   "PDFを分割": "PDF divide",
   "1ページごとに分割": "Singuli fasciculi singulis paginis",
   "ページ範囲を指定（例: 1-3, 4-6, 7-10）": "Intervalla paginarum indica (e.g. 1-3, 4-6, 7-10)",
   "分割したファイルの保存先フォルダーを選択": "Scrinium fasciculis divisis elige",
   "ページ範囲が正しくありません: {range}": "Intervallum paginarum vitiosum: {range}",
-  "{count}個のファイルに分割しました: {folder}": "In {count} fasciculos divisum est: {folder}",
   "PDFを分割できませんでした。\n\n{error}": "PDF dividi non potuit.\n\n{error}",
   "⋮⋮  テキスト ボックス": "⋮⋮  Capsa textus",
   "⋮⋮  図形": "⋮⋮  Figura",
@@ -168,7 +179,6 @@
   "テキスト ボックスを削除": "Capsam textus dele",
   "削除": "Dele",
   "トリミング": "Reseca",
-  "ハンドルをドラッグしてトリミングの範囲を指定": "Aream resecandam octo ansis constitue",
   "ドラッグして線の終点を移動": "Trahe ut finem lineae moveas",
   "「{document_title}」の変更を保存しますか？": "Visne mutationes in “{document_title}” servare?",
   "保存（&S）": "&Serva",
@@ -176,14 +186,13 @@
   "キャンセル": "Abroga",
   "閉じる": "Claude",
   "ファイル・タブ": "Fasciculus et pittacia",
-  "編集": "Emendatio",
+  "編集": "Emenda",
   "表示・ページ移動": "Aspectus et navigatio",
   "ページ管理": "Administratio paginarum",
-  "描画・注釈ツール": "Instrumenta delineationis et adnotationis",
-  "選択中の図形を回転": "Figuram selectam verte",
+  "選択中のオブジェクトを回転": "Rem impositam selectam verte",
   "矢印キー": "Claves sagittarum",
-  "マウス ホイール": "Rota muris",
-  "連続ズーム": "Amplificatio continua",
+  "マウス ホイール": "rota muris",
+  "連続ズーム": "Amplifica aut minue",
   "{count}件": "{count} inventa",
   "PDFファイル (*.pdf);;すべてのファイル (*.*)": "Fasciculi PDF (*.pdf);;Omnes fasciculi (*.*)",
   "ファイルのパスが長すぎます（260文字まで）。フォルダー名を短くするか、ファイルを上の階層のフォルダーへ移動してください。": "Via fasciculi nimis longa est (non plus quam 260 litterae licent). Nomen scrinii brevius fac, aut fasciculum in locum minus profundum move.",
@@ -200,50 +209,27 @@
   "描画エラー": "Error reddendi",
   "ページを表示できませんでした。\n\n{error}": "Pagina ostendi non potuit.\n\n{error}",
   "表示用の画像のメモリーを確保できませんでした": "Memoria imagini ostendendae attribui non potuit",
-  "ページ {start}-{end}/{total}": "Pagina {start}-{end}/{total}",
+  "ページ {start}-{end}/{total}": "Paginae {start}–{end}/{total}",
   "ページ {page}/{total}": "Pagina {page}/{total}",
   "ページ {page}\n読み込み中…": "Pagina {page}\nParatur…",
   "{name}  •  連続スクロール  •  {count}ページ": "{name}  •  Volutatio continua  •  {count} paginae",
   "ページ {page}\n表示できません": "Pagina {page}\nOstendi non potest",
-  "ページ {page} の付箋へ移動しました": "Ad schedulam adhaerentem paginae {page} itum est",
   "付箋を更新できませんでした。\n\n{error}": "Schedula adhaerens renovari non potuit.\n\n{error}",
-  "「{query}」を検索しています…": "“{query}” quaeritur…",
-  "「{query}」: {count}件見つかりました": "“{query}”: {count} inventa",
   "編集履歴を復元できませんでした。\n\n{error}": "Historia emendationum restitui non potuit.\n\n{error}",
-  "ページをクリックして付箋を追加": "Preme in pagina ut schedulam adhaerentem addas",
-  "ページ上をドラッグして手書き": "Trahe in pagina ut manu libera delinees",
-  "ドラッグして四角形を追加": "Trahe ut rectangulum addas",
-  "ドラッグして矢印を追加": "Trahe ut sagittam addas",
-  "ドラッグして直線を追加": "Trahe ut lineam addas",
-  "クリックした位置に編集できるテキスト ボックスがありません": "In loco presso nulla capsa textus mutabilis est",
+  "クリックした位置に編集できるテキスト ボックスがありません": "Ubi pressisti, nulla est capsa textus quae mutari possit",
   "テキスト ボックスを保存できませんでした。\n\n{error}": "Capsa textus servari non potuit.\n\n{error}",
   "画像データを読み取れません": "Data imaginis legi non possunt",
   "画像を作り直せませんでした": "Imago denuo creari non potuit",
   "画像の変更を保存できませんでした。\n\n{error}": "Emendatio imaginis servari non potuit.\n\n{error}",
-  "{count}個の注釈を選択中": "{count} adnotationes selectae",
   "付箋を追加": "Schedulam adhaerentem adde",
-  "{count}文字に{operation}を追加しました": "{operation} {count} litteris addita",
-  "{operation}を解除しました": "{operation} remota",
-  "付箋を追加しました。挿入モードを終了しました": "Schedula adhaerens addita. Modus inserendi finitus",
-  "図形を追加しました。挿入モードを終了しました": "Figura addita. Modus inserendi finitus",
   "編集を適用できませんでした。\n\n{error}": "Emendatio adhiberi non potuit.\n\n{error}",
-  "{count}個の注釈を削除しました": "{count} adnotationes deletae",
-  "テキスト ボックスの文字をコピーしました": "Textus capsae textus exscriptus",
-  "テキスト注釈をコピーしました": "Adnotatio textus exscripta",
-  "画像をクリップボードへコピーしました": "Imago in tabulam transitoriam exscripta",
-  "選択内容を画像としてコピーしました": "Selectio ut imago exscripta",
-  "選択したテキストをコピーしました": "Textus selectus exscriptus",
   "切り取るものを選択してください": "Primum aliquid excidendum elige",
-  "{count}個の注釈を貼り付けました": "{count} adnotationes agglutinatae",
   "この図形は別のPDFへは貼り付けられません": "Haec figura in aliud PDF agglutinari non potest",
-  "選択内容をコピーしました": "Selectio exscripta",
-  "選択内容を切り取りました": "Selectio excisa",
   "追加する画像を選択": "Imaginem addendam elige",
   "画像 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)": "Imagines (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
   "クリップボードに画像がありません": "In tabula transitoria nulla imago est quam agglutines",
   "クリップボードの画像を読み取れませんでした": "Imago tabulae transitoriae legi non potuit",
   "クリップボード画像": "Imago tabulae transitoriae",
-  "{name}を現在のページへ貼り付けました": "In paginam praesentem agglutinatum: {name}",
   "画像を追加できませんでした。\n\n{error}": "Imago addi non potuit.\n\n{error}",
   "追加するPDFを選択": "PDF addendum elige",
   "PDFファイル (*.pdf)": "Fasciculi PDF (*.pdf)",
@@ -251,18 +237,11 @@
   "PDFページを追加できませんでした。\n\n{error}": "Paginae PDF addi non potuerunt.\n\n{error}",
   "PDFには1ページ以上必要です。": "PDF saltem unam paginam habere debet.",
   "現在のページを書き出し": "Paginam praesentem exporta",
-  "ページを書き出しました: {path}": "Pagina exportata: {path}",
-  "ページの順序を変更しました": "Ordo paginarum mutatus",
-  "ページをコピーしました": "Pagina exscripta",
-  "ページを切り取りました": "Pagina excisa",
   "ページをコピーできませんでした。\n\n{error}": "Pagina exscribi non potuit.\n\n{error}",
-  "ページを貼り付けました": "Pagina agglutinata",
   "ページを書き出せませんでした。\n\n{error}": "Pagina exportari non potuit.\n\n{error}",
   "テキストを取得できませんでした。\n\n{error}": "Textus obtineri non potuit.\n\n{error}",
   "このページにはコピーできるテキストがありません。": "In hac pagina nullus textus est qui exscribi possit.",
-  "ページ {page} のテキストをコピーしました": "Textus paginae {page} exscriptus",
   "名前を付けて保存": "Alio nomine serva",
-  "保存しました: {path}": "Servatum: {path}",
   "PDFを保存できませんでした。\n\n{error}": "PDF servari non potuit.\n\n{error}",
   "不明": "Ignotum",
   "文書のプロパティ": "Proprietates scripti",
@@ -286,13 +265,11 @@
   "開く": "Aperi",
   "印刷": "Imprime",
   "印刷を準備しています…": "Impressio paratur…",
-  "プリンターに送信しました": "Ad imprimendum missum",
   "更新": "Renova",
-  "表示を更新しました": "Aspectus renovatus",
   "選択中の文字列に下線を引く": "Textum selectum linea subiecta nota",
   "選択中の文字列に取り消し線を引く": "Textum selectum linea transversa nota",
   "選択中の文字列をハイライト": "Textum selectum illumina",
-  "手書きの挿入": "Delineationem liberam insere",
+  "手書きの挿入": "Manu libera delinea",
   "{description}：{shortcut}": "{description}: {shortcut}",
   "貼り付け": "Agglutina",
   "移動": "Move",
@@ -315,17 +292,10 @@
   "ハイライトの色": "Color illuminationis",
   "下線の色": "Color lineae subiectae",
   "取り消し線の色": "Color lineae transversae",
-  "図形・手書きの色": "Color figurarum et manus liberae",
+  "図形・手書きの色": "Color delineationis",
   "ページ全体": "Pagina tota",
   "ズーム": "Amplificatio",
-  "表紙を単独表示": "Tegumentum seorsum ostende",
-  "{key}で確定": "{key} ut finias",
-  "クリックで選択、ドラッグで範囲選択": "Preme ut eligas, trahe ut aream eligas",
-  "ページをクリックしてテキスト ボックスを追加": "Preme in pagina ut capsam textus addas",
-  "画像を選択中": "Imago selecta",
-  "注釈を選択中": "Adnotatio selecta",
-  "矢印を選択中": "Sagitta selecta",
-  "図形を選択中": "Figura selecta",
+  "表紙を単独表示": "In paginis adversis tegumentum seorsum ostende",
   "文字列を選択してください": "Primum aliquid textus elige",
   "ドラッグ＆ドロップでも開けます": "PDF etiam huc trahere et demittere potes",
   "別のアプリが起動することがあります。\n\n{uri}\n\n開きますか？": "Fieri potest ut hoc aliud instrumentum excitet.\n\n{uri}\n\nVisne id aperire?",
@@ -334,14 +304,11 @@
   "サニタイズしたコピーを保存": "Exemplum purgatum serva",
   "サニタイズしたPDFを保存": "PDF purgatum serva",
   "保護": "Tutela",
-  "墨消しの範囲を{count}件マークしました。「墨消しを適用」で確定します": "{count} areae ad oblitterandum notatae. “Oblitterationes adhibe” elige ut finias.",
   "適用する墨消しがありません": "Nullae oblitterationes adhibendae",
-  "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": "Visne {count} oblitterationes adhibere? Textus et imagines subter iacentes, atque adnotationes et campi formulae quae eas attingunt, removebuntur. In PDF servato non retinentur neque ex eo recuperari possunt. Dum gradus in historia emendationum manet, “Revoca” eum reducere potest.\n\nPergamne?",
+  "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる文字装飾・オブジェクト・フォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": "Visne {count} oblitterationes adhibere?\n\nTextus et imagines subter iacentes, atque notae textus, res impositae et campi formulae quae eas attingunt, removebuntur. In PDF servato non manebunt neque ex eo recuperari poterunt. Dum hic gradus in historia emendationum manet, eum per “Revoca” rescindere potes.",
   "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": "Iam exstant {count} fasciculi eisdem nominibus. Visne eos substituere?\n\n{names}",
-  "{count}件の墨消しを適用しました": "{count} oblitterationes adhibitae",
   "墨消しを適用できませんでした。\n\n{error}": "Oblitterationes adhiberi non potuerunt.\n\n{error}",
   "サニタイズできませんでした。\n\n{error}": "Scriptum purgari non potuit.\n\n{error}",
-  "サニタイズしたPDFを保存しました: {path}": "PDF purgatum servatum: {path}",
   "この文字列を検索": "Hunc textum quaere",
   "挿入": "Insere",
   "ページのテキストをコピー": "Textum paginae exscribe",
@@ -352,24 +319,20 @@
   "言語データのフォルダーを開く": "Scrinium datorum linguae aperi",
   "フォルダーを開けませんでした: {folder}": "Scrinium aperiri non potuit: {folder}",
   "OCR中… ({done}/{total})": "OCR fit… ({done}/{total})",
-  "OCRが完了しました ({count}ページ)": "OCR perfectum ({count} paginae)",
-  "OCRを中止しました": "OCR abrogatum",
   "OCRを中止": "OCR abroga",
   "フォーム入力": "Campos formulae imple",
   "このPDFにはフォームがありません": "Hoc PDF campos formulae non habet",
-  "フォームを更新しました": "Campus formulae renovatus",
   "フォームを編集できませんでした。\n\n{error}": "Campus formulae mutari non potuit.\n\n{error}",
   "表示": "Aspectus",
   "OCRを実行できませんでした。\n\n{error}": "OCR fieri non potuit.\n\n{error}",
   "認識できる文字がありませんでした": "Nullus textus agnosci potuit",
   "OCRが必要なページはありません": "Nulla pagina OCR eget",
-  "墨消しが{count}件マークされています。適用すると完全に削除されます": "{count} areae ad oblitterandum notatae sunt. Adhibitae in perpetuum removentur",
+  "墨消しが{count}件マークされています。適用すると完全に削除されます": "{count} areae ad oblitterandum notatae sunt. Cum adhibentur, quae subsunt in perpetuum removentur.",
   "適用": "Adhibe",
   "マークを削除": "Notas remove",
-  "墨消しのマークを削除しました": "Notae oblitterationis remotae",
-  "入力できるフォームがあります": "Hoc PDF campos formulae habet quos implere potes",
+  "入力できるフォームがあります": "Hoc PDF campos formulae habet quos implere potes.",
   "最初の欄へ": "Ad primum campum i",
-  "このページにはテキストがありません。OCRを実行すると、検索やコピーができるようになります": "Haec pagina textum non habet. OCR efficit ut in ea quaeri et ex ea exscribi possit",
+  "このページにはテキストがありません。OCRを実行すると、検索やコピーができるようになります": "Haec pagina textum non habet. OCR efficit ut in ea quaeri et ex ea exscribi possit.",
   "OCRを実行": "OCR exsequere",
   "すべて選択": "Omnia elige",
   "このタブを閉じる": "Pittacium claude",
@@ -381,7 +344,6 @@
   "入力": "Imple",
   "この欄を消去": "Hunc campum purga",
   "すべての欄を消去": "Omnes campos purga",
-  "フォームの入力を消去しました": "Inscriptiones formulae purgatae",
   "配置": "Dispositio",
   "左揃え": "Ad sinistram",
   "中央揃え": "Ad medium",
@@ -392,7 +354,6 @@
   "前面へ移動": "Uno gradu promove",
   "背面へ移動": "Uno gradu remove",
   "フォントを選択": "Typum litterarum elige",
-  "注釈を選択してください": "Primum adnotationem elige",
   "ページを先頭 / 末尾へ移動": "Paginam ad initium / finem move",
   "100%": "100%",
   "画像として保存": "Ut imaginem serva",
@@ -405,11 +366,7 @@
   "太い": "Crassa",
   "極太": "Crassissima",
   "画像 (*.png *.jpg *.jpeg)": "Imagines (*.png *.jpg *.jpeg)",
-  "画像を保存しました: {path}": "Imago servata: {path}",
   "画像を保存できませんでした。\n\n{error}": "Imago servari non potuit.\n\n{error}",
-  "注釈を削除できませんでした": "Adnotatio deleri non potuit",
-  "{done}/{total}個の注釈を削除しました（一部失敗）": "{done} ex {total} adnotationibus deletae (quaedam defecerunt)",
-  "注釈を変更できませんでした": "Adnotatio mutari non potuit",
   "上余白": "Supra",
   "下余白": "Infra",
   "左余白": "Sinistra",
@@ -455,34 +412,25 @@
   "テキスト ボックスを開けませんでした": "Capsa textus aperiri non potuit",
   "認識した文字をページに書き込めませんでした": "Textus agnitus est, sed in paginam scribi non potuit",
   "PDFファイルではありません。": "Hic fasciculus PDF non est.",
-  "編集を確定できなかったため保存を中止しました": "Servatio abrogata: emendatio pendens confirmari non potuit",
-  "編集を確定できなかったためタブを閉じませんでした": "Pittacium non clausum est: emendatio quae in manibus erat perfici non potuit.",
-  "編集を確定できなかったため印刷を中止しました": "Impressio abrogata est: emendatio quae in manibus erat perfici non potuit.",
-  "編集を確定できなかったため中止しました": "Abrogatum: emendatio quae in manibus erat perfici non potuit.",
+  "編集を確定できなかったため保存を中止しました": "Servatio abrogata est: emendatio quae in manibus erat perfici non potuit",
+  "編集を確定できなかったためタブを閉じませんでした": "Pittacium non clausum est: emendatio quae in manibus erat perfici non potuit",
+  "編集を確定できなかったため印刷を中止しました": "Impressio abrogata est: emendatio quae in manibus erat perfici non potuit",
+  "編集を確定できなかったため中止しました": "Abrogatum: emendatio quae in manibus erat perfici non potuit",
   "途中まで行った処理を元に戻せませんでした。文書の一部が変更されたままになっている可能性があります。": "Mutatio ex parte facta revocari non potuit. Fieri potest ut pars scripti mutata sit.",
   "図形を保存できませんでした。\n\n{error}": "Figura servari non potuit.\n\n{error}",
-  "{done}/{total}個の注釈を変更しました（一部失敗）": "{done} ex {total} adnotationibus mutatae (quaedam defecerunt)",
-  "{count}個の注釈の色を変更しました": "Color {count} adnotationum mutatus",
-  "{count}個の注釈の線の太さを変更しました": "Crassitudo lineae {count} adnotationum mutata",
-  "{count}個の注釈を複製しました": "{count} adnotationes duplicatae",
   "重ね順を変更できませんでした": "Ordo stratorum mutari non potuit",
-  "最前面へ移動しました": "In primum locum allatum",
-  "最背面へ移動しました": "In ultimum locum remissum",
-  "前面へ移動しました": "Uno gradu promotum",
-  "背面へ移動しました": "Uno gradu remotum",
   "墨消しのマークを削除できませんでした": "Notae oblitterationis removeri non potuerunt",
   "  •  軽量描画": "  •  Redditio levis",
   "色の変更": "Color",
   "OK": "Fiat",
   "印刷を開始できませんでした。プリンターの状態をご確認ください。": "Impressio incipi non potuit. Impressorium inspice.",
   "ページを印刷できませんでした。\n\n{error}": "Pagina imprimi non potuit.\n\n{error}",
-  "リンクを開きませんでした": "Nexus non apertus",
   "「{name}」の復元にはパスワードが必要です。": "Ad “{name}” restituendum tessera eius requiritur.",
   "このPDFは大きいため、元に戻す履歴を保持できません": "Hoc PDF maius est quam ut historia revocandi servetur",
   "複数部を印刷するとき、1部ずつページ順にそろえて出力します（1,2,3 → 1,2,3）。オフにすると同じページをまとめて出力します（1,1 → 2,2 → 3,3）。": "Cum plura exemplaria imprimuntur, quodque exemplar integrum ordine paginarum imprimitur (1,2,3 → 1,2,3). Exstingue ut omnia exemplaria cuiusque paginae simul imprimantur (1,1 → 2,2 → 3,3).",
   "このPDFには作成者が設定した使用制限があります。権利者の意図に沿ってご利用ください": "Auctor huius PDF usum restrinxit. Voluntatem domini iurium observa.",
   "追加したページの元のPDFには使用制限があります。この文書にはその制限は引き継がれません": "PDF unde hae paginae venerunt usum restrictum habet. Restrictiones in hoc scriptum non transferuntur.",
-  "{count}個の注釈またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": "{count} adnotationes aut campi formulae removeri non potuerunt. In areis oblitteratis aliquid manere potest; scriptum inspice antequam id servas.",
+  "{count}個の項目またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": "{count} res aut campi formulae removeri non potuerunt. In areis oblitteratis aliquid manere potest; scriptum inspice antequam id servas.",
   "この文書には見えない文字（OCRで付けた文字など）があります。削除すると、サニタイズしたPDFでは検索やコピーができなくなります。\n\n見えない文字も削除しますか？": "Hoc scriptum textum invisibilem continet, ut textum per OCR additum. Si removebitur, in PDF purgato non iam quaeri neque ex eo exscribi poterit.\n\nVisne textum invisibilem quoque removere?",
   "各ソフトウェアに含まれるライブラリやフォントまで載せた一覧と、ソース コードの入手先は、「{tab}」タブの「{document}」にあります。": "Index plenus, una cum bibliothecis et typis litterarum quae singulis partibus insunt, et unde codex fontis eorum peti possit, in “{document}” est, in pittacio “{tab}”.",
   "制限": "Restrictiones",
@@ -517,7 +465,6 @@
   "{count} 年ごとに自動更新されます": "Sponte renovatur singulis {count} annorum spatiis",
   "自動更新されます": "Sponte renovatur",
   "Microsoft Store から商品と価格を読み込んでいます…": "Merces et pretia e Microsoft Store petuntur…",
-  "購入の前にお読みください:": "Ante emptionem, quaeso, lege:",
   "特定商取引法に基づく表記": "Notitia legalis ad Iaponiam pertinens (lex de certis negotiis mercatoriis)",
   "利用規約に同意します。購入後すぐにプレミアム機能が使えるようになることに同意し、欧州経済領域又は英国にお住まいの場合は、これにより撤回権を失うことを了承します。": "Condicionibus usus assentior. Assentior facultates Premium statim post emptionem praeberi et, si in Spatio Oeconomico Europaeo aut in Regno Unito habito, agnosco me ita ius recedendi amittere.",
   "Microsoft Store で購入": "In Microsoft Store eme",
@@ -552,7 +499,7 @@
   "ライセンス": "Licentia",
   "ライセンス ファイルが見つかりません: {name}": "Fasciculus licentiae non inventus: {name}",
   "GNU AGPL 第3版（またはそれ以降の版）の下で提供され、ライセンシーは同ライセンスに従って頒布できます。法令で認められる範囲で無保証です。": "Sub GNU AGPL, editione 3 aut posteriore, licentia datur, secundum quam ii quibus licentia data est id aliis tradere possunt. SINE ULLA CAUTIONE praebetur, quatenus lex sinit.",
-  "ページを固定": "Paginam fige",
+  "ページを固定": "Pagina post paginam",
   "プレミアムでお使いいただけるもの:": "Premium continet:",
   "開く・読む・ハイライト・付箋・手書き・図形・保存・印刷は、これまでどおり無料でお使いいただけます。": "Aperire, legere, illuminare, schedulas adhaerentes addere, manu libera delineare, figuras addere, servare, imprimere: haec gratuita manent.",
   "プレミアム機能": "Facultas Premium",
@@ -563,9 +510,8 @@
   "テキスト ボックスの追加": "Additio capsarum textus",
   "キー ヒントを表示": "Indicia clavium ostende",
   "Alt キー": "Alt",
-  "以前の pdfNote で大きくなっていたファイルです。保存すると {before} から {after} になります": "Editio prior pdfNote hunc fasciculum maiorem quam opus est fecit. Servando ex {before} fit {after}",
+  "以前の pdfNote で大きくなっていたファイルです。保存すると {before} から {after} になります": "Editio prior pdfNote hunc fasciculum maiorem quam opus est fecit. Servando ex {before} fit {after}.",
   "PDFとして保存": "Ut PDF serva",
-  "印刷を取り消しました": "Impressio abrogata",
   "開いているPDFには上書きできません。別の名前を指定してください。": "PDF apertum superscribi non potest. Aliud nomen elige.",
   "PDFを書き出せませんでした。\n\n{error}": "PDF scribi non potuit.\n\n{error}",
   "OCRの処理が途中で終了しました（終了コード {code}）": "Opus OCR praemature finitum est (numerus exitus {code})",
@@ -580,19 +526,123 @@
   "今はしない": "Alias",
   "今後このメッセージを表示しない": "Ne iterum ostendatur",
   "Windows の設定を開けませんでした": "Optiones Windows aperiri non potuerunt",
-  "Windows の設定で「.pdf」に pdfNote を選んでください": "In Optionibus Windows pdfNote fasciculis “.pdf” elige",
-  "PDF を開く既定のアプリを pdfNote にしました": "pdfNote nunc fasciculos tuos PDF aperit",
   "PDFを分割できませんでした。{total}個のうち{done}個のファイルは書き出しました。「{name}」から先は書き出していません。\n\n{error}": "PDF dividi non potuit. {done} ex {total} fasciculis scripti sunt; nihil ab “{name}” deinceps scriptum est.\n\n{error}",
-  "PDFに書き出しました: {path}": "PDF servatum: {path}",
   "pdfNote が PDF を直接作ります。文字は選択・検索でき、ファイルは小さくなります": "pdfNote ipsum PDF scribit: textus eligi et quaeri potest, et fasciculus parvus manet",
   "新しいウィンドウに移動": "Pittacium in novam fenestram move",
   "OCRの言語データ": "Data linguae ad OCR",
   "OCRには言語データが必要です。次の言語データをダウンロードしますか？\n\n{languages}（約 {size} MB）\n\nダウンロード元: GitHub（Tesseract OCR プロジェクト）。接続するのは、このダウンロードのときだけです。": "OCR data linguae requirit. Visne haec data linguae arcessere?\n\n{languages} (circiter {size} MB)\n\nE GitHub (opus Tesseract OCR). Conexus interretialis huius tantum arcessendi causa fit.",
   "OCRの言語データをダウンロードしています… ({done} / {total} MB)": "Data linguae ad OCR arcessuntur… ({done} ex {total} MB)",
-  "ダウンロードを中止しました": "Arcessere desitum est",
   "ダウンロードしたデータが壊れています。もう一度お試しください。": "Data arcessita corrupta sunt. Iterum conare.",
   "OCRの言語データをダウンロードできませんでした。\n\n{error}": "Data linguae ad OCR arcessi non potuerunt.\n\n{error}",
-  "OCRの言語データをダウンロードしました": "Data linguae ad OCR arcessita sunt"
+  "OCRの言語": "Linguae ad OCR",
+  "読み取る言語を選んでください。複数選ぶと、そのどの言語の文字も読み取ります（例：日本語と英語を選ぶと、日本語とアルファベットの両方）。": "Elige linguas legendas. Si plures eligis, litterae cuiusvis earum leguntur (exempli gratia, Iaponica et Anglica electis, et Iaponicae et Latinae litterae leguntur).",
+  "言語データの管理...": "Data linguae cura...",
+  "言語データがありません。［言語データの管理］からダウンロードしてください。": "Data linguae desunt. Arcesse ea per “Data linguae cura”.",
+  "言語を検索": "Linguam quaere",
+  "ダウンロード": "Arcesse",
+  "ダウンロード元: GitHub（Tesseract OCR プロジェクト）": "E GitHub (opus Tesseract OCR)",
+  "フォルダーを開く": "Scrinium aperi",
+  "ダウンロード済み": "Arcessitae",
+  "{count} 言語を選択（約 {size} MB）": "{count} linguae selectae (circiter {size} MB)",
+  "{count} 言語（約 {size} MB）": "{count} linguae (circiter {size} MB)",
+  "選んだ {count} 言語の言語データを削除しますか？": "Visne data {count} linguarum selectarum delere?",
+  "OCRの実行中は言語データを削除できません": "Dum OCR fit, data linguae deleri non possunt",
+  "{languages} ほか {count} 言語": "{languages} et {count} aliae",
+  "リンクを開く前に確認する": "Ante nexus aperiendos interroga",
+  "文書の外へのリンク（ウェブ ページやメール）を開く前に確かめる": "Interroga antequam nexus extra scriptum ducens (pagina interretialis vel epistula electronica) aperiatur",
+  "OCRの言語データ...": "Data linguae ad OCR...",
+  "文書の外へのリンクを開こうとしています。": "Nexum extra scriptum ducentem aperturus es.",
+  "{uri}\n\n開きますか？": "{uri}\n\nVisne eum aperire?",
+  "今後は確認せずにリンクを開く": "Posthac nexus sine interrogatione aperi",
+  "絞り込み": "Secerne",
+  "種類と色で絞り込む": "Secundum genus et colorem secerne",
+  "図形": "Figura",
+  "その他": "Cetera",
+  "文字装飾": "Notae textus",
+  "文字装飾はありません": "Nullae notae textus",
+  "オブジェクト": "Res impositae",
+  "オブジェクトはありません": "Nullae res impositae",
+  "{shown} / {total} 件": "{shown} ex {total}",
+  "{total} 件": "{total} res",
+  "種類": "Genus",
+  "色": "Color",
+  "その他の色": "Alii colores",
+  "すべて表示": "Omnia ostende",
+  "項目を選択してください": "Prius rem elige",
+  "項目を削除できませんでした": "Selecta deleri non potuerunt",
+  "{done}/{total}個の項目を削除しました（一部失敗）": "Deleta: {done} ex {total} (quaedam deleri non potuerunt)",
+  "項目を変更できませんでした": "Selecta mutari non potuerunt",
+  "{done}/{total}個の項目を変更しました（一部失敗）": "Mutata: {done} ex {total} (quaedam mutari non potuerunt)",
+  "画像とテキスト ボックスは回転できません": "Imagines et capsae textus verti non possunt",
+  "このページを目次に追加": "Hanc paginam indici capitum adde",
+  "表示しているページを目次に追加": "Paginam quae ostenditur indici capitum adde",
+  "目次を変更できませんでした。\n\n{error}": "Index capitum mutari non potuit.\n\n{error}",
+  "名前の変更": "Nomen muta",
+  "目次から削除": "Ex indice capitum remove",
+  "すべて折りたたむ": "Omnia contrahe",
+  "すべて展開": "Omnia explica",
+  "選択したページを複製": "Paginas selectas duplica",
+  "選択したページを削除": "Paginas selectas dele",
+  "選択したページを90度回転": "Paginas selectas 90° verte",
+  "更新日時": "Dies mutationis",
+  "名前": "Nomen",
+  "オプション...": "Optiones...",
+  "オプション": "Optiones",
+  "［ファイル］→［オプション］で元に戻せます": "Hoc postea mutare potes per “Fasciculus” > “Optiones”.",
+  "正方形に描く": "Quadratum describe",
+  "45度ずつ描く": "Angulis 45° describe",
+  "ドラッグ": "trahe",
+  "角をドラッグ": "angulum trahe",
+  "ダブルクリック": "Bis preme",
+  "単語を選択": "Verbum elige",
+  "縦横比を保ってサイズ変更": "Magnitudinem servata proportione muta",
+  "選択した項目を編集": "Rem selectam muta",
+  "文字装飾・描画ツール": "Instrumenta notarum textus et delineationis",
+  "直線・矢印は45度ずつ、四角形は正方形に": "Lineae et sagittae angulis 45°, rectangula quadrata",
+  "タブを入力": "Intervallum insere",
+  "　・{item}": "• {item}",
+  "{label}: {value}": "{label}: {value}",
+  "p.{page}": "p. {page}",
+  " pt": " pt",
+  "%": "%",
+  "{name}  •  {page}  •  {zoom}%": "{name}  •  {page}  •  {zoom}%",
+  "{value} dpi": "{value} dpi",
+  "{name}  ({size} MB)": "{name} ({size} MB)",
+  "{name}  ({size} MB) — ダウンロード済み": "{name} ({size} MB) — arcessita",
+  "{name}  （ダウンロードが必要）": "{name} (arcessenda)",
+  "{badge} — プレミアム機能": "Facultas Premium",
+  "購入の前にお読みください: {terms}　{tokushoho}　{privacy}": "Ante emptionem, quaeso, lege: {terms} · {tokushoho} · {privacy}",
+  "{name} (印刷)": "{name} (impressum)",
+  "{name} (サニタイズ済み)": "{name} (purgatum)",
+  "{size} KB": "{size} KB",
+  "{size} MB": "{size} MB",
+  "ページ〔タブ〕": "Paginae",
+  "移動〔ページ〕": "Transitus",
+  "カラー〔見出し〕": "Color",
+  "なし〔制限〕": "Nullae",
+  "編集〔見出し〕": "Emendatio",
+  "検索〔見出し〕": "Inquisitio",
+  "回転〔動詞〕": "Converte",
+  "ハイライト〔名詞〕": "Illuminatio",
+  "下線〔名詞〕": "Linea subiecta",
+  "取り消し線〔名詞〕": "Linea transversa",
+  "墨消し〔名詞〕": "Oblitteratio",
+  "{first}、{then}": "{first}, {then}",
+  "更新の履歴": "Series editionum",
+  "新しい版があるか確かめる": "Quaere novam editionem",
+  "Microsoft Store を開く": "Microsoft Store aperi",
+  "新しい版の確認": "Nova editio quaeritur",
+  "Microsoft Store に問い合わせて、新しい版があるかを確かめます。インターネットに接続します。よろしいですか？": "pdfNote a Microsoft Store quaeret num nova editio praesto sit. Ad hoc cum interreti conectetur. Pergisne?",
+  "Microsoft Store に問い合わせています…": "Microsoft Store interrogatur…",
+  "この{app}は Microsoft Store から入れたものではないため、新しい版を確かめられません。": "Hoc exemplar {app} non ex Microsoft Store institutum est; itaque novam editionem quaerere non potest.",
+  "新しい版があります。Microsoft Store で更新してください。": "Nova editio praesto est. pdfNote in Microsoft Store renova.",
+  "お使いの{app} {version}は最新の版です。": "{app} {version} editio novissima est.",
+  "このアプリを最初に有償購入してくれたのはデンマークの方でした。彼または彼女への最大限の感謝の印にデンマーク語とその祖先の古ノルド語対応をしました。": "Qui primus hoc instrumentum emit, e Dania erat. In signum summae gratiae erga eum eamve linguam Danicam eiusque parentem, linguam Norrenam antiquam, addidi.",
+  "pdfNoteは若き開発者がたった一人で作っています。もし気に入っていただけたなら、有償版を購入して開発者を応援していただけないでしょうか。": "pdfNote unus iuvenis artifex solus conficit. Si tibi placet, velisne Premium emendo artificem adiuvare?",
+  "{app} のレビュー": "Iudicium de {app}",
+  "pdfNoteは若き開発者がたった一人で作っています。Microsoft Store でレビューしていただけると励みになります。": "pdfNote unus iuvenis artifex solus conficit. Si de eo iudicium in Microsoft Store scripseris, artifici magno incitamento erit.",
+  "レビューを書く": "Iudicium scribe",
+  "{days}日間のプレミアム機能無料体験期間が終了してしまいました。マウスを使えば引き続き無料でpdfNoteをご利用いただけます。右クリックメニューやショートカットなどのプレミアム機能をお求めの場合は、有償版を購入してください。このアプリの開発者が大層喜んで小躍りし、シェイプアップを達成することでしょう。": "Experimentum gratuitum facultatum Premium, {days} dierum, finitum est. Mure adhibito pdfNote gratis uti pergere potes. Si facultates Premium cupis, ut tabellam contextus et compendia clavium, Premium eme: is qui pdfNote conficit tanto gaudio afficietur ut prae laetitia saltet ac tandem gracilior fiat."
  },
  "plural": {
   "{count} か月ごとに自動更新されます": {
@@ -607,62 +657,44 @@
   "{count}件": {
    "one": "{count} inventum"
   },
-  "「{query}」: {count}件見つかりました": {
-   "one": "“{query}”: {count} inventum"
-  },
   "{name}  •  {count}ページ": {
    "one": "{name}  •  {count} pagina"
   },
   "{name}  •  連続スクロール  •  {count}ページ": {
    "one": "{name}  •  Volutatio continua  •  {count} pagina"
   },
-  "OCRが完了しました ({count}ページ)": {
-   "one": "OCR perfectum ({count} pagina)"
-  },
   "{total}ページを印刷します": {
    "one": "{total} pagina imprimitur"
   },
-  "墨消しの範囲を{count}件マークしました。「墨消しを適用」で確定します": {
-   "one": "{count} area ad oblitterandum notata. “Oblitterationes adhibe” elige ut finias."
-  },
-  "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる注釈やフォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": {
-   "one": "Visne {count} oblitterationem adhibere? Textus et imagines subter iacentes, atque adnotationes et campi formulae quae eam attingunt, removebuntur. In PDF servato non retinentur neque ex eo recuperari possunt. Dum gradus in historia emendationum manet, “Revoca” eum reducere potest.\n\nPergamne?"
+  "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる文字装飾・オブジェクト・フォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": {
+   "one": "Visne {count} oblitterationem adhibere?\n\nTextus et imagines subter iacentes, atque notae textus, res impositae et campi formulae quae eam attingunt, removebuntur. In PDF servato non manebunt neque ex eo recuperari poterunt. Dum hic gradus in historia emendationum manet, eum per “Revoca” rescindere potes."
   },
   "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": {
    "one": "Iam exstat fasciculus eodem nomine. Visne eum substituere?\n\n{names}"
   },
-  "{count}件の墨消しを適用しました": {
-   "one": "{count} oblitteratio adhibita"
-  },
   "墨消しが{count}件マークされています。適用すると完全に削除されます": {
-   "one": "{count} area ad oblitterandum notata est. Adhibita in perpetuum removetur"
+   "one": "{count} area ad oblitterandum notata est. Cum adhibetur, quae subsunt in perpetuum removentur."
   },
-  "{count}個のファイルに分割しました: {folder}": {
-   "one": "In {count} fasciculum divisum est: {folder}"
+  "{count}個の項目またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {
+   "one": "{count} res aut campus formulae removeri non potuit. In areis oblitteratis aliquid manere potest; scriptum inspice antequam id servas."
   },
-  "{count}個の注釈を削除しました": {
-   "one": "{count} adnotatio deleta"
+  "{count} 言語を選択（約 {size} MB）": {
+   "one": "{count} lingua selecta (circiter {size} MB)"
   },
-  "{count}個の注釈を選択中": {
-   "one": "{count} adnotatio selecta"
+  "{count} 言語（約 {size} MB）": {
+   "one": "{count} lingua (circiter {size} MB)"
   },
-  "{count}文字に{operation}を追加しました": {
-   "one": "{operation} {count} litterae addita"
+  "選んだ {count} 言語の言語データを削除しますか？": {
+   "one": "Visne data linguae selectae delere?"
   },
-  "{count}個の注釈を貼り付けました": {
-   "one": "{count} adnotatio agglutinata"
+  "{languages} ほか {count} 言語": {
+   "one": "{languages} et {count} alia"
   },
-  "{count}個の注釈を複製しました": {
-   "one": "{count} adnotatio duplicata"
+  "{shown} / {total} 件": {
+   "one": "{shown} ex {total}"
   },
-  "{count}個の注釈の線の太さを変更しました": {
-   "one": "Crassitudo lineae {count} adnotationis mutata"
-  },
-  "{count}個の注釈の色を変更しました": {
-   "one": "Color {count} adnotationis mutatus"
-  },
-  "{count}個の注釈またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {
-   "one": "{count} adnotatio aut campus formulae removeri non potuit. In areis oblitteratis aliquid manere potest; scriptum inspice antequam id servas."
+  "{total} 件": {
+   "one": "{total} res"
   }
  },
  "qt": [
@@ -673,28 +705,8 @@
   },
   {
    "context": "QPlatformTheme",
-   "source": "Save",
-   "text": "Serva"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Save All",
-   "text": "Omnia serva"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Open",
-   "text": "Aperi"
-  },
-  {
-   "context": "QPlatformTheme",
    "source": "&Yes",
    "text": "&Ita"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Yes to &All",
-   "text": "Ita ad &omnia"
   },
   {
    "context": "QPlatformTheme",
@@ -703,58 +715,8 @@
   },
   {
    "context": "QPlatformTheme",
-   "source": "N&o to All",
-   "text": "Non ad omni&a"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Abort",
-   "text": "Desine"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Retry",
-   "text": "Iterum conare"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Ignore",
-   "text": "Neglege"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Close",
-   "text": "Claude"
-  },
-  {
-   "context": "QPlatformTheme",
    "source": "Cancel",
    "text": "Abroga"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Discard",
-   "text": "Abice"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Help",
-   "text": "Auxilium"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Apply",
-   "text": "Adhibe"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Reset",
-   "text": "Restitue"
-  },
-  {
-   "context": "QPlatformTheme",
-   "source": "Restore Defaults",
-   "text": "Solita restitue"
   },
   {
    "context": "QColorDialog",
@@ -788,11 +750,6 @@
   },
   {
    "context": "QColorDialog",
-   "source": "A&lpha channel:",
-   "text": "Canalis a&lpha:"
-  },
-  {
-   "context": "QColorDialog",
    "source": "&HTML:",
    "text": "&HTML:"
   },
@@ -800,11 +757,6 @@
    "context": "QColorDialog",
    "source": "Cursor at %1, %2\nPress ESC to cancel",
    "text": "Cursor ad %1, %2\nPreme ESC ut abroges"
-  },
-  {
-   "context": "QColorDialog",
-   "source": "Select Color",
-   "text": "Colorem elige"
   },
   {
    "context": "QColorDialog",
@@ -824,7 +776,7 @@
   {
    "context": "QColorDialog",
    "source": "&Pick Screen Color",
-   "text": "Colorem e quadro sum&e"
+   "text": "Colorem e conspectu sum&e"
   },
   {
    "context": "QLineEdit",
@@ -863,21 +815,6 @@
   },
   {
    "context": "QWidgetTextControl",
-   "source": "&Undo",
-   "text": "&Revoca"
-  },
-  {
-   "context": "QWidgetTextControl",
-   "source": "&Redo",
-   "text": "R&efice"
-  },
-  {
-   "context": "QWidgetTextControl",
-   "source": "Cu&t",
-   "text": "Exc&ide"
-  },
-  {
-   "context": "QWidgetTextControl",
    "source": "&Copy",
    "text": "E&xscribe"
   },
@@ -885,16 +822,6 @@
    "context": "QWidgetTextControl",
    "source": "Copy &Link Location",
    "text": "Locum &nexus exscribe"
-  },
-  {
-   "context": "QWidgetTextControl",
-   "source": "&Paste",
-   "text": "&Agglutina"
-  },
-  {
-   "context": "QWidgetTextControl",
-   "source": "Delete",
-   "text": "Dele"
   },
   {
    "context": "QWidgetTextControl",
@@ -980,16 +907,6 @@
    "context": "QScrollBar",
    "source": "Scroll down",
    "text": "Voluta deorsum"
-  },
-  {
-   "context": "QMessageBox",
-   "source": "Show Details...",
-   "text": "Singula ostende..."
-  },
-  {
-   "context": "QMessageBox",
-   "source": "Hide Details...",
-   "text": "Singula cela..."
   }
  ]
 }

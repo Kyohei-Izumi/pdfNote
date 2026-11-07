@@ -1,8 +1,22 @@
 PyMuPDF==1.28.2
 PySide6==6.11.1
 PyInstaller==6.22.0
-# Only for tools/make_icons.py, which makes the icon and the Store images;
-# pdfNote.spec keeps it out of the exe.
+# File > Export (6.7): Word through pdf2docx and python-docx, PowerPoint
+# through python-pptx, Excel through XlsxWriter. Every package they bring in
+# is pinned here too, as each is part of the exe.
+pdf2docx==0.5.13
+python-docx==1.2.0
+python-pptx==1.0.2
+XlsxWriter==3.2.9
+lxml==6.1.3
+opencv-python-headless==5.0.0.93
+numpy==2.4.6
+fonttools==4.66.1
+# pdf2docx's command line only; pdfNote.spec keeps them out of the exe.
+fire==0.7.1
+termcolor==3.3.0
+# python-pptx reads pictures with it (6.7), and tools/make_icons.py makes
+# the icon and the Store images with it.
 Pillow==12.3.0
 # The Microsoft Store edition's purchases (Windows.Services.Store). Windows
 # only; elsewhere pdfNote runs without them and cannot buy premium.
@@ -10,4 +24,5 @@ winrt-runtime==3.2.1; sys_platform == "win32"
 winrt-Windows.Foundation==3.2.1; sys_platform == "win32"
 winrt-Windows.Foundation.Collections==3.2.1; sys_platform == "win32"
 winrt-Windows.Services.Store==3.2.1; sys_platform == "win32"
-typing_extensions==4.15.0; sys_platform == "win32"
+# Used by PyWinRT, python-docx and python-pptx.
+typing_extensions==4.15.0

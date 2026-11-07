@@ -54,6 +54,7 @@
     <Resource Language="hi" />
     <Resource Language="bn" />
     <Resource Language="ur" />
+    <Resource Language="da" />
   </Resources>
 
   <Applications>
