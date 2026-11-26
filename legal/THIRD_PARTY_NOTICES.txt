@@ -210,6 +210,11 @@ it contains code generated with C++/WinRT
     Copyright: Copyright (c) Microsoft Corporation. All rights reserved.
                Copyright (c) 2021-2025 David Lechner <david@pybricks.com>
 
+asn1crypto 1.5.1, which reads who signed a signed PDF (pdfNote 7.9); pure
+Python, nothing built into it
+    License:   MIT (THIRD_PARTY_LICENSES.txt, section 17)
+    Copyright: Copyright (c) 2015-2022 Will Bond <will@wbond.net>
+
 typing_extensions 4.15.0 (used by PyWinRT, python-docx and python-pptx)
     License:   Python Software Foundation License Version 2 (Python-LICENSE.txt)
     Copyright: Python Software Foundation
@@ -361,6 +366,9 @@ of the components, for the exact versions in this build, is published here:
   PyInstaller 6.22.0 (including the bootloader source)
     https://files.pythonhosted.org/packages/05/03/669d06735cf57d7e2e5dfc3c2e1643554b34c559eff21449c58172ca0335/pyinstaller-6.22.0.tar.gz
     SHA-256 8b0166fff4583b374bbe7fa044bf03ddc33cab0f792a665807d96048e63f060e
+  asn1crypto 1.5.1
+    https://files.pythonhosted.org/packages/de/cf/d547feed25b5244fcb9392e288ff9fdc3280b10260362fc45d37a798a6ee/asn1crypto-1.5.1.tar.gz
+    SHA-256 13ae38502be632115abf8a24cbe5f4da52e3b5231990aff31123c805306ccb9c
   pdf2docx 0.5.13
     https://files.pythonhosted.org/packages/96/02/0b97863cc45761f6d076d2973038c79460b4364b49ea4cc2f015a2e8c1d5/pdf2docx-0.5.13.tar.gz
     SHA-256 75eff485d4fdcd28237783a65c1bc5e9eaf9fbc747fcacee6c5c16c8ffa7a6a9

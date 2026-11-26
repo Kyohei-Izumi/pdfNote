@@ -1,6 +1,6 @@
 # pdfNote Privacy Policy
 
-Last updated: October 31, 2026
+Last updated: November 9, 2026
 
 This Privacy Policy explains how personal information is handled in connection with pdfNote as published by Kyohei Izumi in the Microsoft Store (the "Store Edition") and in connection with communications that you send to us. Terms defined in the pdfNote Terms of Use have the same meanings in this Policy.
 
@@ -9,14 +9,14 @@ This Privacy Policy explains how personal information is handled in connection w
 This summary is provided for convenience. The full text of this Policy governs.
 
 - The Store Edition does not send your documents, their contents, their file names or information about how you use it to us or to any third party. Information leaves the Store Edition only in the cases described in Section 6, such as when you print or open a link.
-- The only connection the Store Edition makes to the internet itself is to download OCR language data that you agree to download (Section 6(g)). To check for a newer version, it asks you each time and then asks the Microsoft Store component of Windows (Section 6(i)). The Microsoft Store review window opens only when you choose Write a Review (Section 6(j)). If it stops because of an unexpected error, Windows may send an error report to Microsoft, as your Windows settings allow (Section 6(h)).
+- The Store Edition itself connects to the internet only to download OCR language data, and only if you agree (Section 6(g)). It checks for a newer version only after asking you each time, and the check is made by the Microsoft Store component of Windows (Section 6(i)). The Microsoft Store review window opens only when you choose Write a Review (Section 6(j)). If the Store Edition closes unexpectedly because of an error, Windows may send an error report to Microsoft, as your Windows settings allow (Section 6(h)).
 - The Store Edition contains no advertising, analytics or telemetry, and it does not use an advertising identifier or location information.
-- Your documents, file paths, recovery copies and the error log are stored only on your device, where we have no access to them (Section 4).
-- We receive personal information only when you contact us (Section 8), and we see only aggregated or de-identified reports that Microsoft makes available to publishers (Section 7).
+- Your documents, the paths of the files you open, recovery copies and the error log are stored only on your device. We have no access to them (Section 4).
+- We receive personal information only when you contact us (Section 8). Apart from that, we see only aggregated or de-identified reports that Microsoft makes available to app publishers (Section 7).
 
 ## 1. Who We Are
 
-Kyohei Izumi, an individual resident in Japan who develops and publishes the Store Edition ("we", "us" and "our"), is responsible for the personal information described in this Policy. For the purposes of the EU and UK General Data Protection Regulation (the "GDPR") we are the controller, and for the purposes of the Act on the Protection of Personal Information of Japan (the "APPI") we are the business operator handling personal information. Our contact details are in Section 16.
+Kyohei Izumi, an individual residing in Japan who develops and publishes the Store Edition ("we", "us" and "our"), is responsible for the personal information described in this Policy. For the purposes of the EU and UK General Data Protection Regulation (the "GDPR") we are the controller, and for the purposes of the Act on the Protection of Personal Information of Japan (the "APPI") we are the business operator handling personal information. Our contact details are in Section 16.
 
 ## 2. Scope
 
@@ -24,7 +24,7 @@ Kyohei Izumi, an individual resident in Japan who develops and publishes the Sto
 
 2.2 This Policy does not apply to:
 
-(a) Microsoft, including the Microsoft Store, Windows, your Microsoft account and the processing of purchases, which are governed by the Microsoft Privacy Statement;
+(a) Microsoft's services, including the Microsoft Store, Windows, your Microsoft account and the processing of purchases, which are governed by the Microsoft Privacy Statement;
 
 (b) websites and applications that you open from the Store Edition, such as a link in a document; and
 
@@ -46,7 +46,7 @@ Because the Store Edition does not collect personal information over the interne
 
 ## 4. Information Stored on Your Device
 
-The documents the Store Edition works with, file paths, recovery copies and the error log are stored only on your device and, except as described in Section 6, are not sent anywhere.
+The documents that the Store Edition works with, the paths of the files you open, recovery copies and the error log are stored only on your device and are not sent anywhere, except as described in Section 6.
 
 ## 5. Information Written into Your Documents
 
@@ -74,9 +74,9 @@ Information leaves the Store Edition only in the following cases. Apart from the
 
 (g) **Downloading OCR language data.** If the language data that OCR needs is not on your device, the Store Edition asks you whether to download it. Only if you agree does it connect to GitHub (raw.githubusercontent.com), operated by GitHub, Inc., and download language data files published by the Tesseract OCR project. GitHub receives the information that any internet request carries, such as your IP address, together with the names of the files requested and the name and version of the Store Edition. Your documents, their contents, their file names and information about how you use the Store Edition are not sent. GitHub handles this information under its privacy statement. The downloaded files are stored on your device.
 
-(h) **Reports of unexpected errors.** If the Store Edition stops because of an unexpected error, Windows Error Reporting may send an error report to Microsoft, as your Windows diagnostic data settings allow. The report contains technical information such as the name and version of the Store Edition, the type of error and where in the program it occurred, and, depending on your Windows settings, may include part of the memory contents at that moment, which can include parts of open documents. The report is sent by Windows, not by the Store Edition, and the Microsoft Privacy Statement applies. As described in Section 7.2, we see the information that Microsoft makes available in Partner Center.
+(h) **Reports of unexpected errors.** If the Store Edition closes unexpectedly because of an error, Windows Error Reporting may send an error report to Microsoft, as your Windows diagnostic data settings allow. The report contains technical information such as the name and version of the Store Edition, the type of error and where in the program it occurred, and, depending on your Windows settings, may include part of the memory contents at that moment, which can include parts of open documents. The report is sent by Windows, not by the Store Edition, and the Microsoft Privacy Statement applies. As described in Section 7.2, we see the information that Microsoft makes available in Partner Center.
 
-(i) **Checking for a newer version.** When you ask, in the version window, to check for a newer version, the Store Edition asks you whether it may connect to the internet. Only if you agree does it ask the Microsoft Store component of Windows whether an update of the Store Edition is available; that component communicates with Microsoft. The Store Edition receives only information about whether an update is available. It sends nothing itself and downloads no update; updates are delivered through the Microsoft Store (Section 6(f)).
+(i) **Checking for a newer version.** When you choose Check for Updates in the Update History window, which opens from the version number, the Store Edition first asks whether it may connect to the internet. Only if you agree does it ask the Microsoft Store component of Windows whether an update of the Store Edition is available; that component communicates with Microsoft. The Store Edition receives only information about whether an update is available. It sends nothing itself and downloads no update; updates are delivered through the Microsoft Store (Section 6(f)).
 
 (j) **Ratings and reviews.** Some time after it starts, the Store Edition may show a window asking you to review it in the Microsoft Store. Only if you choose Write a Review does the Store Edition ask the Microsoft Store component of Windows to open its rating and review window; that component communicates with Microsoft. The ratings and reviews you enter there are handled by Microsoft and published as described in Section 7.3. The Store Edition receives only the result, such as whether the rating and review window was shown. If you choose Not Now, the Store Edition does not connect to the internet.
 
@@ -86,7 +86,7 @@ The Store Edition does not otherwise connect to the internet. Text recognition (
 
 7.1 Microsoft operates the Microsoft Store and handles acquisitions, payments, refunds and subscriptions. Under the arrangements in effect at the date of this Policy, Microsoft does not provide us with your name, email address or payment details in connection with a purchase.
 
-7.2 Microsoft makes reports available to publishers in Partner Center, such as aggregated or de-identified information about acquisitions, installations, usage, ratings and reviews, and crashes. Crash information depends on your Windows diagnostic data settings and is collected by Microsoft under the Microsoft Privacy Statement (Section 6(h)). We use these reports to understand how the Store Edition is acquired and used and to find and fix defects.
+7.2 Microsoft makes reports available to app publishers in Partner Center, such as aggregated or de-identified information about acquisitions, installations, usage, ratings and reviews, and crashes. Crash information depends on your Windows diagnostic data settings and is collected by Microsoft under the Microsoft Privacy Statement (Section 6(h)). We use these reports to understand how the Store Edition is acquired and used and to find and fix defects.
 
 7.3 Ratings and reviews that you post in the Microsoft Store are public and are shown with the name you choose. We may read them and respond to them publicly.
 

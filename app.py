@@ -17,10 +17,12 @@ import itertools
 import atexit
 import faulthandler
 import math
+import mmap
 import getpass
 import hashlib
 import json
 import os
+import stat
 import platform
 import re
 import secrets
@@ -48,6 +50,7 @@ from PySide6.QtCore import (
     QObject,
     QByteArray,
     QEvent,
+    QEventLoop,
     QIODevice,
     QItemSelectionModel,
     QLineF,
@@ -65,8 +68,10 @@ from PySide6.QtCore import (
     QUrl,
     QKeyCombination,
     QLibraryInfo,
+    QDate,
     QDateTime,
     QLocale,
+    QTime,
     QTranslator,
     Signal,
     qVersion,
@@ -76,6 +81,7 @@ from PySide6.QtCore import QProcess, QProcessEnvironment, QSharedMemory
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QPageLayout,
+    QRadialGradient,
     QAction,
     QActionGroup,
     QColor,
@@ -111,12 +117,14 @@ from PySide6.QtGui import (
     QTransform,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QProgressDialog,
     QGridLayout,
     QButtonGroup,
     QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
+    QGraphicsOpacityEffect,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -136,7 +144,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QRadioButton,
     QTextEdit,
     QTextBrowser,
     QPlainTextEdit,
@@ -172,7 +179,7 @@ from PySide6.QtPrintSupport import (
 
 
 APP_NAME = "pdfNote"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 # The catchphrase. Its initials spell PDF, so it stays in English in every
 # language: translated, the joke is gone.
 APP_TAGLINE = "Passion Drives Future"
@@ -184,6 +191,11 @@ APP_COPYRIGHT_HOLDER_JA = "泉　恭平"
 # Use (section 2.3), which the Store listing points to (AGPL section 6(d));
 # the program itself does not repeat it (5.39).
 APP_SOURCE_URL = "https://github.com/Kyohei-Izumi/pdfNote"
+# The name a save dialog offers for a document that has none yet, and the
+# words it adds to a name ("(sanitized)", "(restored)"...), are English in
+# every language (the owner, 2026-11-10): a file name, not a string to
+# translate. The UI still calls such a document 無題 in its own words.
+UNTITLED_FILE_NAME = "Untitled.pdf"
 # Files under legal/, bundled into the executable by pdfNote.spec.
 LEGAL_NOTICE_TITLE = "pdfNote License Notice"
 LEGAL_DOCUMENTS: tuple[tuple[str, str], ...] = (
@@ -209,7 +221,7 @@ LEGAL_PRIVACY_FILES = {"ja": "PRIVACY_POLICY_ja.md", "en": "PRIVACY_POLICY_en.md
 # notice presents. Change it with a change to either document worth
 # presenting again (Terms of Use 17.2): everyone then sees the notice
 # again at their next start.
-TERMS_VERSION = "2026-10-31"
+TERMS_VERSION = "2026-11-10"
 # The bootloader is linked in at build time, so the frozen program cannot
 # ask for its version; functional_qa compares this with the installed one.
 PYINSTALLER_VERSION = "6.22.0"
@@ -563,6 +575,58 @@ def owner_is_running(identity: str) -> bool:
     return True
 
 
+# The folders of the runs in a process of their own (OcrProcess,
+# ExportProcess): each holds a copy of the document being read. They go when
+# the run ends -- but a pdfNote that crashed, or was ended, in the middle of
+# one left its folder, and the copy in it, in the temporary folder for good
+# (7.9's review). Each is now marked with the process it belongs to, and a
+# start clears away those whose process is no longer running.
+WORK_FOLDER_PREFIXES = ("pdfnote-ocr-", "pdfnote-export-")
+WORK_FOLDER_OWNER = "owner.txt"
+# One with no mark is from a pdfNote before 7.9, or is being made this
+# instant: it goes once it is this old.
+WORK_FOLDER_UNMARKED_SECONDS = 24 * 60 * 60
+
+
+def make_work_folder(prefix: str) -> Path:
+    """A private temporary folder for a run in another process, marked with
+    this process (remove_abandoned_work_folders)."""
+    folder = Path(tempfile.mkdtemp(prefix=prefix))
+    (folder / WORK_FOLDER_OWNER).write_text(process_identity(), encoding="utf-8")
+    return folder
+
+
+def remove_abandoned_work_folders(root: str | Path | None = None) -> int:
+    """Remove the work folders in the temporary folder that no running
+    pdfNote owns; how many went. One whose files are still held -- the run's
+    own process outliving the pdfNote that started it -- goes as far as it
+    can, and the rest at a later start."""
+    removed = 0
+    mine = process_identity()
+    try:
+        entries = list(os.scandir(root or tempfile.gettempdir()))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.name.startswith(WORK_FOLDER_PREFIXES) or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                owner = Path(entry.path, WORK_FOLDER_OWNER).read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                owner = ""
+            if owner:
+                if owner == mine or owner_is_running(owner):
+                    continue
+            elif time.time() - entry.stat().st_mtime < WORK_FOLDER_UNMARKED_SECONDS:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 # Windows refuses a path of more than 259 characters to the ordinary file
 # APIs, and MuPDF uses those. Python can still see such a file through the
 # extended-length form, which is how this tells "too long" from "not there".
@@ -647,7 +711,7 @@ class RecentFiles:
             partial.write_text(
                 json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            os.replace(partial, self.path)
+            replace_file(partial, self.path)
         except OSError:
             try:
                 partial.unlink(missing_ok=True)
@@ -697,7 +761,7 @@ PREMIUM_MENU_MARK = "\u2060\u2060"
 # Only the entries: the feature each one stood for was written beside it
 # and never read (6.25).
 PREMIUM_MENU_KEYS = frozenset({
-    "このページをOCR", "文書全体をOCR", "OCRを実行", "墨消し", "テキスト ボックス",
+    "このページをOCR", "文書全体をOCR", "OCRを実行", "墨消し",
 })
 # Continuous scrolling is the default view; Freeze Page turns it off.
 DEFAULT_CONTINUOUS_SCROLL = True
@@ -886,6 +950,15 @@ class LicenseState:
         used = (latest - started).total_seconds() / 86400
         return max(0, TRIAL_DAYS - math.floor(used))
 
+    def trial_ends(self) -> datetime:
+        """When the premium free trial period ends: thirty days from the
+        first start, to the minute (7.8). The offer said today plus the days
+        left, a day late when less than a whole day of the last one was
+        left."""
+        self.trial_days_left()  # notes the first start, if this is it
+        started = self._read_time(self.settings.data.get("trial_started"))
+        return (started or self.clock()) + timedelta(days=TRIAL_DAYS)
+
     def refresh(self) -> str:
         forced = self.forced_mode
         if forced is not None:
@@ -905,16 +978,12 @@ class LicenseState:
 
     @property
     def marks_visible(self) -> bool:
-        """The premium mark shows in limited mode only (v5.28).
-
-        During the trial every command works, so marking one says nothing
-        useful -- only that it will be taken away, while the person is still
-        deciding. After a purchase there is nothing to mark. The mark exists
-        to explain why something is refused, which happens in limited mode
-        and nowhere else. The trial itself is still shown: the status bar
-        counts the days down, and the Store listing states the terms.
-        """
-        return self.mode == self.LIMITED
+        """The premium mark shows until a purchase: during the trial too
+        (7.5, the owner's decision of 2026-11-08), so what will need premium
+        is known before the trial ends -- it showed in limited mode only
+        (v5.28). During the trial the tooltip says it works for now. The
+        gates still ask whether the trial is over (`limited`)."""
+        return self.mode in (self.TRIAL, self.LIMITED)
 
 
 class _CloseMenuOnEnter(QObject):
@@ -1018,21 +1087,14 @@ def select_all_on_first_click(line_edit: QLineEdit | None) -> None:
         owner.installEventFilter(watcher)
 
 
-def premium_menu_blocked(widget: QWidget) -> bool:
-    """For a widget that opens its own right-click menu: does its pdfNote
-    window hold the menu back (limited mode), after saying so?"""
-    window = widget.window()
-    blocked = getattr(window, "_premium_blocked", None)
-    return bool(blocked is not None and blocked(window.PREMIUM_CONTEXT_MENU))
-
-
 # ---- Microsoft Store: the premium purchases ---------------------------------
 #
 # The premium features are sold as add-ons of the Microsoft Store edition: a
 # one-time purchase and a subscription. Every durable
 # add-on pdfNote has is one of them, so any of them, active, makes this copy
-# premium. Only the packaged Store edition can ask the Store; a build from the
-# source has no package identity and keeps the free trial and limited mode.
+# premium. The source is the Store edition's (the owner, 2026-11-10): it asks
+# the Store through its package identity, and offers nothing to a copy that
+# has none.
 #
 # Every Store call runs on StoreClient's thread. Some show Microsoft's own
 # purchase window and last as long as the customer takes; none may hold up
@@ -1273,8 +1335,11 @@ class StoreClient(QObject):
 
     def _start(self) -> None:
         if not self._ready.is_set() and not self._closing:
-            self._thread = threading.Thread(target=self._run, name="pdfNote Microsoft Store", daemon=True)
-            self._thread.start()
+            # One thread: a start that took longer than the wait below was
+            # started a second time by the next request (7.9's review).
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="pdfNote Microsoft Store", daemon=True)
+                self._thread.start()
             self._ready.wait(10)
 
     def shutdown(self, timeout: float = 3.0) -> None:
@@ -1603,9 +1668,245 @@ def install_premium_badges(menu: QMenu) -> None:
     if not getattr(menu, "_pdfnote_badges_wired", False):
         menu._pdfnote_badges_wired = True  # type: ignore[attr-defined]
         # actionGeometry() is only right once the menu has been laid out.
-        menu.aboutToShow.connect(lambda: QTimer.singleShot(0, place))
+        menu.aboutToShow.connect(lambda: QTimer.singleShot(0, menu, place))
     place()
 
+
+
+# A sticky note on selected text (7.9, the owner, after Google Slides'
+# comments): the text it is about -- its lines' rectangles and its words --
+# kept in the note itself, shown in the sidebar, and lit on the page while
+# the note is selected. Replies are the PDF's own: notes of their own that
+# point at it with /IRT (In Reply To) and /RT /R, not drawn (NoView), as
+# Acrobat keeps a thread.
+NOTE_ANCHOR_KEY = "PdfNoteAnchor"
+NOTE_QUOTE_KEY = "PdfNoteQuote"
+NOTE_QUOTE_CHARS = 200
+# Google Slides' yellow, light enough to read the words through.
+NOTE_ANCHOR_COLOR = "#66FFD54F"
+
+
+# The thread's markup is built where a parameter is called html.
+escape_html = html.escape
+
+
+def annotation_is_unseen(annotation: Any) -> bool:
+    """Is the annotation one the page does not show (Hidden or NoView) --
+    a reply in a thread, say? Nothing unseen is clicked, listed or
+    selected."""
+    try:
+        return bool(annotation.flags & (fitz.PDF_ANNOT_IS_HIDDEN | fitz.PDF_ANNOT_IS_NO_VIEW))
+    except Exception:
+        return False
+
+
+def note_reply_parent(document: Any, xref: int) -> int | None:
+    """The note a reply answers (/IRT), or None."""
+    try:
+        kind, value = document.xref_get_key(xref, "IRT")
+    except Exception:
+        return None
+    if kind != "xref":
+        return None
+    try:
+        return int(value.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def note_anchor_rects(document: Any, xref: int) -> list[fitz.Rect]:
+    """The lines of text a note was put on, in page coordinates."""
+    try:
+        kind, value = document.xref_get_key(xref, NOTE_ANCHOR_KEY)
+    except Exception:
+        return []
+    if kind != "array":
+        return []
+    try:
+        numbers = [float(part) for part in value.strip("[] ").split()]
+    except ValueError:
+        return []
+    return [
+        fitz.Rect(*numbers[index:index + 4])
+        for index in range(0, len(numbers) - 3, 4)
+    ]
+
+
+def note_quote(document: Any, xref: int) -> str:
+    """The words a note was put on, or ""."""
+    try:
+        kind, value = document.xref_get_key(xref, NOTE_QUOTE_KEY)
+    except Exception:
+        return ""
+    return value if kind == "string" else ""
+
+
+def set_note_anchor(document: Any, xref: int, rects: list[Any], quote: str) -> None:
+    numbers = " ".join(
+        f"{value:.2f}" for rect in rects for value in (rect.x0, rect.y0, rect.x1, rect.y1)
+    )
+    document.xref_set_key(xref, NOTE_ANCHOR_KEY, f"[{numbers}]")
+    document.xref_set_key(xref, NOTE_QUOTE_KEY, fitz.get_pdf_str(quote))
+
+
+def pdf_date_text(value: str) -> str:
+    """A PDF date (D:YYYYMMDDHHmmSS...) in the short form of the region's
+    settings, or "" (7.9: when a reply was written)."""
+    match = re.match(r"D:(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?", value or "")
+    if match is None:
+        return ""
+    year, month, day, hour, minute = (int(part) if part else 0 for part in match.groups())
+    try:
+        moment = QDateTime(QDate(year, month, day), QTime(hour, minute))
+    except Exception:
+        return ""
+    if not moment.isValid():
+        return ""
+    return QLocale.system().toString(moment, QLocale.ShortFormat)
+
+
+def note_children(page: Any, xref: int) -> list[Any]:
+    """Every annotation that answers a note (/IRT): its replies and its
+    states, oldest first, as the page lists them."""
+    children = []
+    for other, kind, _name in page.annot_xrefs():
+        if kind != fitz.PDF_ANNOT_TEXT or other == xref:
+            continue
+        if note_reply_parent(page.parent, other) == xref:
+            try:
+                children.append(page.load_annot(other))
+            except Exception:
+                continue
+    return children
+
+
+def note_is_state(document: Any, xref: int) -> bool:
+    """Is the annotation a state -- Acrobat's Set Status, which pdfNote's
+    Resolve writes -- rather than a reply?"""
+    try:
+        return document.xref_get_key(xref, "StateModel")[0] != "null"
+    except Exception:
+        return False
+
+
+def note_replies(page: Any, xref: int) -> list[Any]:
+    """The replies to a note, oldest first -- not its states."""
+    return [child for child in note_children(page, xref) if not note_is_state(page.parent, child.xref)]
+
+
+def note_is_resolved(page: Any, xref: int) -> bool:
+    """Is the note's thread resolved: its latest review state Completed,
+    as Acrobat's Set Status > Completed, or pdfNote's Resolve (7.9)?"""
+    resolved = False
+    for child in note_children(page, xref):
+        document = page.parent
+        try:
+            # A text string as the standard has it; a name, as some write it.
+            if document.xref_get_key(child.xref, "StateModel")[1].lstrip("/") != "Review":
+                continue
+            resolved = document.xref_get_key(child.xref, "State")[1].lstrip("/") == "Completed"
+        except Exception:
+            continue
+    return resolved
+
+
+def guard_premium_menu(menu: QMenu, offer: Callable[[], None]) -> None:
+    """After the trial, a right-click menu opens as it always does -- its
+    entries can be read, each with the mark -- but choosing one, by click,
+    Enter or its letter, or going into one of its boxes, brings the offer
+    (`offer`) instead of running it (7.7, the owner: the offer comes when a
+    marked entry is used, not at the right-click).
+
+    The entries' signals are blocked while the menu is open, so no command
+    runs whichever way it is chosen; a check box entry the choice toggled
+    is set back. A blocked entry cannot tell its menu it was chosen, so the
+    choice is read from the click or key that makes it."""
+    menus: list[QMenu] = []
+    entries: list[QAction] = []
+    widgets: list[QWidget] = []
+
+    def collect(current: QMenu) -> None:
+        menus.append(current)
+        for action in current.actions():
+            if action.menu() is not None:
+                collect(action.menu())
+            elif isinstance(action, QWidgetAction):
+                if action.defaultWidget() is not None:
+                    widgets.append(action.defaultWidget())
+            elif not action.isSeparator():
+                entries.append(action)
+
+    collect(menu)
+    checked = {action: action.isChecked() for action in entries if action.isCheckable()}
+    was_blocked = {action: action.blockSignals(True) for action in entries}
+    state = {"done": False, "chosen": False, "offered": False}
+
+    def restore() -> None:
+        if state["done"]:
+            return
+        state["done"] = True
+        for action, blocked in was_blocked.items():
+            try:
+                action.blockSignals(blocked)
+                if action in checked and action.isChecked() != checked[action]:
+                    action.setChecked(checked[action])
+            except RuntimeError:
+                continue
+        if state["chosen"] and not state["offered"]:
+            state["offered"] = True
+            offer()
+
+    def is_entry(action: QAction | None) -> bool:
+        return action is not None and action in was_blocked and action.isEnabled() and action.isVisible()
+
+    class _Choice(QObject):
+        """Which entry the click or key chooses, before the menu runs it."""
+
+        def eventFilter(self, watched: Any, event: QEvent) -> bool:  # noqa: N802 - Qt's name
+            kind = event.type()
+            if isinstance(watched, QMenu):
+                if kind == QEvent.MouseButtonRelease:
+                    if is_entry(watched.actionAt(event.position().toPoint())):
+                        state["chosen"] = True
+                elif kind == QEvent.KeyPress:
+                    if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space, Qt.Key_Select):
+                        if is_entry(watched.activeAction()):
+                            state["chosen"] = True
+                    elif event.text():
+                        letter = event.text().upper()
+                        matching = [
+                            action for action in watched.actions()
+                            if action.isVisible() and action.isEnabled()
+                            and (found := re.search(r"&([^&])", action.text())) is not None
+                            and found.group(1).upper() == letter
+                        ]
+                        if len(matching) == 1 and is_entry(matching[0]):
+                            state["chosen"] = True
+                return False
+            # A box in the menu (the size row, the font row) asks too, when
+            # it is entered -- by a click, a key, or Tab -- not when the
+            # menu itself puts the focus there as it opens (7.9: the text
+            # box's menu, its font box first, asked at the right-click).
+            entered = kind in (QEvent.MouseButtonPress, QEvent.KeyPress) or (
+                kind == QEvent.FocusIn
+                and event.reason() in (Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.MouseFocusReason, Qt.ShortcutFocusReason)
+            )
+            if entered:
+                state["chosen"] = True
+                menu.close()
+                return True
+            return False
+
+    choice = _Choice(menu)
+    menu._pdfnote_premium_choice = choice  # type: ignore[attr-defined]
+    for current in menus:
+        current.installEventFilter(choice)
+    for widget in widgets:
+        for child in [widget, *widget.findChildren(QWidget)]:
+            child.installEventFilter(choice)
+    # An entry is run just after its menu hides; set things back, and ask,
+    # after that.
+    menu.aboutToHide.connect(lambda: QTimer.singleShot(0, restore))
 
 def theme_palette() -> QPalette:
     """The colours Qt uses for whatever the stylesheet does not cover.
@@ -2005,7 +2306,6 @@ TRANSLATIONS = {
 "入力を確定": {"en": "Finish Typing", "zh_CN": "确认文本", "ko": "텍스트 확정", "es": "Confirmar texto", "fr": "Valider le texte", "ru": "Подтвердить текст", "ar": "تأكيد النص"},
 "その他の色...": {"en": "More Colors...", "zh_CN": "更多颜色...", "ko": "다른 색...", "es": "Más colores...", "fr": "Autres couleurs...", "ru": "Другие цвета...", "ar": "ألوان أخرى..."},
 "フォント": {"en": "Font", "zh_CN": "字体", "ko": "글꼴", "es": "Fuente", "fr": "Police", "ru": "Шрифт", "ar": "الخط"},
-"書式": {"en": "Format", "zh_CN": "格式", "ko": "서식", "es": "Formato", "fr": "Format", "ru": "Формат", "ar": "التنسيق"},
 "フォントの色...": {"en": "Font Color...", "zh_CN": "字体颜色...", "ko": "글꼴 색...", "es": "Color de fuente...", "fr": "Couleur de police...", "ru": "Цвет шрифта...", "ar": "لون الخط..."},
 "幅": {"en": "Width", "zh_CN": "宽度", "ko": "너비", "es": "Ancho", "fr": "Largeur", "ru": "Ширина", "ar": "العرض"},
 "選択中のオブジェクトの幅をpt単位で指定": {"en": "Set the selected object's width in points", "zh_CN": "以磅为单位设置所选对象的宽度", "ko": "선택한 개체의 너비를 pt 단위로 지정", "es": "Establecer el ancho del objeto seleccionado en puntos", "fr": "Définir la largeur de l'objet sélectionné en points", "ru": "Задать ширину выбранного объекта в пунктах", "ar": "تحديد عرض الكائن المحدد بالنقاط"},
@@ -2024,8 +2324,6 @@ TRANSLATIONS = {
 "白": {"en": "White", "zh_CN": "白色", "ko": "흰색", "es": "Blanco", "fr": "Blanc", "ru": "Белый", "ar": "أبيض"},
 "黄": {"en": "Yellow", "zh_CN": "黄色", "ko": "노란색", "es": "Amarillo", "fr": "Jaune", "ru": "Желтый", "ar": "أصفر"},
 "ピンク": {"en": "Pink", "zh_CN": "粉红色", "ko": "분홍색", "es": "Rosa", "fr": "Rose", "ru": "Розовый", "ar": "وردي"},
-"ナビゲーション": {"en": "Navigation", "zh_CN": "导航", "ko": "탐색", "es": "Navegación", "fr": "Navigation", "ru": "Навигация", "ar": "التنقل"},
-"ナビゲーションを閉じる ({key}で再表示)": {"en": "Close the navigation pane (press {key} to reopen it)", "zh_CN": "关闭导航窗格（按 {key} 重新打开）", "ko": "탐색 창 닫기({key}를 누르면 다시 열림)", "es": "Cerrar el panel de navegación ({key} para volver a abrirlo)", "fr": "Fermer le volet de navigation ({key} pour le rouvrir)", "ru": "Закрыть панель навигации ({key}, чтобы показать снова)", "ar": "إغلاق جزء التنقل (اضغط {key} لإعادة فتحه)"},
 "文書内を検索": {"en": "Search this document", "zh_CN": "在文档中搜索", "ko": "문서 내 검색", "es": "Buscar en el documento", "fr": "Rechercher dans le document", "ru": "Поиск в документе", "ar": "البحث في المستند"},
 "目次": {"en": "Table of Contents", "zh_CN": "目录", "ko": "목차", "es": "Tabla de contenido", "fr": "Sommaire", "ru": "Оглавление", "ar": "جدول المحتويات"},
 "検索結果": {"en": "Search Results", "zh_CN": "搜索结果", "ko": "검색 결과", "es": "Resultados de la búsqueda", "fr": "Résultats de la recherche", "ru": "Результаты поиска", "ar": "نتائج البحث"},
@@ -2039,13 +2337,11 @@ TRANSLATIONS = {
 "カーソルを表示/非表示": {"en": "Show/Hide Cursor", "zh_CN": "显示/隐藏光标", "ko": "커서 표시/숨김", "es": "Mostrar/ocultar cursor", "fr": "Afficher/masquer le curseur", "ru": "Показать/скрыть курсор", "ar": "إظهار/إخفاء المؤشر"},
 "ウィンドウ": {"en": "Window", "zh_CN": "窗口", "ko": "창", "es": "Ventana", "fr": "Fenêtre", "ru": "Окно", "ar": "النافذة"},
 "ページのテキスト": {"en": "Page Text", "zh_CN": "页面文本", "ko": "페이지 텍스트", "es": "Texto de la página", "fr": "Texte de la page", "ru": "Текст страницы", "ar": "نص الصفحة"},
-"ナビゲーションとページを切り替え": {"en": "Switch Between Navigation and Page", "zh_CN": "在导航和页面之间切换", "ko": "탐색과 페이지 간 전환", "es": "Cambiar entre navegación y página", "fr": "Basculer entre la navigation et la page", "ru": "Переключение между навигацией и страницей", "ar": "التبديل بين التنقل والصفحة"},
 "ウィンドウ枠の切り替え": {"en": "Switch Panes", "zh_CN": "切换窗格", "ko": "창 전환", "es": "Cambiar de panel", "fr": "Changer de volet", "ru": "Переключение областей", "ar": "التبديل بين الأجزاء"},
 "アプリケーション キー": {"en": "Menu key", "zh_CN": "应用程序键", "ko": "애플리케이션 키", "es": "tecla de aplicación", "fr": "touche Application", "ru": "клавиша контекстного меню", "ar": "مفتاح التطبيق"},
 "ショートカット メニュー": {"en": "Shortcut Menu", "zh_CN": "快捷菜单", "ko": "바로 가기 메뉴", "es": "Menú contextual", "fr": "Menu contextuel", "ru": "Контекстное меню", "ar": "القائمة المختصرة"},
 "ページに戻る": {"en": "Back to Page", "zh_CN": "返回页面", "ko": "페이지로 돌아가기", "es": "Volver a la página", "fr": "Revenir à la page", "ru": "Вернуться к странице", "ar": "العودة إلى الصفحة"},
 "カーソルを移動": {"en": "Move Cursor", "zh_CN": "移动光标", "ko": "커서 이동", "es": "Mover el cursor", "fr": "Déplacer le curseur", "ru": "Перемещение курсора", "ar": "تحريك المؤشر"},
-"単語単位で移動": {"en": "Move by Word", "zh_CN": "按单词移动", "ko": "단어 단위로 이동", "es": "Mover por palabras", "fr": "Déplacer mot par mot", "ru": "Перемещение по словам", "ar": "التنقل كلمة بكلمة"},
 "行頭 / 行末": {"en": "Start / End of Line", "zh_CN": "行首 / 行尾", "ko": "줄의 처음 / 끝", "es": "Inicio / fin de línea", "fr": "Début / fin de ligne", "ru": "Начало / конец строки", "ar": "بداية / نهاية السطر"},
 "選択範囲を拡張": {"en": "Extend Selection", "zh_CN": "扩展选定内容", "ko": "선택 영역 확장", "es": "Extender la selección", "fr": "Étendre la sélection", "ru": "Расширение выделения", "ar": "توسيع التحديد"},
 "単語単位で選択": {"en": "Select by Word", "zh_CN": "按单词选择", "ko": "단어 단위로 선택", "es": "Seleccionar por palabras", "fr": "Sélectionner mot par mot", "ru": "Выделение по словам", "ar": "التحديد كلمة بكلمة"},
@@ -2100,7 +2396,6 @@ TRANSLATIONS = {
 "PDFを分割": {"en": "Split PDF", "zh_CN": "拆分 PDF", "ko": "PDF 분할", "es": "Dividir PDF", "fr": "Fractionner le PDF", "ru": "Разделить PDF", "ar": "تقسيم PDF"},
 "1ページごとに分割": {"en": "One file per page", "zh_CN": "每页拆分为一个文件", "ko": "페이지마다 파일 분리", "es": "Un archivo por página", "fr": "Un fichier par page", "ru": "По одному файлу на страницу", "ar": "ملف واحد لكل صفحة"},
 "ページ範囲を指定（例: 1-3, 4-6, 7-10）": {"en": "Specify page ranges (e.g. 1-3, 4-6, 7-10)", "zh_CN": "指定页面范围（例如：1-3, 4-6, 7-10）", "ko": "페이지 범위 지정(예: 1-3, 4-6, 7-10)", "es": "Especificar rangos de páginas (p. ej., 1-3, 4-6, 7-10)", "fr": "Spécifier des plages de pages (ex. : 1-3, 4-6, 7-10)", "ru": "Укажите диапазоны страниц (например, 1-3, 4-6, 7-10)", "ar": "حدد نطاقات الصفحات (مثال: 1-3, 4-6, 7-10)"},
-"分割したファイルの保存先フォルダーを選択": {"en": "Choose a Folder for the Split Files", "zh_CN": "选择拆分文件的保存文件夹", "ko": "분할된 파일을 저장할 폴더 선택", "es": "Elegir una carpeta para los archivos divididos", "fr": "Choisir un dossier pour les fichiers fractionnés", "ru": "Выберите папку для разделенных файлов", "ar": "اختر مجلداً للملفات المقسّمة"},
 "ページ範囲が正しくありません: {range}": {"en": "Invalid page range: {range}", "zh_CN": "无效的页面范围：{range}", "ko": "잘못된 페이지 범위입니다: {range}", "es": "Rango de páginas no válido: {range}", "fr": "Plage de pages non valide : {range}", "ru": "Недопустимый диапазон страниц: {range}", "ar": "نطاق صفحات غير صالح: {range}"},
 "PDFを分割できませんでした。\n\n{error}": {"en": "Couldn't split the PDF.\n\n{error}", "zh_CN": "无法拆分 PDF。\n\n{error}", "ko": "PDF를 분할할 수 없습니다.\n\n{error}", "es": "No se pudo dividir el PDF.\n\n{error}", "fr": "Impossible de fractionner le PDF.\n\n{error}", "ru": "Не удалось разделить PDF.\n\n{error}", "ar": "تعذر تقسيم ملف PDF.\n\n{error}"},
 "⋮⋮  テキスト ボックス": {"en": "⋮⋮  Text Box", "zh_CN": "⋮⋮  文本框", "ko": "⋮⋮  텍스트 상자", "es": "⋮⋮  Cuadro de texto", "fr": "⋮⋮  Zone de texte", "ru": "⋮⋮  Текстовое поле", "ar": "⋮⋮  مربع نص"},
@@ -2214,7 +2509,6 @@ TRANSLATIONS = {
 "ページ指定": {"en": "Go to Page", "zh_CN": "转到页面", "ko": "페이지 이동", "es": "Ir a la página", "fr": "Aller à la page", "ru": "Перейти к странице", "ar": "الانتقال إلى الصفحة"},
 "単ページ": {"en": "Single Page", "zh_CN": "单页", "ko": "단일 페이지", "es": "Página única", "fr": "Page unique", "ru": "Одна страница", "ar": "صفحة واحدة"},
 "見開き": {"en": "Facing Pages", "zh_CN": "双页视图", "ko": "펼침 페이지", "es": "Páginas enfrentadas", "fr": "Pages en vis-à-vis", "ru": "Разворот", "ar": "صفحات متقابلة"},
-"ナビゲーションのタブを切り替え": {"en": "Switch Navigation Tab", "zh_CN": "切换导航标签页", "ko": "탐색 탭 전환", "es": "Cambiar pestaña de navegación", "fr": "Changer d'onglet de navigation", "ru": "Переключить вкладку навигации", "ar": "تبديل علامة تبويب التنقل"},
 "ページを追加": {"en": "Add Pages", "zh_CN": "添加页面", "ko": "페이지 추가", "es": "Añadir páginas", "fr": "Ajouter des pages", "ru": "Добавить страницы", "ar": "إضافة صفحات"},
 "ページを複製": {"en": "Duplicate Page", "zh_CN": "创建页面副本", "ko": "페이지 복제", "es": "Duplicar página", "fr": "Dupliquer la page", "ru": "Дублировать страницу", "ar": "تكرار الصفحة"},
 "ページを回転": {"en": "Rotate Page", "zh_CN": "旋转页面", "ko": "페이지 회전", "es": "Girar página", "fr": "Faire pivoter la page", "ru": "Повернуть страницу", "ar": "تدوير الصفحة"},
@@ -2238,14 +2532,14 @@ TRANSLATIONS = {
 "別のアプリが起動することがあります。\n\n{uri}\n\n開きますか？": {"en": "This may open another app.\n\n{uri}\n\nOpen it?", "zh_CN": "这可能会启动其他应用。\n\n{uri}\n\n要打开吗？", "ko": "다른 앱이 실행될 수 있습니다.\n\n{uri}\n\n여시겠습니까?", "es": "Esto puede abrir otra aplicación.\n\n{uri}\n\n¿Abrirlo?", "fr": "Cela peut lancer une autre application.\n\n{uri}\n\nL'ouvrir ?", "ru": "Это может запустить другое приложение.\n\n{uri}\n\nОткрыть?", "ar": "قد يؤدي هذا إلى تشغيل تطبيق آخر.\n\n{uri}\n\nهل تريد فتحه؟"},
 "墨消し": {"en": "Redact", "zh_CN": "标记密文", "ko": "교정", "es": "Censurar", "fr": "Biffer", "ru": "Скрыть данные", "ar": "تنقيح"},
 "墨消しを適用": {"en": "Apply Redactions", "zh_CN": "应用密文", "ko": "교정 적용", "es": "Aplicar censura", "fr": "Appliquer les biffures", "ru": "Применить скрытие", "ar": "تطبيق التنقيح"},
-"サニタイズしたコピーを保存": {"en": "Save Sanitized Copy", "zh_CN": "保存净化副本", "ko": "정리된 사본 저장", "es": "Guardar copia saneada", "fr": "Enregistrer une copie assainie", "ru": "Сохранить очищенную копию", "ar": "حفظ نسخة منقّاة"},
-"サニタイズしたPDFを保存": {"en": "Save Sanitized PDF", "zh_CN": "保存净化后的 PDF", "ko": "정리된 PDF 저장", "es": "Guardar PDF saneado", "fr": "Enregistrer le PDF assaini", "ru": "Сохранить очищенный PDF", "ar": "حفظ ملف PDF منقّى"},
+"サニタイズしたコピーを保存": {"en": "Save Sanitized Copy", "zh_CN": "保存清理后的副本", "ko": "정리된 사본 저장", "es": "Guardar copia saneada", "fr": "Enregistrer une copie assainie", "ru": "Сохранить очищенную копию", "ar": "حفظ نسخة منقّاة"},
+"サニタイズしたPDFを保存": {"en": "Save Sanitized PDF", "zh_CN": "保存清理后的 PDF", "ko": "정리된 PDF 저장", "es": "Guardar PDF saneado", "fr": "Enregistrer le PDF assaini", "ru": "Сохранить очищенный PDF", "ar": "حفظ ملف PDF منقّى"},
 "保護": {"en": "Protect", "zh_CN": "保护", "ko": "보호", "es": "Proteger", "fr": "Protéger", "ru": "Защита", "ar": "الحماية"},
 "適用する墨消しがありません": {"en": "No redactions to apply", "zh_CN": "没有可应用的密文", "ko": "적용할 교정이 없습니다", "es": "No hay censuras que aplicar", "fr": "Aucune biffure à appliquer", "ru": "Нет областей для скрытия", "ar": "لا توجد تنقيحات للتطبيق"},
 "{count}件の墨消しを適用します。範囲内の文字や画像と、範囲にかかる文字装飾・オブジェクト・フォーム欄が削除されます。保存したPDFには残らず、そこから取り戻すことはできません。編集履歴に残っている間は［元に戻す］で取り消せます。\n\n実行しますか？": {"en": "Apply {count} redactions?\n\nThe text and images under them, and any text markup, objects, or form fields that overlap them, will be removed. They won't be in the saved PDF and can't be recovered from it. You can undo this while it's still in the edit history.", "zh_CN": "要应用 {count} 处密文吗？\n\n密文区域内的文字和图片，以及与之重叠的文本标记、对象和表单字段都将被删除。保存的 PDF 中不会保留这些内容，也无法从中恢复。只要此操作仍在编辑历史中，就可以用“撤消”取消。", "ko": "교정 {count}개를 적용하시겠습니까?\n\n영역 안의 텍스트와 이미지, 그리고 영역에 걸친 텍스트 마크업, 개체, 양식 필드가 삭제됩니다. 저장한 PDF에는 남지 않으며 그 파일에서 되찾을 수 없습니다. 편집 기록에 남아 있는 동안에는 [실행 취소]로 되돌릴 수 있습니다.", "es": "¿Aplicar {count} censuras?\n\nSe eliminarán el texto y las imágenes que cubren, y las marcas de texto, los objetos o los campos de formulario que se superpongan. No quedarán en el PDF guardado ni podrán recuperarse de él. Puedes deshacerlo mientras siga en el historial de edición.", "fr": "Appliquer {count} biffures ?\n\nLe texte et les images masqués, ainsi que le marquage du texte, les objets et les champs de formulaire qui les chevauchent, seront supprimés. Ils ne figureront pas dans le PDF enregistré et ne pourront pas en être récupérés. Vous pouvez annuler l'opération tant qu'elle reste dans l'historique des modifications.", "ru": "Применить скрытие к {count} областям?\n\nТекст и изображения под ними, а также разметка текста, объекты и поля форм, которые их перекрывают, будут удалены. В сохраненном PDF их не будет, и восстановить их из него нельзя. Пока этот шаг остается в журнале правок, его можно отменить командой «Отменить».", "ar": "هل تريد تطبيق {count} تنقيح؟\n\nسيُحذف النص والصور الموجودة تحتها، وعلامات النص والكائنات وحقول النماذج المتداخلة معها. لن تبقى في ملف PDF المحفوظ ولا يمكن استعادتها منه. يمكنك التراجع عن هذه الخطوة ما دامت في سجل التحرير."},
 "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": {"en": "{count} files with the same names already exist. Replace them?\n\n{names}", "zh_CN": "已存在 {count} 个同名文件。要替换吗？\n\n{names}", "ko": "같은 이름의 파일이 {count}개 있습니다. 바꾸시겠습니까?\n\n{names}", "es": "Ya existen {count} archivos con el mismo nombre. ¿Quieres reemplazarlos?\n\n{names}", "fr": "{count} fichiers portant le même nom existent déjà. Voulez-vous les remplacer ?\n\n{names}", "ru": "Файлы с такими же именами уже существуют ({count}). Заменить их?\n\n{names}", "ar": "يوجد {count} ملف بالأسماء نفسها. هل تريد استبدالها؟\n\n{names}"},
 "墨消しを適用できませんでした。\n\n{error}": {"en": "Couldn't apply the redactions.\n\n{error}", "zh_CN": "无法应用密文。\n\n{error}", "ko": "교정을 적용할 수 없습니다.\n\n{error}", "es": "No se pudo aplicar la censura.\n\n{error}", "fr": "Impossible d'appliquer les biffures.\n\n{error}", "ru": "Не удалось применить скрытие.\n\n{error}", "ar": "تعذر تطبيق التنقيح.\n\n{error}"},
-"サニタイズできませんでした。\n\n{error}": {"en": "Couldn't sanitize the document.\n\n{error}", "zh_CN": "无法净化文档。\n\n{error}", "ko": "문서를 정리할 수 없습니다.\n\n{error}", "es": "No se pudo sanear el documento.\n\n{error}", "fr": "Impossible d'assainir le document.\n\n{error}", "ru": "Не удалось очистить документ.\n\n{error}", "ar": "تعذرت تنقية المستند.\n\n{error}"},
+"サニタイズできませんでした。\n\n{error}": {"en": "Couldn't sanitize the document.\n\n{error}", "zh_CN": "无法清理文档。\n\n{error}", "ko": "문서를 정리할 수 없습니다.\n\n{error}", "es": "No se pudo sanear el documento.\n\n{error}", "fr": "Impossible d'assainir le document.\n\n{error}", "ru": "Не удалось очистить документ.\n\n{error}", "ar": "تعذرت تنقية المستند.\n\n{error}"},
 "この文字列を検索": {"en": "Search for This Text", "zh_CN": "搜索此文字", "ko": "이 텍스트 검색", "es": "Buscar este texto", "fr": "Rechercher ce texte", "ru": "Найти этот текст", "ar": "البحث عن هذا النص"},
 "挿入": {"en": "Insert", "zh_CN": "插入", "ko": "삽입", "es": "Insertar", "fr": "Insérer", "ru": "Вставка", "ar": "إدراج"},
 "ページのテキストをコピー": {"en": "Copy Page Text", "zh_CN": "复制页面文字", "ko": "페이지 텍스트 복사", "es": "Copiar texto de la página", "fr": "Copier le texte de la page", "ru": "Копировать текст страницы", "ar": "نسخ نص الصفحة"},
@@ -2302,7 +2596,6 @@ TRANSLATIONS = {
 "画像として保存": {"en": "Save as Picture", "zh_CN": "另存为图片", "ko": "그림으로 저장", "es": "Guardar como imagen", "fr": "Enregistrer en tant qu'image", "ru": "Сохранить как рисунок", "ar": "حفظ كصورة"},
 "画像として保存...": {"en": "Save as Picture...", "zh_CN": "另存为图片...", "ko": "그림으로 저장...", "es": "Guardar como imagen...", "fr": "Enregistrer en tant qu'image...", "ru": "Сохранить как рисунок...", "ar": "حفظ كصورة..."},
 "テキストの編集": {"en": "Edit Text", "zh_CN": "编辑文字", "ko": "텍스트 편집", "es": "Editar texto", "fr": "Modifier le texte", "ru": "Изменить текст", "ar": "تحرير النص"},
-"ここに付箋を追加": {"en": "Add Sticky Note Here", "zh_CN": "在此处添加便笺", "ko": "여기에 스티커 메모 추가", "es": "Añadir nota adhesiva aquí", "fr": "Ajouter un pense-bête ici", "ru": "Добавить записку здесь", "ar": "إضافة ملاحظة ملصقة هنا"},
 "線の太さ": {"en": "Line Weight", "zh_CN": "线条粗细", "ko": "선 두께", "es": "Grosor de línea", "fr": "Épaisseur du trait", "ru": "Толщина линии", "ar": "سمك الخط"},
 "細い": {"en": "Thin", "zh_CN": "细", "ko": "가늘게", "es": "Fino", "fr": "Fin", "ru": "Тонкая", "ar": "رفيع"},
 "標準": {"en": "Normal", "zh_CN": "标准", "ko": "보통", "es": "Normal", "fr": "Normal", "ru": "Обычная", "ar": "عادي"},
@@ -2374,7 +2667,7 @@ TRANSLATIONS = {
 "このPDFには作成者が設定した使用制限があります。権利者の意図に沿ってご利用ください": {"en": "The author of this PDF has set usage restrictions. Please respect the rights holder's wishes.", "zh_CN": "此 PDF 的作者设置了使用限制。请按照权利人的意愿使用。", "ko": "이 PDF에는 작성자가 설정한 사용 제한이 있습니다. 권리자의 의도에 맞게 사용하세요.", "es": "El autor de este PDF ha establecido restricciones de uso. Respeta la voluntad del titular de los derechos.", "fr": "L'auteur de ce PDF a défini des restrictions d'utilisation. Respectez la volonté du titulaire des droits.", "ru": "Автор этого PDF установил ограничения на использование. Соблюдайте волю правообладателя.", "ar": "وضع مؤلف ملف PDF هذا قيوداً على الاستخدام. يرجى احترام رغبة صاحب الحقوق."},
 "追加したページの元のPDFには使用制限があります。この文書にはその制限は引き継がれません": {"en": "The PDF these pages came from has usage restrictions. They are not carried over to this document.", "zh_CN": "这些页面所来自的 PDF 设有使用限制。这些限制不会带到此文档中。", "ko": "추가한 페이지의 원본 PDF에는 사용 제한이 있습니다. 이 문서에는 해당 제한이 적용되지 않습니다.", "es": "El PDF del que proceden estas páginas tiene restricciones de uso. No se trasladan a este documento.", "fr": "Le PDF d'origine de ces pages comporte des restrictions d'utilisation. Elles ne sont pas reportées dans ce document.", "ru": "PDF, из которого взяты эти страницы, имеет ограничения на использование. На этот документ они не переносятся.", "ar": "ملف PDF الذي أُخذت منه هذه الصفحات عليه قيود على الاستخدام. لا تنتقل هذه القيود إلى هذا المستند."},
 "{count}個の項目またはフォーム欄を削除できませんでした。墨消しした範囲に内容が残っている可能性があります。保存する前に確認してください。": {"en": "Couldn't remove {count} items or form fields. Some content may still be in the redacted areas, so check the document before you save it.", "zh_CN": "无法删除 {count} 个项目或表单字段。密文区域中可能仍有内容，请在保存前检查文档。", "ko": "항목 또는 양식 필드 {count}개를 삭제할 수 없습니다. 교정한 영역에 내용이 남아 있을 수 있으니 저장하기 전에 문서를 확인하세요.", "es": "No se pudieron quitar {count} elementos o campos de formulario. Puede quedar contenido en las zonas censuradas; revisa el documento antes de guardarlo.", "fr": "Impossible de supprimer {count} éléments ou champs de formulaire. Du contenu peut subsister dans les zones biffées ; vérifiez le document avant de l'enregistrer.", "ru": "Не удалось удалить элементы или поля форм ({count}). В скрытых областях может остаться содержимое; проверьте документ перед сохранением.", "ar": "تعذر حذف {count} من العناصر أو حقول النماذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقق من المستند قبل حفظه."},
-"この文書には見えない文字（OCRで付けた文字など）があります。削除すると、サニタイズしたPDFでは検索やコピーができなくなります。\n\n見えない文字も削除しますか？": {"en": "This document contains invisible text, such as text added by OCR. If you remove it, you won't be able to search or copy text in the sanitized PDF.\n\nRemove the invisible text too?", "zh_CN": "此文档包含不可见文字（例如 OCR 添加的文字）。如果删除，净化后的 PDF 将无法搜索或复制文字。\n\n是否同时删除不可见文字？", "ko": "이 문서에는 보이지 않는 텍스트(OCR로 추가한 텍스트 등)가 있습니다. 삭제하면 정리된 PDF에서 검색하거나 복사할 수 없습니다.\n\n보이지 않는 텍스트도 삭제할까요?", "es": "Este documento contiene texto invisible, como el que añade el OCR. Si lo quitas, no podrás buscar ni copiar texto en el PDF saneado.\n\n¿Quitar también el texto invisible?", "fr": "Ce document contient du texte invisible, comme celui ajouté par l'OCR. Si vous le supprimez, vous ne pourrez plus rechercher ni copier de texte dans le PDF assaini.\n\nSupprimer aussi le texte invisible ?", "ru": "В документе есть невидимый текст, например добавленный при распознавании (OCR). Если удалить его, в очищенном PDF нельзя будет искать и копировать текст.\n\nУдалить и невидимый текст?", "ar": "يحتوي هذا المستند على نص غير مرئي، مثل النص الذي يضيفه التعرف الضوئي على الحروف (OCR). إذا حذفته، فلن تتمكن من البحث في النص أو نسخه في ملف PDF المنقّى.\n\nهل تريد حذف النص غير المرئي أيضاً؟"},
+"この文書には見えない文字（OCRで付けた文字など）があります。削除すると、サニタイズしたPDFでは検索やコピーができなくなります。\n\n見えない文字も削除しますか？": {"en": "This document contains invisible text, such as text added by OCR. If you remove it, you won't be able to search or copy text in the sanitized PDF.\n\nRemove the invisible text too?", "zh_CN": "此文档包含不可见文字（例如 OCR 添加的文字）。如果删除，清理后的 PDF 将无法搜索或复制文字。\n\n是否同时删除不可见文字？", "ko": "이 문서에는 보이지 않는 텍스트(OCR로 추가한 텍스트 등)가 있습니다. 삭제하면 정리된 PDF에서 검색하거나 복사할 수 없습니다.\n\n보이지 않는 텍스트도 삭제할까요?", "es": "Este documento contiene texto invisible, como el que añade el OCR. Si lo quitas, no podrás buscar ni copiar texto en el PDF saneado.\n\n¿Quitar también el texto invisible?", "fr": "Ce document contient du texte invisible, comme celui ajouté par l'OCR. Si vous le supprimez, vous ne pourrez plus rechercher ni copier de texte dans le PDF assaini.\n\nSupprimer aussi le texte invisible ?", "ru": "В документе есть невидимый текст, например добавленный при распознавании (OCR). Если удалить его, в очищенном PDF нельзя будет искать и копировать текст.\n\nУдалить и невидимый текст?", "ar": "يحتوي هذا المستند على نص غير مرئي، مثل النص الذي يضيفه التعرف الضوئي على الحروف (OCR). إذا حذفته، فلن تتمكن من البحث في النص أو نسخه في ملف PDF المنقّى.\n\nهل تريد حذف النص غير المرئي أيضاً؟"},
 "各ソフトウェアに含まれるライブラリやフォントまで載せた一覧と、ソース コードの入手先は、「{tab}」タブの「{document}」にあります。": {"en": "The full list, including the libraries and fonts inside each component, and where to get their source code, is in “{document}” on the “{tab}” tab.", "zh_CN": "包括各组件所含库和字体在内的完整列表以及源代码的获取位置，请参阅“{tab}”选项卡中的“{document}”。", "ko": "각 구성 요소에 포함된 라이브러리와 글꼴을 포함한 전체 목록과 소스 코드를 구할 수 있는 곳은 [{tab}] 탭의 '{document}'에 있습니다.", "es": "La lista completa, con las bibliotecas y fuentes que incluye cada componente, y dónde obtener su código fuente, está en «{document}», en la pestaña «{tab}».", "fr": "La liste complète, y compris les bibliothèques et polices contenues dans chaque composant, et l'adresse de leur code source se trouvent dans « {document} », onglet « {tab} ».", "ru": "Полный список, включая библиотеки и шрифты внутри каждого компонента, и сведения о том, где получить их исходный код, приведены в документе «{document}» на вкладке «{tab}».", "ar": "القائمة الكاملة، بما فيها المكتبات والخطوط المضمّنة في كل مكوّن، ومكان الحصول على شيفرتها المصدرية، موجودة في «{document}» ضمن علامة التبويب «{tab}»."},
 "制限": {"en": "Restrictions", "zh_CN": "限制", "ko": "제한", "es": "Restricciones", "fr": "Restrictions", "ru": "Ограничения", "ar": "القيود"},
 "、": {"en": ", ", "zh_CN": "、", "ko": ", ", "es": ", ", "fr": ", ", "ru": ", ", "ar": "، "},
@@ -2392,21 +2685,22 @@ TRANSLATIONS = {
 "利用規約": {"en": "Terms of Use", "zh_CN": "使用条款", "ko": "사용 약관", "es": "Términos de uso", "fr": "Conditions d'utilisation", "ru": "Условия использования", "ar": "شروط الاستخدام"},
 "プライバシー ポリシー": {"en": "Privacy Policy", "zh_CN": "隐私政策", "ko": "개인정보 처리방침", "es": "Política de privacidad", "fr": "Politique de confidentialité", "ru": "Политика конфиденциальности", "ar": "سياسة الخصوصية"},
 "{app}をお使いいただく前に": {"en": "Before you use {app}", "zh_CN": "使用 {app} 之前", "ko": "{app}을(를) 사용하기 전에", "es": "Antes de usar {app}", "fr": "Avant d'utiliser {app}", "ru": "Перед началом работы с {app}", "ar": "قبل استخدام {app}"},
-"{app}の利用には、下の利用規約が適用されます。［続ける］を選ぶと、利用規約に同意したものとみなされます。情報の取扱いについては、プライバシー ポリシーをご覧ください。": {"en": "Your use of {app} is subject to the Terms of Use below. By selecting Continue, you agree to the Terms of Use. The Privacy Policy explains how information is handled.", "zh_CN": "您使用 {app} 时适用以下使用条款。选择“继续”即表示您同意使用条款。有关信息的处理方式，请参阅隐私政策。", "ko": "{app} 사용에는 아래 사용 약관이 적용됩니다. [계속]을 선택하면 사용 약관에 동의한 것으로 간주됩니다. 정보 처리 방식은 개인정보 처리방침을 참조하세요.", "es": "El uso de {app} está sujeto a los Términos de uso que aparecen a continuación. Al seleccionar Continuar, aceptas los Términos de uso. La Política de privacidad explica cómo se trata la información.", "fr": "Votre utilisation de {app} est soumise aux Conditions d'utilisation ci-dessous. En sélectionnant Continuer, vous acceptez les Conditions d'utilisation. La Politique de confidentialité explique comment les informations sont traitées.", "ru": "Использование {app} регулируется приведенными ниже Условиями использования. Нажимая «Продолжить», вы принимаете Условия использования. О том, как обрабатывается информация, рассказывает Политика конфиденциальности.", "ar": "يخضع استخدامك لـ {app} لشروط الاستخدام الواردة أدناه. باختيارك «متابعة»، فإنك توافق على شروط الاستخدام. وتوضح سياسة الخصوصية كيفية التعامل مع المعلومات."},
-"{app}を初めて起動した時から{days}日間は、すべての機能を無料でお使いいただけます。その後、OCR や墨消しの範囲の指定などのプレミアム機能を使うには、購入が必要です。購入の前に、必要な機能が使えることを無料期間中にお確かめください。": {"en": "Every feature is free for {days} days from the first time you start {app}. After that, premium features such as OCR and marking text for redaction need a purchase. Please use the free period to make sure the features you need work for you before you buy.", "zh_CN": "从首次启动 {app} 起 {days} 天内，所有功能均可免费使用。之后，OCR、标记密文等高级功能需要购买。购买前，请在免费期间确认您需要的功能可以正常使用。", "ko": "{app}을(를) 처음 시작한 때부터 {days}일 동안 모든 기능을 무료로 사용할 수 있습니다. 그 후에는 OCR, 교정 영역 지정 등 프리미엄 기능을 사용하려면 구매해야 합니다. 구매하기 전에 무료 기간 동안 필요한 기능이 제대로 작동하는지 확인하세요.", "es": "Todas las funciones son gratuitas durante {days} días desde la primera vez que inicias {app}. Después, las características premium, como el OCR y marcar texto para censurar, requieren una compra. Antes de comprar, aprovecha el periodo gratuito para comprobar que las funciones que necesitas te sirven.", "fr": "Toutes les fonctionnalités sont gratuites pendant {days} jours à partir du premier démarrage de {app}. Ensuite, les fonctionnalités premium, comme l'OCR et le marquage de texte à biffer, nécessitent un achat. Avant d'acheter, profitez de la période gratuite pour vérifier que les fonctionnalités dont vous avez besoin vous conviennent.", "ru": "Все функции бесплатны в течение {days} дней с первого запуска {app}. После этого для премиум-функций, например OCR и выделения текста для скрытия, нужна покупка. Прежде чем покупать, убедитесь в течение бесплатного периода, что нужные вам функции работают.", "ar": "جميع الميزات مجانية لمدة {days} يوماً من أول تشغيل لـ {app}. بعد ذلك، تتطلب الميزات المتميزة، مثل التعرف الضوئي على الحروف (OCR) وتحديد النص للتنقيح، إجراء عملية شراء. قبل الشراء، استفد من الفترة المجانية للتأكد من أن الميزات التي تحتاجها تعمل كما تريد."},
+"{app}の利用には、下の利用規約が適用されます。［続ける］を選ぶと、利用規約に同意したものとみなされます。情報の取扱いについては、プライバシー ポリシーをご覧ください。": {"en": "Your use of {app} is subject to the Terms of Use below. By selecting Continue, you agree to the Terms of Use. The Privacy Policy explains how information is handled.", "zh_CN": "使用 {app} 时适用以下使用条款。选择“继续”即表示你同意使用条款。有关信息的处理方式，请参阅隐私政策。", "ko": "{app} 사용에는 아래 사용 약관이 적용됩니다. [계속]을 선택하면 사용 약관에 동의한 것으로 간주됩니다. 정보 처리 방식은 개인정보 처리방침을 참조하세요.", "es": "El uso de {app} está sujeto a los Términos de uso que aparecen a continuación. Al seleccionar Continuar, aceptas los Términos de uso. La Política de privacidad explica cómo se trata la información.", "fr": "Votre utilisation de {app} est soumise aux Conditions d'utilisation ci-dessous. En sélectionnant Continuer, vous acceptez les Conditions d'utilisation. La Politique de confidentialité explique comment les informations sont traitées.", "ru": "Использование {app} регулируется приведенными ниже Условиями использования. Нажимая «Продолжить», вы принимаете Условия использования. О том, как обрабатывается информация, рассказывает Политика конфиденциальности.", "ar": "يخضع استخدامك لـ {app} لشروط الاستخدام الواردة أدناه. باختيارك «متابعة»، فإنك توافق على شروط الاستخدام. وتوضح سياسة الخصوصية كيفية التعامل مع المعلومات."},
 "大切な文書は、編集する前に複製を保存してください。墨消しをした文書を渡す前に、保存したファイルを別のソフトウェアで開き、内容が消えていることを確かめてください。": {"en": "Keep a copy of any important document before you edit it. Before you share a redacted document, open the saved file in another program and check that the content is gone.", "zh_CN": "编辑重要文档前，请先保存一份副本。在分享已应用密文的文档前，请用其他软件打开保存后的文件，确认相应内容已被删除。", "ko": "중요한 문서는 편집하기 전에 사본을 저장하세요. 교정한 문서를 전달하기 전에 저장된 파일을 다른 프로그램으로 열어 내용이 지워졌는지 확인하세요.", "es": "Guarda una copia de los documentos importantes antes de editarlos. Antes de compartir un documento censurado, abre el archivo guardado en otro programa y comprueba que el contenido ya no está.", "fr": "Conservez une copie de tout document important avant de le modifier. Avant de partager un document biffé, ouvrez le fichier enregistré dans un autre programme et vérifiez que le contenu a bien disparu.", "ru": "Сохраняйте копию важного документа перед его изменением. Прежде чем передать документ со скрытыми данными, откройте сохраненный файл в другой программе и убедитесь, что содержимое удалено.", "ar": "احتفظ بنسخة من أي مستند مهم قبل تعديله. وقبل مشاركة مستند منقّح، افتح الملف المحفوظ في برنامج آخر وتحقق من أن المحتوى قد أُزيل."},
-"利用規約とプライバシー ポリシーは、{app}のライセンスである GNU AGPL に基づいて利用者が有する権利を制限するものではありません。": {"en": "The Terms of Use and the Privacy Policy do not restrict any right you have under the GNU AGPL, the license of {app}.", "zh_CN": "使用条款和隐私政策不限制您依据 {app} 的许可证 GNU AGPL 享有的任何权利。", "ko": "사용 약관과 개인정보 처리방침은 {app}의 라이선스인 GNU AGPL에 따라 사용자가 가지는 권리를 제한하지 않습니다.", "es": "Los Términos de uso y la Política de privacidad no restringen ninguno de los derechos que te concede la GNU AGPL, la licencia de {app}.", "fr": "Les Conditions d'utilisation et la Politique de confidentialité ne restreignent aucun des droits que vous confère la GNU AGPL, licence de {app}.", "ru": "Условия использования и Политика конфиденциальности не ограничивают ваши права по GNU AGPL, лицензии {app}.", "ar": "لا تقيّد شروط الاستخدام وسياسة الخصوصية أي حق تمنحك إياه رخصة GNU AGPL، وهي رخصة {app}."},
-"購入する…": {"en": "Buy…", "zh_CN": "购买…", "ko": "구매…", "es": "Comprar…", "fr": "Acheter…", "ru": "Купить…", "ar": "شراء…"},
+"利用規約とプライバシー ポリシーは、{app}のライセンスである GNU AGPL に基づいて利用者が有する権利を制限するものではありません。": {"en": "The Terms of Use and the Privacy Policy do not restrict any right you have under the GNU AGPL, the license of {app}.", "zh_CN": "使用条款和隐私政策不限制你依据 {app} 的许可证 GNU AGPL 享有的任何权利。", "ko": "사용 약관과 개인정보 처리방침은 {app}의 라이선스인 GNU AGPL에 따라 사용자가 가지는 권리를 제한하지 않습니다.", "es": "Los Términos de uso y la Política de privacidad no restringen ninguno de los derechos que te concede la GNU AGPL, la licencia de {app}.", "fr": "Les Conditions d'utilisation et la Politique de confidentialité ne restreignent aucun des droits que vous confère la GNU AGPL, licence de {app}.", "ru": "Условия использования и Политика конфиденциальности не ограничивают ваши права по GNU AGPL, лицензии {app}.", "ar": "لا تقيّد شروط الاستخدام وسياسة الخصوصية أي حق تمنحك إياه رخصة GNU AGPL، وهي رخصة {app}."},
+"購入する...": {"en": "Buy…", "zh_CN": "购买…", "ko": "구매…", "es": "Comprar…", "fr": "Acheter…", "ru": "Купить…", "ar": "شراء…"},
 "［購入する］を選ぶと、購入の前に内容を確認する画面が開きます。": {"en": "Select Buy to see the details before you buy.", "zh_CN": "选择“购买”可在购买前查看详细信息。", "ko": "[구매]를 선택하면 구매 전에 내용을 확인하는 화면이 열립니다.", "es": "Selecciona Comprar para ver los detalles antes de comprar.", "fr": "Sélectionnez Acheter pour voir le détail avant d'acheter.", "ru": "Нажмите «Купить», чтобы перед покупкой просмотреть ее условия.", "ar": "اختر «شراء» لعرض التفاصيل قبل الشراء."},
-"プレミアム機能は、Microsoft Store 版の pdfNote で購入できます。": {"en": "You can buy premium features in the Microsoft Store edition of pdfNote.", "zh_CN": "高级功能可在 Microsoft Store 版 pdfNote 中购买。", "ko": "프리미엄 기능은 Microsoft Store 버전 pdfNote에서 구매할 수 있습니다.", "es": "Puedes comprar las características premium en la edición de pdfNote de Microsoft Store.", "fr": "Vous pouvez acheter les fonctionnalités premium dans l'édition Microsoft Store de pdfNote.", "ru": "Премиум-функции можно купить в pdfNote из Microsoft Store.", "ar": "يمكنك شراء الميزات المتميزة في إصدار Microsoft Store من pdfNote."},
 "プレミアムの購入": {"en": "Buy Premium", "zh_CN": "购买高级版", "ko": "프리미엄 구매", "es": "Comprar premium", "fr": "Acheter la version premium", "ru": "Покупка премиум-версии", "ar": "شراء الميزات المتميزة"},
 "購入の手続きが進行中です。Microsoft Store の画面で手続きを完了してください。": {"en": "A purchase is already in progress. Please finish it in the Microsoft Store window.", "zh_CN": "购买正在进行中。请在 Microsoft Store 窗口中完成购买。", "ko": "구매가 진행 중입니다. Microsoft Store 창에서 구매를 완료하세요.", "es": "Ya hay una compra en curso. Termínala en la ventana de Microsoft Store.", "fr": "Un achat est déjà en cours. Terminez-le dans la fenêtre du Microsoft Store.", "ru": "Покупка уже выполняется. Завершите ее в окне Microsoft Store.", "ar": "هناك عملية شراء قيد التنفيذ بالفعل. يرجى إكمالها في نافذة Microsoft Store."},
-"ご購入ありがとうございます。プレミアム機能をお使いいただけます。": {"en": "Thank you for your purchase. The premium features are now available.", "zh_CN": "感谢您的购买。现在可以使用高级功能了。", "ko": "구매해 주셔서 감사합니다. 이제 프리미엄 기능을 사용할 수 있습니다.", "es": "Gracias por tu compra. Ya puedes usar las características premium.", "fr": "Merci pour votre achat. Les fonctionnalités premium sont maintenant disponibles.", "ru": "Спасибо за покупку. Премиум-функции теперь доступны.", "ar": "شكراً لك على الشراء. أصبحت الميزات المتميزة متاحة الآن."},
-"この商品はすでに購入済みです。プレミアム機能をお使いいただけます。": {"en": "You've already bought this. The premium features are available.", "zh_CN": "您已购买此商品。可以使用高级功能。", "ko": "이미 구매한 상품입니다. 프리미엄 기능을 사용할 수 있습니다.", "es": "Ya has comprado este producto. Puedes usar las características premium.", "fr": "Vous avez déjà acheté ce produit. Les fonctionnalités premium sont disponibles.", "ru": "Вы уже купили этот продукт. Премиум-функции доступны.", "ar": "لقد اشتريت هذا المنتج بالفعل. الميزات المتميزة متاحة."},
+"ご購入ありがとうございます。プレミアム機能をお使いいただけます。": {"en": "Thank you for your purchase. The premium features are now available.", "zh_CN": "感谢购买。现在可以使用高级功能了。", "ko": "구매해 주셔서 감사합니다. 이제 프리미엄 기능을 사용할 수 있습니다.", "es": "Gracias por tu compra. Ya puedes usar las características premium.", "fr": "Merci pour votre achat. Les fonctionnalités premium sont maintenant disponibles.", "ru": "Спасибо за покупку. Премиум-функции теперь доступны.", "ar": "شكراً لك على الشراء. أصبحت الميزات المتميزة متاحة الآن."},
+"この商品はすでに購入済みです。プレミアム機能をお使いいただけます。": {"en": "You've already bought this. The premium features are available.", "zh_CN": "已购买此商品。可以使用高级功能。", "ko": "이미 구매한 상품입니다. 프리미엄 기능을 사용할 수 있습니다.", "es": "Ya has comprado este producto. Puedes usar las características premium.", "fr": "Vous avez déjà acheté ce produit. Les fonctionnalités premium sont disponibles.", "ru": "Вы уже купили этот продукт. Премиум-функции доступны.", "ar": "لقد اشتريت هذا المنتج بالفعل. الميزات المتميزة متاحة."},
 "購入を完了できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "The purchase couldn't be completed. Check your internet connection and try again.", "zh_CN": "无法完成购买。请检查网络连接后重试。", "ko": "구매를 완료할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo completar la compra. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "L'achat n'a pas pu être finalisé. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось завершить покупку. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذر إكمال عملية الشراء. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
 "{count} か月ごとに自動更新されます": {"en": "Renews automatically every {count} months", "zh_CN": "每 {count} 个月自动续订", "ko": "{count}개월마다 자동으로 갱신됩니다", "es": "Se renueva automáticamente cada {count} meses", "fr": "Renouvelé automatiquement tous les {count} mois", "ru": "Продлевается автоматически каждые {count} мес.", "ar": "يتجدد تلقائياً كل {count} شهر"},
 "{count} 年ごとに自動更新されます": {"en": "Renews automatically every {count} years", "zh_CN": "每 {count} 年自动续订", "ko": "{count}년마다 자동으로 갱신됩니다", "es": "Se renueva automáticamente cada {count} años", "fr": "Renouvelé automatiquement tous les {count} ans", "ru": "Продлевается автоматически каждые {count} лет", "ar": "يتجدد تلقائياً كل {count} سنة"},
 "自動更新されます": {"en": "Renews automatically", "zh_CN": "自动续订", "ko": "자동으로 갱신됩니다", "es": "Se renueva automáticamente", "fr": "Renouvelé automatiquement", "ru": "Продлевается автоматически", "ar": "يتجدد تلقائياً"},
+"サブスクリプション（{count} か月ごとに自動更新されます）": {"en": "Subscription (renews automatically every {count} months)", "zh_CN": "订阅（每 {count} 个月自动续订）", "ko": "구독({count}개월마다 자동 갱신)", "es": "Suscripción (se renueva automáticamente cada {count} meses)", "fr": "Abonnement (renouvelé automatiquement tous les {count} mois)", "ru": "Подписка (продлевается автоматически каждые {count} мес.)", "ar": "اشتراك (يتجدد تلقائياً كل {count} شهر)"},
+"サブスクリプション（{count} 年ごとに自動更新されます）": {"en": "Subscription (renews automatically every {count} years)", "zh_CN": "订阅（每 {count} 年自动续订）", "ko": "구독({count}년마다 자동 갱신)", "es": "Suscripción (se renueva automáticamente cada {count} años)", "fr": "Abonnement (renouvelé automatiquement tous les {count} ans)", "ru": "Подписка (продлевается автоматически каждые {count} лет)", "ar": "اشتراك (يتجدد تلقائياً كل {count} سنة)"},
+"サブスクリプション（自動更新されます）": {"en": "Subscription (renews automatically)", "zh_CN": "订阅（自动续订）", "ko": "구독(자동 갱신)", "es": "Suscripción (se renueva automáticamente)", "fr": "Abonnement (renouvelé automatiquement)", "ru": "Подписка (продлевается автоматически)", "ar": "اشتراك (يتجدد تلقائياً)"},
 "Microsoft Store から商品と価格を読み込んでいます…": {"en": "Getting products and prices from the Microsoft Store…", "zh_CN": "正在从 Microsoft Store 获取商品和价格…", "ko": "Microsoft Store에서 상품과 가격을 가져오는 중…", "es": "Obteniendo productos y precios de Microsoft Store…", "fr": "Récupération des produits et des prix depuis le Microsoft Store…", "ru": "Получение продуктов и цен из Microsoft Store…", "ar": "جارٍ جلب المنتجات والأسعار من Microsoft Store…"},
 "特定商取引法に基づく表記": {"en": "Legal notice for Japan (Specified Commercial Transactions Act)", "zh_CN": "基于《特定商业交易法》的标示（日本）", "ko": "특정상거래법에 따른 표기(일본)", "es": "Aviso legal para Japón (Ley de Transacciones Comerciales Especificadas)", "fr": "Mentions légales pour le Japon (loi sur les transactions commerciales spécifiées)", "ru": "Правовая информация для Японии (Закон об определенных коммерческих сделках)", "ar": "إشعار قانوني لليابان (قانون المعاملات التجارية المحددة)"},
 "利用規約に同意します。購入後すぐにプレミアム機能が使えるようになることに同意し、欧州経済領域又は英国にお住まいの場合は、これにより撤回権を失うことを了承します。": {"en": "I agree to the Terms of Use. I agree that the premium features are made available immediately after purchase and, if I live in the European Economic Area or the United Kingdom, I acknowledge that I thereby lose my right of withdrawal.", "zh_CN": "我同意使用条款。我同意购买后立即启用高级功能；如果我居住在欧洲经济区或英国，我知悉因此将丧失撤回权。", "ko": "사용 약관에 동의합니다. 구매 직후 프리미엄 기능을 사용할 수 있게 되는 것에 동의하며, 유럽 경제 지역 또는 영국에 거주하는 경우 이로 인해 철회권을 잃는다는 것을 인정합니다.", "es": "Acepto los Términos de uso. Acepto que las características premium estén disponibles inmediatamente después de la compra y, si resido en el Espacio Económico Europeo o en el Reino Unido, reconozco que por ello pierdo mi derecho de desistimiento.", "fr": "J'accepte les Conditions d'utilisation. J'accepte que les fonctionnalités premium soient disponibles immédiatement après l'achat et, si je réside dans l'Espace économique européen ou au Royaume-Uni, je reconnais perdre ainsi mon droit de rétractation.", "ru": "Я принимаю Условия использования. Я согласен с тем, что премиум-функции становятся доступны сразу после покупки, и, если я проживаю в Европейской экономической зоне или Великобритании, признаю, что тем самым теряю право на отказ от договора.", "ar": "أوافق على شروط الاستخدام. وأوافق على إتاحة الميزات المتميزة فور الشراء، وإذا كنت أقيم في المنطقة الاقتصادية الأوروبية أو المملكة المتحدة، فإنني أقر بأنني أفقد بذلك حقي في الانسحاب."},
@@ -2418,17 +2712,14 @@ TRANSLATIONS = {
 "新しい版の確認": {"en": "Check for Updates", "zh_CN": "检查更新", "ko": "업데이트 확인", "es": "Buscar actualizaciones", "fr": "Recherche de mises à jour", "ru": "Проверка обновлений", "ar": "التحقق من التحديثات"},
 "Microsoft Store に問い合わせて、新しい版があるかを確かめます。インターネットに接続します。よろしいですか？": {"en": "pdfNote will ask the Microsoft Store whether a newer version is available. This connects to the internet. Do you want to continue?", "zh_CN": "pdfNote 将向 Microsoft Store 查询是否有新版本。此操作会连接到 Internet。是否继续？", "ko": "pdfNote가 Microsoft Store에 새 버전이 있는지 확인합니다. 인터넷에 연결됩니다. 계속하시겠습니까?", "es": "pdfNote consultará a Microsoft Store si hay una versión más reciente. Para ello se conectará a internet. ¿Quieres continuar?", "fr": "pdfNote va demander au Microsoft Store si une version plus récente est disponible. Une connexion Internet est nécessaire. Voulez-vous continuer ?", "ru": "pdfNote запросит у Microsoft Store, есть ли более новая версия. Для этого будет выполнено подключение к интернету. Продолжить?", "ar": "سيسأل pdfNote متجر Microsoft Store عمّا إذا كان هناك إصدار أحدث. يتطلب ذلك الاتصال بالإنترنت. هل تريد المتابعة؟"},
 "Microsoft Store に問い合わせています…": {"en": "Asking the Microsoft Store…", "zh_CN": "正在询问 Microsoft Store…", "ko": "Microsoft Store에 확인하는 중…", "es": "Consultando a Microsoft Store…", "fr": "Interrogation du Microsoft Store…", "ru": "Запрос к Microsoft Store…", "ar": "جارٍ الاستعلام من Microsoft Store…"},
-"この{app}は Microsoft Store から入れたものではないため、新しい版を確かめられません。": {"en": "This copy of {app} wasn't installed from the Microsoft Store, so it can't check for updates.", "zh_CN": "此 {app} 不是从 Microsoft Store 安装的，因此无法检查更新。", "ko": "이 {app}은(는) Microsoft Store에서 설치하지 않았으므로 업데이트를 확인할 수 없습니다.", "es": "Esta copia de {app} no se instaló desde Microsoft Store, por lo que no puede buscar actualizaciones.", "fr": "Cette copie de {app} n'a pas été installée depuis le Microsoft Store et ne peut donc pas rechercher de mises à jour.", "ru": "Эта копия {app} установлена не из Microsoft Store, поэтому она не может проверить наличие обновлений.", "ar": "لم تُثبَّت هذه النسخة من {app} من Microsoft Store، لذا لا يمكنها التحقق من وجود تحديثات."},
 "新しい版があります。Microsoft Store で更新してください。": {"en": "A newer version is available. Update pdfNote in the Microsoft Store.", "zh_CN": "有新版本可用。请在 Microsoft Store 中更新。", "ko": "새 버전을 사용할 수 있습니다. Microsoft Store에서 업데이트하세요.", "es": "Hay una versión más reciente. Actualiza pdfNote en Microsoft Store.", "fr": "Une version plus récente est disponible. Mettez à jour pdfNote dans le Microsoft Store.", "ru": "Доступна более новая версия. Обновите pdfNote в Microsoft Store.", "ar": "يتوفر إصدار أحدث. حدّث pdfNote من Microsoft Store."},
 "お使いの{app} {version}は最新の版です。": {"en": "{app} {version} is up to date.", "zh_CN": "你使用的 {app} {version} 已是最新版本。", "ko": "사용 중인 {app} {version}은(는) 최신 버전입니다.", "es": "{app} {version} está actualizado.", "fr": "{app} {version} est à jour.", "ru": "{app} {version} — это последняя версия.", "ar": "{app} {version} محدَّث."},
-"このアプリを最初に有償購入してくれたのはデンマークの方でした。彼または彼女への最大限の感謝の印にデンマーク語とその祖先の古ノルド語対応をしました。": {"en": "The first person to buy this app was from Denmark. As a token of my deepest gratitude to him or her, I added Danish and its ancestor, Old Norse.", "zh_CN": "第一位付费购买本应用的是一位丹麦用户。为了向他或她表达最深切的感谢，我为本应用加入了丹麦语及其祖先语言古诺尔斯语。", "ko": "이 앱을 처음으로 유료 구매해 주신 분은 덴마크 분이었습니다. 그분께 최대한의 감사를 전하고자 덴마크어와 그 조상인 고대 노르드어를 지원하게 되었습니다.", "es": "La primera persona que compró esta aplicación era de Dinamarca. Como muestra de mi más profundo agradecimiento hacia él o ella, he añadido el danés y su antepasado, el nórdico antiguo.", "fr": "La toute première personne à acheter cette application venait du Danemark. En témoignage de ma plus profonde gratitude envers elle, j'ai ajouté le danois et son ancêtre, le vieux norrois.", "ru": "Первым покупателем этого приложения стал человек из Дании. В знак глубочайшей благодарности ему или ей в приложение добавлены датский язык и его предок — древнескандинавский.", "ar": "كان أول من اشترى هذا التطبيق شخصاً من الدنمارك. وتعبيراً عن أعمق امتناني له أو لها، أضفت اللغة الدنماركية وسلفها اللغة النوردية القديمة."},
 "Microsoft Store に接続できませんでした。インターネットへの接続を確かめて、もう一度お試しください。": {"en": "Couldn't connect to the Microsoft Store. Check your internet connection and try again.", "zh_CN": "无法连接到 Microsoft Store。请检查网络连接后重试。", "ko": "Microsoft Store에 연결할 수 없습니다. 인터넷 연결을 확인하고 다시 시도하세요.", "es": "No se pudo conectar con Microsoft Store. Comprueba la conexión a internet e inténtalo de nuevo.", "fr": "Impossible de se connecter au Microsoft Store. Vérifiez votre connexion Internet et réessayez.", "ru": "Не удалось подключиться к Microsoft Store. Проверьте подключение к интернету и повторите попытку.", "ar": "تعذر الاتصال بـ Microsoft Store. تحقق من اتصالك بالإنترنت وحاول مرة أخرى."},
 "現在購入できる商品がありません。": {"en": "There is nothing available to buy right now.", "zh_CN": "目前没有可购买的商品。", "ko": "현재 구매할 수 있는 상품이 없습니다.", "es": "Ahora mismo no hay nada disponible para comprar.", "fr": "Aucun produit n'est disponible à l'achat pour le moment.", "ru": "Сейчас нет доступных для покупки продуктов.", "ar": "لا يوجد ما يمكن شراؤه حالياً."},
 "購入する商品を選んでください。": {"en": "Choose what to buy.", "zh_CN": "请选择要购买的商品。", "ko": "구매할 상품을 선택하세요.", "es": "Elige qué quieres comprar.", "fr": "Choisissez ce que vous voulez acheter.", "ru": "Выберите, что купить.", "ar": "اختر ما تريد شراءه."},
 "買い切り（お支払いは1回だけです）": {"en": "One-time purchase (you pay once)", "zh_CN": "一次性购买（仅支付一次）", "ko": "일회성 구매(한 번만 결제)", "es": "Compra única (pagas una sola vez)", "fr": "Achat unique (un seul paiement)", "ru": "Разовая покупка (оплата один раз)", "ar": "شراء لمرة واحدة (تدفع مرة واحدة فقط)"},
 "購入する商品": {"en": "Product", "zh_CN": "商品", "ko": "상품", "es": "Producto", "fr": "Produit", "ru": "Продукт", "ar": "المنتج"},
 "内容": {"en": "What you get", "zh_CN": "内容", "ko": "내용", "es": "Qué incluye", "fr": "Contenu", "ru": "Что входит", "ar": "المحتوى"},
-"この Microsoft Store 版の pdfNote で、プレミアム機能（OCR、墨消しの範囲の指定、テキスト ボックスの追加、右クリックのメニュー、Alt キーのショートカット）が使えるようになります。購入に使う Microsoft アカウントに結び付きます。": {"en": "Enables the premium features (OCR, marking text for redaction, adding text boxes, the shortcut menus and the Alt key shortcuts) in this Microsoft Store edition of pdfNote, for the Microsoft account you buy with.", "zh_CN": "在此 Microsoft Store 版 pdfNote 中启用高级功能（OCR、标记密文区域、添加文本框、快捷菜单和 Alt 键快捷方式），并与购买时使用的 Microsoft 帐户关联。", "ko": "이 Microsoft Store 버전 pdfNote에서 프리미엄 기능(OCR, 교정 영역 지정, 텍스트 상자 추가, 바로 가기 메뉴, Alt 키 바로 가기)을 사용할 수 있게 됩니다. 구매에 사용한 Microsoft 계정에 연결됩니다.", "es": "Activa las características premium (OCR, marcar texto para censurar, añadir cuadros de texto, los menús contextuales y los métodos abreviados con Alt) en esta edición de pdfNote de Microsoft Store, para la cuenta Microsoft con la que compres.", "fr": "Active les fonctionnalités premium (OCR, marquage de texte à biffer, ajout de zones de texte, menus contextuels et raccourcis clavier avec Alt) dans cette édition Microsoft Store de pdfNote, pour le compte Microsoft utilisé pour l'achat.", "ru": "Включает премиум-функции (OCR, выделение текста для скрытия, добавление текстовых полей, контекстные меню и сочетания клавиш с ALT) в этой версии pdfNote из Microsoft Store для учетной записи Microsoft, с которой совершена покупка.", "ar": "يتيح الميزات المتميزة (التعرف الضوئي على الحروف، وتحديد النص للتنقيح، وإضافة مربعات النص، والقوائم المختصرة، واختصارات المفتاح Alt) في إصدار Microsoft Store هذا من pdfNote، لحساب Microsoft الذي تشتري به."},
 "数量": {"en": "Quantity", "zh_CN": "数量", "ko": "수량", "es": "Cantidad", "fr": "Quantité", "ru": "Количество", "ar": "الكمية"},
 "価格": {"en": "Price", "zh_CN": "价格", "ko": "가격", "es": "Precio", "fr": "Prix", "ru": "Цена", "ar": "السعر"},
 "{price}／期間ごと（Microsoft Store での価格。日本では消費税込み）": {"en": "{price} per period (the Microsoft Store price; in Japan, including consumption tax)", "zh_CN": "{price}／每期（Microsoft Store 价格；在日本含消费税）", "ko": "{price}/기간당(Microsoft Store 가격, 일본에서는 소비세 포함)", "es": "{price} por periodo (precio de Microsoft Store; en Japón, impuesto sobre el consumo incluido)", "fr": "{price} par période (prix du Microsoft Store ; au Japon, taxe sur la consommation incluse)", "ru": "{price} за период (цена Microsoft Store; в Японии — с учетом потребительского налога)", "ar": "{price} لكل فترة (سعر Microsoft Store؛ في اليابان، شاملاً ضريبة الاستهلاك)"},
@@ -2439,13 +2730,13 @@ TRANSLATIONS = {
 "使えるようになる時期": {"en": "When you can use it", "zh_CN": "可使用时间", "ko": "사용 가능 시기", "es": "Cuándo puedes usarlo", "fr": "Disponibilité", "ru": "Когда можно пользоваться", "ar": "متى يمكنك استخدامه"},
 "購入が完了するとすぐに使えるようになります。": {"en": "Right after the purchase is complete.", "zh_CN": "购买完成后即可使用。", "ko": "구매가 완료되면 바로 사용할 수 있습니다.", "es": "En cuanto se completa la compra.", "fr": "Dès que l'achat est finalisé.", "ru": "Сразу после завершения покупки.", "ar": "فور إتمام عملية الشراء."},
 "契約期間と解約": {"en": "Term and cancellation", "zh_CN": "合约期限与取消", "ko": "계약 기간 및 해지", "es": "Duración y cancelación", "fr": "Durée et résiliation", "ru": "Срок и отмена", "ar": "المدة والإلغاء"},
-"{renewal}。Microsoft アカウントの「サービスとサブスクリプション」でいつでも解約できます。解約は支払済みの期間の終わりに効力を生じ、残りの期間の分は返金されません。": {"en": "{renewal}. You can cancel at any time under Services & subscriptions in your Microsoft account. Cancellation takes effect at the end of the period you have paid for, and the rest of that period is not refunded.", "zh_CN": "{renewal}。您可以随时在 Microsoft 帐户的“服务和订阅”中取消。取消将在已付费期间结束时生效，剩余期间不予退款。", "ko": "{renewal}. Microsoft 계정의 '서비스 및 구독'에서 언제든지 해지할 수 있습니다. 해지는 결제한 기간이 끝날 때 효력이 발생하며, 남은 기간에 대해서는 환불되지 않습니다.", "es": "{renewal}. Puedes cancelarla en cualquier momento en Servicios y suscripciones de tu cuenta Microsoft. La cancelación surte efecto al final del periodo pagado, y el resto de ese periodo no se reembolsa.", "fr": "{renewal}. Vous pouvez résilier à tout moment dans Services et abonnements de votre compte Microsoft. La résiliation prend effet à la fin de la période payée, et le reste de cette période n'est pas remboursé.", "ru": "{renewal}. Отменить подписку можно в любое время в разделе «Службы и подписки» учетной записи Microsoft. Отмена вступает в силу в конце оплаченного периода; оставшаяся часть периода не возмещается.", "ar": "{renewal}. يمكنك الإلغاء في أي وقت من «الخدمات والاشتراكات» في حساب Microsoft الخاص بك. يسري الإلغاء في نهاية الفترة التي دفعت مقابلها، ولا يُسترد المبلغ عن باقي تلك الفترة."},
+"{renewal}。Microsoft アカウントの「サービスとサブスクリプション」でいつでも解約できます。解約は支払済みの期間の終わりに効力を生じ、残りの期間の分は返金されません。": {"en": "{renewal}. You can cancel at any time under Services & subscriptions in your Microsoft account. Cancellation takes effect at the end of the period you have paid for, and the rest of that period is not refunded.", "zh_CN": "{renewal}。可以随时在 Microsoft 帐户的“服务和订阅”中取消。取消将在已付费期间结束时生效，剩余期间不予退款。", "ko": "{renewal}. Microsoft 계정의 '서비스 및 구독'에서 언제든지 해지할 수 있습니다. 해지는 결제한 기간이 끝날 때 효력이 발생하며, 남은 기간에 대해서는 환불되지 않습니다.", "es": "{renewal}. Puedes cancelarla en cualquier momento en Servicios y suscripciones de tu cuenta Microsoft. La cancelación surte efecto al final del periodo pagado, y el resto de ese periodo no se reembolsa.", "fr": "{renewal}. Vous pouvez résilier à tout moment dans Services et abonnements de votre compte Microsoft. La résiliation prend effet à la fin de la période payée, et le reste de cette période n'est pas remboursé.", "ru": "{renewal}. Отменить подписку можно в любое время в разделе «Службы и подписки» учетной записи Microsoft. Отмена вступает в силу в конце оплаченного периода; оставшаяся часть периода не возмещается.", "ar": "{renewal}. يمكنك الإلغاء في أي وقت من «الخدمات والاشتراكات» في حساب Microsoft الخاص بك. يسري الإلغاء في نهاية الفترة التي دفعت مقابلها، ولا يُسترد المبلغ عن باقي تلك الفترة."},
 "返品・返金": {"en": "Returns and refunds", "zh_CN": "退货与退款", "ko": "반품 및 환불", "es": "Devoluciones y reembolsos", "fr": "Retours et remboursements", "ru": "Возврат и возмещение", "ar": "الإرجاع واسترداد المبالغ"},
 "購入後の返金は、法令又は Microsoft の返金の規定による場合を除き、お受けできません。pdfNote は GNU AGPL の下で提供され、そのソース コードは公開されています。このことは返金の理由となりません。": {"en": "Purchases are not refundable, except where the law or Microsoft's refund policy provides otherwise. pdfNote is licensed under the GNU AGPL and its source code is published; this is not grounds for a refund.", "zh_CN": "除法律或 Microsoft 退款政策另有规定外，购买后不予退款。pdfNote 依据 GNU AGPL 提供，其源代码已公开；这不构成退款理由。", "ko": "법령 또는 Microsoft의 환불 규정에 따른 경우를 제외하고, 구매 후에는 환불되지 않습니다. pdfNote는 GNU AGPL에 따라 제공되며 소스 코드가 공개되어 있습니다. 이는 환불 사유가 되지 않습니다.", "es": "Las compras no son reembolsables, salvo que la ley o la política de reembolsos de Microsoft dispongan otra cosa. pdfNote se ofrece bajo la GNU AGPL y su código fuente está publicado; esto no es motivo de reembolso.", "fr": "Les achats ne sont pas remboursables, sauf si la loi ou la politique de remboursement de Microsoft en dispose autrement. pdfNote est distribué sous la GNU AGPL et son code source est publié ; cela ne constitue pas un motif de remboursement.", "ru": "Покупки не подлежат возврату, если иное не предусмотрено законом или правилами возврата Microsoft. pdfNote распространяется по лицензии GNU AGPL, и его исходный код опубликован; это не является основанием для возврата.", "ar": "لا تُسترد المبالغ بعد الشراء، إلا إذا نص القانون أو سياسة الاسترداد لدى Microsoft على خلاف ذلك. يُقدَّم pdfNote بموجب رخصة GNU AGPL وشيفرته المصدرية منشورة؛ ولا يُعد ذلك سبباً لاسترداد المبلغ."},
 "文書がその後に変更されたため、やり直せませんでした": {"en": "The document has changed since then, so this can't be redone", "zh_CN": "文档此后已被更改，因此无法恢复", "ko": "그 이후 문서가 변경되어 다시 실행할 수 없습니다", "es": "El documento se modificó después, así que no se puede rehacer", "fr": "Le document a été modifié depuis ; impossible de rétablir", "ru": "Документ был изменен после этого, поэтому повторить действие нельзя", "ar": "تغيّر المستند منذ ذلك الحين، لذا تتعذر الإعادة"},
 "続ける": {"en": "Continue", "zh_CN": "继续", "ko": "계속", "es": "Continuar", "fr": "Continuer", "ru": "Продолжить", "ar": "متابعة"},
 "AGPL 第7条に基づく追加条項（{app}の名称とアイコン、改変版の表示など）が適用されます。「{tab}」タブの「{document}」をご覧ください。": {"en": "Additional terms under section 7 of the AGPL apply, concerning among other things the name and icon of {app} and the marking of modified versions. See “{document}” on the “{tab}” tab.", "zh_CN": "适用 AGPL 第 7 条规定的附加条款（涉及 {app} 的名称和图标、修改版本的标示等）。请参阅“{tab}”选项卡中的“{document}”。", "ko": "AGPL 제7조에 따른 추가 조건({app}의 이름과 아이콘, 수정 버전의 표시 등)이 적용됩니다. [{tab}] 탭의 '{document}'을(를) 참조하세요.", "es": "Se aplican condiciones adicionales conforme a la sección 7 de la AGPL, relativas, entre otras cosas, al nombre y el icono de {app} y a la identificación de las versiones modificadas. Consulta «{document}», en la pestaña «{tab}».", "fr": "Des conditions supplémentaires au titre de l'article 7 de l'AGPL s'appliquent, notamment au nom et à l'icône de {app} et à l'identification des versions modifiées. Consultez « {document} », onglet « {tab} ».", "ru": "Применяются дополнительные условия согласно разделу 7 AGPL, в том числе в отношении названия и значка {app} и обозначения измененных версий. См. документ «{document}» на вкладке «{tab}».", "ar": "تسري شروط إضافية بموجب القسم 7 من AGPL، تتعلق من بين أمور أخرى باسم {app} وأيقونته وتمييز النسخ المعدّلة. راجع «{document}» ضمن علامة التبويب «{tab}»."},
-"{app}は、GNU Affero General Public License 第3版（またはそれ以降の版）の下で提供されます。ライセンシーは、同ライセンスの条件に従って{app}を頒布できます。ライセンスの本文は「{tab}」タブにあります。": {"en": "{app} is licensed under the GNU Affero General Public License, version 3 or (at your option) any later version. Licensees may convey {app} under the terms of that license, the text of which is on the “{tab}” tab.", "zh_CN": "{app} 依据 GNU Affero 通用公共许可证第 3 版（或您选择的任何更高版本）授权。被许可人可以按照该许可证的条款传递 {app}，许可证文本位于“{tab}”选项卡。", "ko": "{app}은(는) GNU Affero 일반 공중 사용 허가서 버전 3(또는 선택에 따라 그 이후 버전)에 따라 사용이 허가됩니다. 사용권자는 이 라이선스의 조건에 따라 {app}을(를) 배포할 수 있으며, 라이선스 본문은 [{tab}] 탭에 있습니다.", "es": "{app} se distribuye con la Licencia Pública General Affero de GNU, versión 3 o (a tu elección) cualquier versión posterior. Los licenciatarios pueden transmitir {app} según los términos de esa licencia, cuyo texto está en la pestaña «{tab}».", "fr": "{app} est distribué sous la licence publique générale GNU Affero, version 3 ou (à votre choix) toute version ultérieure. Les licenciés peuvent transmettre {app} selon les termes de cette licence, dont le texte figure dans l'onglet « {tab} ».", "ru": "{app} лицензируется на условиях Стандартной общественной лицензии GNU Affero версии 3 или (по вашему выбору) любой более поздней версии. Лицензиаты могут передавать {app} на условиях этой лицензии; ее текст приведен на вкладке «{tab}».", "ar": "يُرخَّص {app} بموجب رخصة جنو أفيرو العمومية العامة، الإصدار 3 أو (حسب اختيارك) أي إصدار لاحق. ويجوز للمرخَّص لهم نقل {app} وفقاً لشروط هذا الترخيص، ويوجد نصه في علامة التبويب «{tab}»."},
+"{app}は、GNU Affero General Public License 第3版（またはそれ以降の版）の下で提供されます。ライセンシーは、同ライセンスの条件に従って{app}を頒布できます。ライセンスの本文は「{tab}」タブにあります。": {"en": "{app} is licensed under the GNU Affero General Public License, version 3 or (at your option) any later version. Licensees may convey {app} under the terms of that license, the text of which is on the “{tab}” tab.", "zh_CN": "{app} 依据 GNU Affero 通用公共许可证第 3 版（或你选择的任何更高版本）授权。被许可人可以按照该许可证的条款传递 {app}，许可证文本位于“{tab}”选项卡。", "ko": "{app}은(는) GNU Affero 일반 공중 사용 허가서 버전 3(또는 선택에 따라 그 이후 버전)에 따라 사용이 허가됩니다. 사용권자는 이 라이선스의 조건에 따라 {app}을(를) 배포할 수 있으며, 라이선스 본문은 [{tab}] 탭에 있습니다.", "es": "{app} se distribuye con la Licencia Pública General Affero de GNU, versión 3 o (a tu elección) cualquier versión posterior. Los licenciatarios pueden transmitir {app} según los términos de esa licencia, cuyo texto está en la pestaña «{tab}».", "fr": "{app} est distribué sous la licence publique générale GNU Affero, version 3 ou (à votre choix) toute version ultérieure. Les licenciés peuvent transmettre {app} selon les termes de cette licence, dont le texte figure dans l'onglet « {tab} ».", "ru": "{app} лицензируется на условиях Стандартной общественной лицензии GNU Affero версии 3 или (по вашему выбору) любой более поздней версии. Лицензиаты могут передавать {app} на условиях этой лицензии; ее текст приведен на вкладке «{tab}».", "ar": "يُرخَّص {app} بموجب رخصة جنو أفيرو العمومية العامة، الإصدار 3 أو (حسب اختيارك) أي إصدار لاحق. ويجوز للمرخَّص لهم نقل {app} وفقاً لشروط هذا الترخيص، ويوجد نصه في علامة التبويب «{tab}»."},
 "{app}には、法令で認められる範囲で、また利用規約に定める場合を除き、商品性や特定目的への適合性の保証を含め、いかなる保証もありません。Microsoft Store で提供される{app}とその中での購入には、「{terms}」タブの利用規約が適用されます。": {"en": "{app} comes with NO WARRANTY, including any implied warranty of merchantability or fitness for a particular purpose, to the extent permitted by applicable law and except as stated in the Terms of Use. The Terms of Use on the “{terms}” tab apply to {app} as published in the Microsoft Store and to purchases made in it.", "zh_CN": "在适用法律允许的范围内，除使用条款另有规定外，{app} 不提供任何担保，包括对适销性或特定用途适用性的默示担保。“{terms}”选项卡中的使用条款适用于在 Microsoft Store 中发布的 {app} 及在其中进行的购买。", "ko": "관련 법률이 허용하는 범위에서, 그리고 사용 약관에 규정된 경우를 제외하고, {app}은(는) 상품성이나 특정 목적 적합성에 대한 묵시적 보증을 포함하여 어떠한 보증도 제공하지 않습니다. Microsoft Store에서 게시된 {app} 및 그 안에서의 구매에는 [{terms}] 탭의 사용 약관이 적용됩니다.", "es": "{app} se ofrece SIN NINGUNA GARANTÍA, incluidas las garantías implícitas de comerciabilidad o idoneidad para un fin determinado, en la medida permitida por la ley aplicable y salvo lo dispuesto en los Términos de uso. Los Términos de uso de la pestaña «{terms}» se aplican a {app} tal como se publica en Microsoft Store y a las compras realizadas en él.", "fr": "{app} est fourni SANS AUCUNE GARANTIE, y compris les garanties implicites de qualité marchande ou d'adéquation à un usage particulier, dans la mesure permise par la loi applicable et sauf disposition contraire des Conditions d'utilisation. Les Conditions d'utilisation de l'onglet « {terms} » s'appliquent à {app} tel que publié dans le Microsoft Store et aux achats qui y sont effectués.", "ru": "{app} предоставляется БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, включая подразумеваемые гарантии товарной пригодности и пригодности для определенной цели, в пределах, допускаемых применимым законодательством, если иное не предусмотрено Условиями использования. Условия использования на вкладке «{terms}» применяются к {app}, опубликованной в Microsoft Store, и к покупкам в ней.", "ar": "يأتي {app} دون أي ضمان، بما في ذلك الضمانات الضمنية للقابلية للتسويق أو الملاءمة لغرض معين، في الحدود التي يسمح بها القانون المعمول به وباستثناء ما تنص عليه شروط الاستخدام. تسري شروط الاستخدام الموجودة في علامة التبويب «{terms}» على {app} كما هو منشور في Microsoft Store وعلى عمليات الشراء التي تتم فيه."},
 "このソフトウェアは次のオープンソース ソフトウェアを利用しています。": {"en": "This software uses the following open-source software.", "zh_CN": "本软件使用了以下开放源代码软件。", "ko": "이 소프트웨어는 다음 오픈 소스 소프트웨어를 사용합니다.", "es": "Este software usa el siguiente software de código abierto.", "fr": "Ce logiciel utilise les logiciels open source suivants.", "ru": "Эта программа использует следующее ПО с открытым кодом.", "ar": "يستخدم هذا البرنامج البرامج مفتوحة المصدر التالية."},
 "コンポーネント": {"en": "Component", "zh_CN": "组件", "ko": "구성 요소", "es": "Componente", "fr": "Composant", "ru": "Компонент", "ar": "المكوّن"},
@@ -2459,14 +2750,8 @@ TRANSLATIONS = {
 # with the ribbon" pages (KeyTips). Freeze Page follows each language's
 # Excel Freeze Panes (Inmovilizar, Figer, Закрепить, 冻结, 틀 고정, تجميد).
 "ページを固定": {"en": "Page by Page", "zh_CN": "逐页查看", "ko": "한 페이지씩 보기", "es": "Página a página", "fr": "Page par page", "ru": "Постраничный просмотр", "ar": "عرض صفحة بصفحة"},
-"プレミアムでお使いいただけるもの:": {"en": "Premium includes:", "zh_CN": "高级版包含：", "ko": "프리미엄에 포함된 기능:", "es": "Premium incluye:", "fr": "Premium comprend :", "ru": "Премиум включает:", "ar": "تتضمن الميزات المتميزة:"},
-"開く・読む・ハイライト・付箋・手書き・図形・保存・印刷は、これまでどおり無料でお使いいただけます。": {"en": "Opening and reading PDFs, highlighting, sticky notes, freehand drawing, shapes, saving and printing stay free.", "zh_CN": "打开和阅读 PDF、突出显示、便笺、手绘、图形、保存和打印仍然免费。", "ko": "PDF 열기와 읽기, 강조 표시, 스티커 메모, 자유형 그리기, 도형, 저장, 인쇄는 계속 무료로 사용할 수 있습니다.", "es": "Abrir y leer PDF, resaltar, añadir notas adhesivas, dibujar a mano alzada y formas, guardar e imprimir siguen siendo gratis.", "fr": "L'ouverture et la lecture des PDF, le surlignage, les pense-bêtes, le dessin à main levée, les formes, l'enregistrement et l'impression restent gratuits.", "ru": "Открытие и чтение PDF, выделение цветом, записки, рисование от руки, фигуры, сохранение и печать остаются бесплатными.", "ar": "تبقى الميزات التالية مجانية: فتح ملفات PDF وقراءتها، والتمييز، والملاحظات الملصقة، والرسم الحر، والأشكال، والحفظ، والطباعة."},
 "プレミアム機能": {"en": "Premium feature", "zh_CN": "高级功能", "ko": "프리미엄 기능", "es": "Característica premium", "fr": "Fonctionnalité premium", "ru": "Премиум-функция", "ar": "ميزة متميزة"},
-"「{feature}」はプレミアム機能です": {"en": "“{feature}” is a premium feature", "zh_CN": "“{feature}”是高级功能", "ko": "[{feature}]은(는) 프리미엄 기능입니다", "es": "«{feature}» es una característica premium", "fr": "« {feature} » est une fonctionnalité premium", "ru": "«{feature}» — премиум-функция", "ar": "«{feature}» ميزة متميزة"},
-"無料試用期間が終了しました": {"en": "Your free trial has ended", "zh_CN": "免费试用已结束", "ko": "무료 평가판 기간이 종료되었습니다", "es": "La prueba gratuita ha finalizado", "fr": "L'essai gratuit est terminé", "ru": "Срок действия бесплатной пробной версии истек", "ar": "انتهت التجربة المجانية"},
-"無料試用版: 残り {count} 日": {"en": "Free trial: {count} days left", "zh_CN": "免费试用：剩余 {count} 天", "ko": "무료 평가판: {count}일 남음", "es": "Prueba gratuita: quedan {count} días", "fr": "Essai gratuit : {count} jours restants", "ru": "Бесплатная пробная версия, осталось дней: {count}", "ar": "التجربة المجانية: متبقٍ {count} يوم"},
 "Alt キーのショートカット": {"en": "Alt key shortcuts", "zh_CN": "Alt 键快捷方式", "ko": "Alt 키 바로 가기", "es": "Métodos abreviados con Alt", "fr": "Raccourcis clavier avec Alt", "ru": "Сочетания клавиш с ALT", "ar": "اختصارات المفتاح Alt"},
-"テキスト ボックスの追加": {"en": "Adding text boxes", "zh_CN": "添加文本框", "ko": "텍스트 상자 추가", "es": "Añadir cuadros de texto", "fr": "Ajout de zones de texte", "ru": "Добавление текстовых полей", "ar": "إضافة مربعات نص"},
 "キー ヒントを表示": {"en": "Show KeyTips", "zh_CN": "显示按键提示", "ko": "키 설명 표시", "es": "Mostrar sugerencias de teclas", "fr": "Afficher les touches d'accès", "ru": "Показать подсказки клавиш", "ar": "إظهار تلميحات المفاتيح"},
 "Alt キー": {"en": "Alt", "zh_CN": "Alt", "ko": "Alt", "es": "Alt", "fr": "Alt", "ru": "ALT", "ar": "Alt"},
 "以前の pdfNote で大きくなっていたファイルです。保存すると {before} から {after} になります": {"en": "An earlier version of pdfNote made this file larger than necessary. Saving it reduces it from {before} to {after}.", "zh_CN": "旧版 pdfNote 使此文件变得过大。保存后将从 {before} 减小到 {after}。", "ko": "이전 버전의 pdfNote가 이 파일을 필요 이상으로 크게 만들었습니다. 저장하면 {before}에서 {after}(으)로 줄어듭니다.", "es": "Una versión anterior de pdfNote hizo este archivo más grande de lo necesario. Al guardarlo, pasará de {before} a {after}.", "fr": "Une version antérieure de pdfNote a rendu ce fichier plus volumineux que nécessaire. En l'enregistrant, vous le ferez passer de {before} à {after}.", "ru": "Предыдущая версия pdfNote сделала этот файл больше, чем нужно. После сохранения его размер уменьшится с {before} до {after}.", "ar": "جعل إصدار سابق من pdfNote هذا الملف أكبر من اللازم. عند الحفظ سيصغر حجمه من {before} إلى {after}."},
@@ -2485,7 +2770,6 @@ TRANSLATIONS = {
 "{app} のレビュー": {"en": "Review {app}", "zh_CN": "评价 {app}", "ko": "{app} 리뷰", "es": "Reseña de {app}", "fr": "Avis sur {app}", "ru": "Отзыв о {app}", "ar": "مراجعة {app}"},
 "pdfNoteは若き開発者がたった一人で作っています。Microsoft Store でレビューしていただけると励みになります。": {"en": "pdfNote is made by a young developer working entirely alone. A review in the Microsoft Store would be a real encouragement.", "zh_CN": "pdfNote 由一位年轻的开发者独自开发。如果你能在 Microsoft Store 中写下评价，将是对开发者莫大的鼓励。", "ko": "pdfNote는 젊은 개발자가 혼자서 만들고 있습니다. Microsoft Store에 리뷰를 남겨 주시면 개발에 큰 힘이 됩니다.", "es": "pdfNote es obra de un joven desarrollador que trabaja solo. Si escribes una reseña en Microsoft Store, le darás muchos ánimos.", "fr": "pdfNote est l'œuvre d'un jeune développeur qui travaille entièrement seul. Un avis dans le Microsoft Store serait pour lui un vrai encouragement.", "ru": "pdfNote в одиночку создает молодой разработчик. Отзыв в Microsoft Store очень его поддержит.", "ar": "يعمل على pdfNote مطوّر شاب بمفرده تماماً. وإن كتبت مراجعة في Microsoft Store، فسيكون ذلك حافزاً كبيراً للاستمرار في تطويره."},
 "レビューを書く": {"en": "Write a Review", "zh_CN": "撰写评价", "ko": "리뷰 쓰기", "es": "Escribir una reseña", "fr": "Donner un avis", "ru": "Написать отзыв", "ar": "كتابة مراجعة"},
-"{days}日間のプレミアム機能無料体験期間が終了してしまいました。マウスを使えば引き続き無料でpdfNoteをご利用いただけます。右クリックメニューやショートカットなどのプレミアム機能をお求めの場合は、有償版を購入してください。このアプリの開発者が大層喜んで小躍りし、シェイプアップを達成することでしょう。": {"en": "Your {days}-day free trial of the premium features has ended. You can keep using pdfNote for free with the mouse. If you'd like premium features such as the shortcut menu and keyboard shortcuts, please buy the paid version. The developer would be so delighted he'd dance a little jig, and finally get in shape.", "zh_CN": "{days} 天的高级功能免费试用已结束。使用鼠标，你仍可以继续免费使用 pdfNote。如果需要快捷菜单、快捷键等高级功能，请购买付费版。开发者一定会乐得手舞足蹈，顺便把身材也练好。", "ko": "{days}일간의 프리미엄 기능 무료 체험 기간이 끝났습니다. 마우스로는 계속 무료로 pdfNote를 사용할 수 있습니다. 바로 가기 메뉴나 바로 가기 키 같은 프리미엄 기능이 필요하시면 유료 버전을 구매해 주세요. 개발자가 너무 기뻐서 덩실덩실 춤을 추다가 몸매 관리까지 성공할 것입니다.", "es": "Ha terminado tu prueba gratuita de {days} días de las características premium. Puedes seguir usando pdfNote gratis con el ratón. Si quieres características premium como el menú contextual y los métodos abreviados de teclado, compra la versión de pago. El desarrollador de pdfNote se pondrá tan contento que bailará de alegría y acabará poniéndose en forma.", "fr": "Votre essai gratuit de {days} jours des fonctionnalités premium est terminé. Vous pouvez continuer à utiliser pdfNote gratuitement avec la souris. Si vous souhaitez profiter des fonctionnalités premium, comme le menu contextuel et les raccourcis clavier, achetez la version payante. Le développeur de pdfNote en sera si ravi qu'il dansera de joie et finira par retrouver la ligne.", "ru": "{days}-дневный бесплатный пробный период премиум-функций закончился. С помощью мыши вы можете и дальше пользоваться pdfNote бесплатно. Если вам нужны премиум-функции, например контекстное меню и сочетания клавиш, купите платную версию. От радости разработчик пустится в пляс и наконец-то приведет себя в форму.", "ar": "انتهت الفترة التجريبية المجانية للميزات المتميزة ومدتها {days} يوماً. يمكنك مواصلة استخدام pdfNote مجاناً باستخدام الماوس. وإذا أردت الميزات المتميزة مثل القائمة المختصرة واختصارات لوحة المفاتيح، فاشترِ الإصدار المدفوع. سيفرح مطوّر pdfNote فرحاً عظيماً حتى يرقص طرباً، فيستعيد رشاقته."},
 "今はしない": {"en": "Not Now", "zh_CN": "暂不", "ko": "나중에", "es": "Ahora no", "fr": "Pas maintenant", "ru": "Не сейчас", "ar": "ليس الآن"},
 "今後このメッセージを表示しない": {"en": "Don't show this again", "zh_CN": "不再显示此消息", "ko": "이 메시지를 다시 표시하지 않음", "es": "No volver a mostrar", "fr": "Ne plus afficher ce message", "ru": "Больше не показывать", "ar": "عدم إظهار هذه الرسالة مرة أخرى"},
 "Windows の設定を開けませんでした": {"en": "Couldn't open Windows Settings", "zh_CN": "无法打开 Windows 设置", "ko": "Windows 설정을 열 수 없습니다", "es": "No se pudo abrir Configuración de Windows", "fr": "Impossible d'ouvrir les Paramètres de Windows", "ru": "Не удалось открыть параметры Windows", "ar": "تعذر فتح إعدادات Windows"},
@@ -2525,13 +2809,11 @@ TRANSLATIONS = {
 "種類": {"en": "Type", "zh_CN": "类型", "ko": "종류", "es": "Tipo", "fr": "Type", "ru": "Тип", "ar": "النوع"},
 "色": {"en": "Color", "zh_CN": "颜色", "ko": "색", "es": "Color", "fr": "Couleur", "ru": "Цвет", "ar": "اللون"},
 "その他の色": {"en": "Other colors", "zh_CN": "其他颜色", "ko": "기타 색", "es": "Otros colores", "fr": "Autres couleurs", "ru": "Другие цвета", "ar": "ألوان أخرى"},
-"すべて表示": {"en": "Show All", "zh_CN": "全部显示", "ko": "모두 표시", "es": "Mostrar todo", "fr": "Tout afficher", "ru": "Показать все", "ar": "إظهار الكل"},
 "項目を選択してください": {"en": "Select an item first", "zh_CN": "请先选择项目", "ko": "먼저 항목을 선택하세요", "es": "Selecciona primero un elemento", "fr": "Sélectionnez d'abord un élément", "ru": "Сначала выберите элемент", "ar": "حدد عنصراً أولاً"},
 "項目を削除できませんでした": {"en": "Couldn't delete the selected items", "zh_CN": "无法删除所选项目", "ko": "선택한 항목을 삭제할 수 없습니다", "es": "No se pudieron eliminar los elementos seleccionados", "fr": "Impossible de supprimer les éléments sélectionnés", "ru": "Не удалось удалить выбранное", "ar": "تعذر حذف العناصر المحددة"},
 "{done}/{total}個の項目を削除しました（一部失敗）": {"en": "Deleted {done} of {total} items (some couldn't be deleted)", "zh_CN": "已删除 {done}/{total} 个项目（部分失败）", "ko": "{total}개 중 {done}개 항목을 삭제했습니다(일부 실패)", "es": "Elementos eliminados: {done} de {total} (algunos no se pudieron eliminar)", "fr": "Éléments supprimés : {done} sur {total} (certains n'ont pas pu l'être)", "ru": "Удалено элементов: {done} из {total} (некоторые удалить не удалось)", "ar": "تم حذف {done} من أصل {total} (تعذر حذف بعض العناصر)"},
 "項目を変更できませんでした": {"en": "Couldn't change the selected items", "zh_CN": "无法更改所选项目", "ko": "선택한 항목을 변경할 수 없습니다", "es": "No se pudieron cambiar los elementos seleccionados", "fr": "Impossible de modifier les éléments sélectionnés", "ru": "Не удалось изменить выбранное", "ar": "تعذر تغيير العناصر المحددة"},
 "{done}/{total}個の項目を変更しました（一部失敗）": {"en": "Changed {done} of {total} items (some couldn't be changed)", "zh_CN": "已更改 {done}/{total} 个项目（部分失败）", "ko": "{total}개 중 {done}개 항목을 변경했습니다(일부 실패)", "es": "Elementos cambiados: {done} de {total} (algunos no se pudieron cambiar)", "fr": "Éléments modifiés : {done} sur {total} (certains n'ont pas pu l'être)", "ru": "Изменено элементов: {done} из {total} (некоторые изменить не удалось)", "ar": "تم تغيير {done} من أصل {total} (تعذر تغيير بعض العناصر)"},
-"画像とテキスト ボックスは回転できません": {"en": "Images and text boxes can't be rotated", "zh_CN": "图片和文本框无法旋转", "ko": "이미지와 텍스트 상자는 회전할 수 없습니다", "es": "Las imágenes y los cuadros de texto no se pueden girar", "fr": "Les images et les zones de texte ne peuvent pas pivoter", "ru": "Изображения и текстовые поля нельзя поворачивать", "ar": "لا يمكن تدوير الصور ومربعات النص"},
 "このページを目次に追加": {"en": "Add This Page to the Table of Contents", "zh_CN": "将此页添加到目录", "ko": "이 페이지를 목차에 추가", "es": "Añadir esta página a la tabla de contenido", "fr": "Ajouter cette page au sommaire", "ru": "Добавить эту страницу в оглавление", "ar": "إضافة هذه الصفحة إلى جدول المحتويات"},
 "表示しているページを目次に追加": {"en": "Add the page you're viewing to the table of contents", "zh_CN": "将当前显示的页面添加到目录", "ko": "보고 있는 페이지를 목차에 추가", "es": "Añadir la página que estás viendo a la tabla de contenido", "fr": "Ajouter la page affichée au sommaire", "ru": "Добавить текущую страницу в оглавление", "ar": "إضافة الصفحة المعروضة إلى جدول المحتويات"},
 "目次を変更できませんでした。\n\n{error}": {"en": "Couldn't change the table of contents.\n\n{error}", "zh_CN": "无法更改目录。\n\n{error}", "ko": "목차를 변경할 수 없습니다.\n\n{error}", "es": "No se pudo cambiar la tabla de contenido.\n\n{error}", "fr": "Impossible de modifier le sommaire.\n\n{error}", "ru": "Не удалось изменить оглавление.\n\n{error}", "ar": "تعذر تغيير جدول المحتويات.\n\n{error}"},
@@ -2563,7 +2845,10 @@ TRANSLATIONS = {
 # a word's second job (CONTEXT_MARK).
 "　・{item}": {"en": "• {item}", "zh_CN": "• {item}", "ko": "• {item}", "es": "• {item}", "fr": "• {item}", "ru": "• {item}", "ar": "• {item}"},
 "{label}: {value}": {"en": "{label}: {value}", "zh_CN": "{label}：{value}", "ko": "{label}: {value}", "es": "{label}: {value}", "fr": "{label} : {value}", "ru": "{label}: {value}", "ar": "{label}: {value}"},
-"p.{page}": {"en": "p. {page}", "zh_CN": "第 {page} 页", "ko": "{page}페이지", "es": "pág. {page}", "fr": "p. {page}", "ru": "стр. {page}", "ar": "صفحة {page}"},
+"p.{page}  {label}": {"en": "p. {page}  {label}", "zh_CN": "第 {page} 页  {label}", "ko": "{page}페이지  {label}", "es": "pág. {page}  {label}", "fr": "p. {page}  {label}", "ru": "стр. {page}  {label}", "ar": "صفحة {page}  {label}"},
+"p.{page}   {context}": {"en": "p. {page}   {context}", "zh_CN": "第 {page} 页   {context}", "ko": "{page}페이지   {context}", "es": "pág. {page}   {context}", "fr": "p. {page}   {context}", "ru": "стр. {page}   {context}", "ar": "صفحة {page}   {context}"},
+"{first}  {second}": {"en": "{first}  {second}", "zh_CN": "{first}  {second}", "ko": "{first}  {second}", "es": "{first}  {second}", "fr": "{first}  {second}", "ru": "{first}  {second}", "ar": "{first}  {second}"},
+"{first} / {second}": {"en": "{first} / {second}", "zh_CN": "{first} / {second}", "ko": "{first} / {second}", "es": "{first} / {second}", "fr": "{first} / {second}", "ru": "{first} / {second}", "ar": "{first} / {second}"},
 " pt": {"en": " pt", "zh_CN": " 磅", "ko": "pt", "es": " pto", "fr": " pt", "ru": " пт", "ar": " نقطة"},
 "%": {"en": "%", "zh_CN": "%", "ko": "%", "es": " %", "fr": " %", "ru": "%", "ar": "%"},
 "{name}  •  {page}  •  {zoom}%": {"en": "{name}  •  {page}  •  {zoom}%", "zh_CN": "{name}  •  {page}  •  {zoom}%", "ko": "{name}  •  {page}  •  {zoom}%", "es": "{name}  •  {page}  •  {zoom} %", "fr": "{name}  •  {page}  •  {zoom} %", "ru": "{name}  •  {page}  •  {zoom}%", "ar": "{name}  •  {page}  •  {zoom}%"},
@@ -2573,8 +2858,6 @@ TRANSLATIONS = {
 "{name}  （ダウンロードが必要）": {"en": "{name} (download required)", "zh_CN": "{name}（需要下载）", "ko": "{name}(다운로드 필요)", "es": "{name} (requiere descarga)", "fr": "{name} (téléchargement requis)", "ru": "{name} (нужно скачать)", "ar": "{name} (يلزم التنزيل)"},
 "{badge} — プレミアム機能": {"en": "Premium feature", "zh_CN": "高级功能", "ko": "프리미엄 기능", "es": "Característica premium", "fr": "Fonctionnalité premium", "ru": "Премиум-функция", "ar": "ميزة متميزة"},
 "購入の前にお読みください: {terms}　{tokushoho}　{privacy}": {"en": "Please read before you buy: {terms} · {tokushoho} · {privacy}", "zh_CN": "购买前请阅读：{terms}、{tokushoho}和{privacy}", "ko": "구매 전에 읽어 주세요: {terms} · {tokushoho} · {privacy}", "es": "Lee esto antes de comprar: {terms} · {tokushoho} · {privacy}", "fr": "À lire avant d'acheter : {terms} · {tokushoho} · {privacy}", "ru": "Прочитайте перед покупкой: {terms} · {tokushoho} · {privacy}", "ar": "يرجى القراءة قبل الشراء: {terms} · {tokushoho} · {privacy}"},
-"{name} (印刷)": {"en": "{name} (printed)", "zh_CN": "{name} (打印版)", "ko": "{name} (인쇄본)", "es": "{name} (impreso)", "fr": "{name} (imprimé)", "ru": "{name} (печать)", "ar": "{name} (مطبوع)"},
-"{name} (サニタイズ済み)": {"en": "{name} (sanitized)", "zh_CN": "{name} (净化版)", "ko": "{name} (정리본)", "es": "{name} (saneado)", "fr": "{name} (assaini)", "ru": "{name} (очищенный)", "ar": "{name} (منقّى)"},
 "{size} KB": {"en": "{size} KB", "zh_CN": "{size} KB", "ko": "{size}KB", "es": "{size} KB", "fr": "{size} Ko", "ru": "{size} КБ", "ar": "{size} كيلوبايت"},
 "{size} MB": {"en": "{size} MB", "zh_CN": "{size} MB", "ko": "{size}MB", "es": "{size} MB", "fr": "{size} Mo", "ru": "{size} МБ", "ar": "{size} ميغابايت"},
 "ページ〔タブ〕": {"en": "Pages", "zh_CN": "页面", "ko": "페이지", "es": "Páginas", "fr": "Pages", "ru": "Страницы", "ar": "الصفحات"},
@@ -2592,6 +2875,106 @@ TRANSLATIONS = {
 # use in each language: "Alt + H、H" in Japanese, "Alt+M، M، D" in Arabic,
 # "Alt+H, A, C" in English (key_text).
 "{first}、{then}": {"en": "{first}, {then}", "zh_CN": "{first}, {then}", "ko": "{first}, {then}", "es": "{first}, {then}", "fr": "{first}, {then}", "ru": "{first}, {then}", "ar": "{first}، {then}"},
+# 7.10: the texts of 7.0-7.9, written in each language.
+"発表": {"en": "Presentation", "zh_CN": "演示", "ko": "프레젠테이션", "es": "Presentación", "fr": "Présentation", "ru": "Презентация", "ar": "العرض التقديمي"},
+"現在のページから発表": {"en": "Present from Current Page", "zh_CN": "从当前页开始演示", "ko": "현재 페이지부터 발표", "es": "Presentar desde la página actual", "fr": "Présenter à partir de la page actuelle", "ru": "Показать с текущей страницы", "ar": "العرض من الصفحة الحالية"},
+"発表を終了": {"en": "End Presentation", "zh_CN": "结束演示", "ko": "프레젠테이션 끝내기", "es": "Finalizar presentación", "fr": "Arrêter la présentation", "ru": "Завершить презентацию", "ar": "إنهاء العرض"},
+"ページへ移動": {"en": "Go to Page", "zh_CN": "转到页面", "ko": "페이지 이동", "es": "Ir a la página", "fr": "Aller à la page", "ru": "Перейти к странице", "ar": "الانتقال إلى الصفحة"},
+"ページ {number}": {"en": "Page {number}", "zh_CN": "第 {number} 页", "ko": "{number}페이지", "es": "Página {number}", "fr": "Page {number}", "ru": "Страница {number}", "ar": "الصفحة {number}"},
+"レーザー ポインター": {"en": "Laser Pointer", "zh_CN": "激光笔", "ko": "레이저 포인터", "es": "Puntero láser", "fr": "Pointeur laser", "ru": "Лазерная указка", "ar": "مؤشر ليزر"},
+"ペン": {"en": "Pen", "zh_CN": "笔", "ko": "펜", "es": "Lápiz", "fr": "Stylet", "ru": "Перо", "ar": "قلم"},
+"蛍光ペン": {"en": "Highlighter", "zh_CN": "荧光笔", "ko": "형광펜", "es": "Marcador de resaltado", "fr": "Surligneur", "ru": "Маркер", "ar": "قلم تمييز"},
+"消しゴム": {"en": "Eraser", "zh_CN": "橡皮擦", "ko": "지우개", "es": "Borrador", "fr": "Gomme", "ru": "Ластик", "ar": "ممحاة"},
+"すべてのインクを消去": {"en": "Erase All Ink on Page", "zh_CN": "擦除页面上的所有墨迹", "ko": "페이지에서 모든 잉크 지우기", "es": "Borrar toda la entrada de lápiz de la página", "fr": "Effacer toutes les entrées manuscrites de la page", "ru": "Стереть все рукописные фрагменты на странице", "ar": "مسح كل الحبر على الصفحة"},
+"ポインターを表示しない": {"en": "Hide Pointer", "zh_CN": "隐藏指针", "ko": "포인터 숨기기", "es": "Ocultar puntero", "fr": "Masquer le pointeur", "ru": "Скрыть указатель", "ar": "إخفاء المؤشر"},
+"インクを表示しない": {"en": "Hide Ink", "zh_CN": "隐藏墨迹", "ko": "잉크 숨기기", "es": "Ocultar entrada de lápiz", "fr": "Masquer les entrées manuscrites", "ru": "Скрыть рукописные фрагменты", "ar": "إخفاء الحبر"},
+"画面": {"en": "Screen", "zh_CN": "屏幕", "ko": "화면", "es": "Pantalla", "fr": "Écran", "ru": "Экран", "ar": "الشاشة"},
+"黒い画面": {"en": "Black Screen", "zh_CN": "黑屏", "ko": "검정 화면", "es": "Pantalla en negro", "fr": "Écran noir", "ru": "Черный экран", "ar": "شاشة سوداء"},
+"白い画面": {"en": "White Screen", "zh_CN": "白屏", "ko": "흰색 화면", "es": "Pantalla en blanco", "fr": "Écran blanc", "ru": "Белый экран", "ar": "شاشة بيضاء"},
+"インクを保持しますか?": {"en": "Do you want to keep your ink annotations?", "zh_CN": "是否保留墨迹注释？", "ko": "잉크 주석을 유지하시겠습니까?", "es": "¿Quieres mantener las anotaciones manuscritas?", "fr": "Voulez-vous conserver vos annotations manuscrites ?", "ru": "Сохранить рукописные заметки?", "ar": "هل تريد الاحتفاظ بالتعليقات التوضيحية بالحبر؟"},
+"保持": {"en": "Keep", "zh_CN": "保留", "ko": "유지", "es": "Mantener", "fr": "Conserver", "ru": "Сохранить", "ar": "الاحتفاظ"},
+"破棄": {"en": "Discard", "zh_CN": "放弃", "ko": "삭제", "es": "Descartar", "fr": "Ignorer", "ru": "Отменить", "ar": "تجاهل"},
+"サイド バー": {"en": "Sidebar", "zh_CN": "侧边栏", "ko": "사이드바", "es": "Barra lateral", "fr": "Barre latérale", "ru": "Боковая панель", "ar": "الشريط الجانبي"},
+"サイド バーを閉じる ({key}で再表示)": {"en": "Close the sidebar (press {key} to reopen it)", "zh_CN": "关闭侧边栏（按 {key} 重新打开）", "ko": "사이드바 닫기({key}를 누르면 다시 열림)", "es": "Cerrar la barra lateral ({key} para volver a abrirla)", "fr": "Fermer la barre latérale ({key} pour la rouvrir)", "ru": "Закрыть боковую панель ({key}, чтобы показать снова)", "ar": "إغلاق الشريط الجانبي (اضغط {key} لإعادة فتحه)"},
+"サイド バーとページを切り替え": {"en": "Switch Between Sidebar and Page", "zh_CN": "在侧边栏和页面之间切换", "ko": "사이드바와 페이지 간 전환", "es": "Cambiar entre barra lateral y página", "fr": "Basculer entre la barre latérale et la page", "ru": "Переключиться между боковой панелью и страницей", "ar": "التبديل بين الشريط الجانبي والصفحة"},
+"サイド バーのタブを切り替え": {"en": "Switch Sidebar Tab", "zh_CN": "切换侧边栏标签页", "ko": "사이드바 탭 전환", "es": "Cambiar pestaña de la barra lateral", "fr": "Changer d'onglet de la barre latérale", "ru": "Переключить вкладку боковой панели", "ar": "تبديل علامة تبويب الشريط الجانبي"},
+"{author}　{time}": {"en": "{author}  {time}", "zh_CN": "{author}  {time}", "ko": "{author}  {time}", "es": "{author}  {time}", "fr": "{author}  {time}", "ru": "{author}  {time}", "ar": "{author}  {time}"},
+"配置〔オブジェクト〕": {"en": "Align", "zh_CN": "对齐", "ko": "맞춤", "es": "Alinear", "fr": "Aligner", "ru": "Выровнять", "ar": "محاذاة"},
+"左揃え〔オブジェクト〕": {"en": "Align Left", "zh_CN": "左对齐", "ko": "왼쪽 맞춤", "es": "Alinear a la izquierda", "fr": "Aligner à gauche", "ru": "Выровнять по левому краю", "ar": "محاذاة لليسار"},
+"左右中央揃え": {"en": "Align Center", "zh_CN": "水平居中", "ko": "가운데 맞춤", "es": "Alinear al centro", "fr": "Centrer", "ru": "Выровнять по центру", "ar": "محاذاة المركز"},
+"右揃え〔オブジェクト〕": {"en": "Align Right", "zh_CN": "右对齐", "ko": "오른쪽 맞춤", "es": "Alinear a la derecha", "fr": "Aligner à droite", "ru": "Выровнять по правому краю", "ar": "محاذاة لليمين"},
+"上揃え": {"en": "Align Top", "zh_CN": "顶端对齐", "ko": "위쪽 맞춤", "es": "Alinear en la parte superior", "fr": "Aligner en haut", "ru": "Выровнять по верхнему краю", "ar": "محاذاة إلى الأعلى"},
+"上下中央揃え": {"en": "Align Middle", "zh_CN": "垂直居中", "ko": "중간 맞춤", "es": "Alinear al medio", "fr": "Aligner au milieu", "ru": "Выровнять по середине", "ar": "محاذاة للوسط"},
+"下揃え": {"en": "Align Bottom", "zh_CN": "底端对齐", "ko": "아래쪽 맞춤", "es": "Alinear en la parte inferior", "fr": "Aligner en bas", "ru": "Выровнять по нижнему краю", "ar": "محاذاة لأسفل"},
+"幅を入力": {"en": "Enter Width", "zh_CN": "输入宽度", "ko": "너비 입력", "es": "Escribir el ancho", "fr": "Saisir la largeur", "ru": "Ввести ширину", "ar": "إدخال العرض"},
+"高さを入力": {"en": "Enter Height", "zh_CN": "输入高度", "ko": "높이 입력", "es": "Escribir el alto", "fr": "Saisir la hauteur", "ru": "Ввести высоту", "ar": "إدخال الارتفاع"},
+"回転角度を入力": {"en": "Enter Rotation Angle", "zh_CN": "输入旋转角度", "ko": "회전 각도 입력", "es": "Escribir el ángulo de giro", "fr": "Saisir l'angle de rotation", "ru": "Ввести угол поворота", "ar": "إدخال زاوية التدوير"},
+"目次のレベル上げ": {"en": "Promote in Table of Contents", "zh_CN": "在目录中提升级别", "ko": "목차에서 수준 올리기", "es": "Aumentar nivel en la tabla de contenido", "fr": "Hausser d'un niveau dans le sommaire", "ru": "Повысить уровень в оглавлении", "ar": "ترقية في جدول المحتويات"},
+"目次のレベル下げ": {"en": "Demote in Table of Contents", "zh_CN": "在目录中降低级别", "ko": "목차에서 수준 내리기", "es": "Disminuir nivel en la tabla de contenido", "fr": "Abaisser d'un niveau dans le sommaire", "ru": "Понизить уровень в оглавлении", "ar": "تخفيض في جدول المحتويات"},
+"すべてクリア": {"en": "Clear All", "zh_CN": "全部清除", "ko": "모두 지우기", "es": "Desactivar todo", "fr": "Tout désélectionner", "ru": "Снять все", "ar": "مسح الكل"},
+"テキスト ボックスを追加": {"en": "New Text Box", "zh_CN": "新建文本框", "ko": "새 텍스트 상자", "es": "Nuevo cuadro de texto", "fr": "Nouvelle zone de texte", "ru": "Новое текстовое поле", "ar": "مربع نص جديد"},
+"分割したファイルを保存（名前の後ろにページ番号が付きます）": {"en": "Save Split Files (page numbers are added after the name)", "zh_CN": "保存拆分的文件（文件名后会加上页码）", "ko": "분할한 파일 저장(이름 뒤에 페이지 번호가 붙음)", "es": "Guardar los archivos divididos (se añade el número de página al nombre)", "fr": "Enregistrer les fichiers fractionnés (le numéro de page est ajouté au nom)", "ru": "Сохранение разделенных файлов (к имени добавляется номер страницы)", "ar": "حفظ الملفات المقسمة (يُضاف رقم الصفحة بعد الاسم)"},
+"印刷しています… {done} / {total} ページ": {"en": "Printing… page {done} of {total}", "zh_CN": "正在打印… 第 {done} 页，共 {total} 页", "ko": "인쇄 중… {total}페이지 중 {done}페이지", "es": "Imprimiendo… página {done} de {total}", "fr": "Impression… page {done} sur {total}", "ru": "Печать… страница {done} из {total}", "ar": "جارٍ الطباعة… الصفحة {done} من {total}"},
+"印刷を中止しました。すでにプリンターへ送ったページは、印刷されることがあります。プリンターの印刷待ちの一覧をご確認ください。": {"en": "Printing was canceled. Pages already sent to the printer may still print. Check the printer's queue.", "zh_CN": "已取消打印。已发送到打印机的页面可能仍会打印。请检查打印机的打印队列。", "ko": "인쇄를 취소했습니다. 이미 프린터로 보낸 페이지는 인쇄될 수 있습니다. 프린터의 인쇄 대기열을 확인하세요.", "es": "Se canceló la impresión. Es posible que las páginas ya enviadas a la impresora se impriman igualmente. Revisa la cola de impresión de la impresora.", "fr": "L'impression a été annulée. Les pages déjà envoyées à l'imprimante peuvent quand même être imprimées. Vérifiez la file d'attente d'impression de l'imprimante.", "ru": "Печать отменена. Страницы, уже отправленные на принтер, могут быть напечатаны. Проверьте очередь печати принтера.", "ar": "تم إلغاء الطباعة. قد تتم طباعة الصفحات التي أُرسلت بالفعل إلى الطابعة. تحقق من قائمة انتظار الطباعة في الطابعة."},
+"このファイルは読み取り専用のため、上書きできません。［名前を付けて保存］で別の名前を付けて保存してください。": {"en": "This file is read-only, so it can't be overwritten. Use Save As to save it with a different name.", "zh_CN": "此文件为只读文件，无法覆盖。请使用“另存为”以其他名称保存。", "ko": "이 파일은 읽기 전용이므로 덮어쓸 수 없습니다. [다른 이름으로 저장]을 사용하여 다른 이름으로 저장하세요.", "es": "Este archivo es de solo lectura y no se puede sobrescribir. Usa «Guardar como» para guardarlo con otro nombre.", "fr": "Ce fichier est en lecture seule et ne peut pas être remplacé. Utilisez « Enregistrer sous » pour l'enregistrer sous un autre nom.", "ru": "Этот файл доступен только для чтения, поэтому его нельзя перезаписать. Сохраните его под другим именем с помощью команды «Сохранить как».", "ar": "هذا الملف للقراءة فقط، لذا لا يمكن الكتابة فوقه. استخدم «حفظ باسم» لحفظه باسم آخر."},
+"解決": {"en": "Resolve", "zh_CN": "解决", "ko": "해결", "es": "Resolver", "fr": "Résoudre", "ru": "Разрешить", "ar": "حل"},
+"再開": {"en": "Reopen", "zh_CN": "重新打开", "ko": "다시 열기", "es": "Volver a abrir", "fr": "Rouvrir", "ru": "Открыть повторно", "ar": "إعادة فتح"},
+"スレッドを解決済みにして、ページから隠します": {"en": "Resolve the thread and hide it from the page", "zh_CN": "将线程标记为已解决并从页面上隐藏", "ko": "스레드를 해결됨으로 표시하고 페이지에서 숨깁니다", "es": "Marca la conversación como resuelta y la oculta de la página", "fr": "Marque le thread comme résolu et le masque sur la page", "ru": "Пометить цепочку как разрешенную и скрыть ее на странице", "ar": "يحل المحادثة ويخفيها من الصفحة"},
+"スレッドを再開して、ページに戻します": {"en": "Reopen the thread and show it on the page again", "zh_CN": "重新打开线程并在页面上重新显示", "ko": "스레드를 다시 열고 페이지에 다시 표시합니다", "es": "Vuelve a abrir la conversación y la muestra de nuevo en la página", "fr": "Rouvre le thread et l'affiche de nouveau sur la page", "ru": "Открыть цепочку повторно и снова показать ее на странице", "ar": "يعيد فتح المحادثة ويعرضها في الصفحة مرة أخرى"},
+"解決済み": {"en": "Resolved", "zh_CN": "已解决", "ko": "해결됨", "es": "Resuelto", "fr": "Résolu", "ru": "Разрешено", "ar": "تم الحل"},
+"（解決済み）": {"en": "(Resolved)", "zh_CN": "（已解决）", "ko": "(해결됨)", "es": "(Resuelto)", "fr": "(Résolu)", "ru": "(Разрешено)", "ar": "(تم الحل)"},
+"「{quote}」": {"en": "“{quote}”", "zh_CN": "“{quote}”", "ko": "“{quote}”", "es": "«{quote}»", "fr": "« {quote} »", "ru": "«{quote}»", "ar": "«{quote}»"},
+"返信を入力": {"en": "Add a reply", "zh_CN": "添加回复", "ko": "회신 추가", "es": "Añadir una respuesta", "fr": "Ajouter une réponse", "ru": "Введите ответ", "ar": "إضافة رد"},
+"その他の操作": {"en": "More actions", "zh_CN": "更多操作", "ko": "추가 작업", "es": "Más acciones", "fr": "Autres actions", "ru": "Другие действия", "ar": "مزيد من الإجراءات"},
+"保存": {"en": "Save", "zh_CN": "保存", "ko": "저장", "es": "Guardar", "fr": "Enregistrer", "ru": "Сохранить", "ar": "حفظ"},
+"返信を削除": {"en": "Delete Reply", "zh_CN": "删除回复", "ko": "회신 삭제", "es": "Eliminar respuesta", "fr": "Supprimer la réponse", "ru": "Удаление ответа", "ar": "حذف الرد"},
+"この返信を削除しますか？": {"en": "Delete this reply?", "zh_CN": "删除此回复？", "ko": "이 회신을 삭제하시겠습니까?", "es": "¿Quieres eliminar esta respuesta?", "fr": "Supprimer cette réponse ?", "ru": "Удалить этот ответ?", "ar": "هل تريد حذف هذا الرد؟"},
+"スレッドを解決しました": {"en": "Thread resolved", "zh_CN": "已解决线程", "ko": "스레드를 해결했습니다", "es": "Conversación resuelta", "fr": "Thread résolu", "ru": "Цепочка разрешена", "ar": "تم حل المحادثة"},
+"スレッドを再開しました": {"en": "Thread reopened", "zh_CN": "已重新打开线程", "ko": "스레드를 다시 열었습니다", "es": "Conversación abierta de nuevo", "fr": "Thread rouvert", "ru": "Цепочка открыта повторно", "ar": "تمت إعادة فتح المحادثة"},
+"（返信 {count}）": {"en": "({count} replies)", "zh_CN": "（{count} 条回复）", "ko": "(회신 {count}개)", "es": "({count} respuestas)", "fr": "({count} réponses)", "ru": "({count} ответов)", "ar": "({count} رد)"},
+"このPDFには電子署名があります（{names}）。": {"en": "This PDF is digitally signed ({names}).", "zh_CN": "此 PDF 有数字签名（{names}）。", "ko": "이 PDF에는 디지털 서명이 있습니다({names}).", "es": "Este PDF tiene una firma digital ({names}).", "fr": "Ce PDF comporte une signature numérique ({names}).", "ru": "Этот PDF-файл содержит цифровую подпись ({names}).", "ar": "يحتوي ملف PDF هذا على توقيع رقمي ({names})."},
+"このPDFには電子署名があります。": {"en": "This PDF is digitally signed.", "zh_CN": "此 PDF 有数字签名。", "ko": "이 PDF에는 디지털 서명이 있습니다.", "es": "Este PDF tiene una firma digital.", "fr": "Ce PDF comporte une signature numérique.", "ru": "Этот PDF-файл содержит цифровую подпись.", "ar": "يحتوي ملف PDF هذا على توقيع رقمي."},
+"変更を許可しない設定で証明されています。": {"en": "It's certified with no changes allowed.", "zh_CN": "它已被认证，且不允许更改。", "ko": "변경을 허용하지 않도록 인증되었습니다.", "es": "Está certificado sin permitir cambios.", "fr": "Il est certifié sans autoriser de modifications.", "ru": "Он сертифицирован без разрешения изменений.", "ar": "إنه معتمد مع عدم السماح بأي تغييرات."},
+"署名のあとに変更があります。": {"en": "It has been changed since it was signed.", "zh_CN": "签名后已有更改。", "ko": "서명한 후에 변경되었습니다.", "es": "Se ha modificado después de firmarse.", "fr": "Il a été modifié après la signature.", "ru": "После подписания в него были внесены изменения.", "ar": "تم تغييره بعد التوقيع."},
+"署名を外したコピーを作成": {"en": "Create Unsigned Copy", "zh_CN": "创建未签名副本", "ko": "서명되지 않은 사본 만들기", "es": "Crear copia sin firmar", "fr": "Créer une copie non signée", "ru": "Создать неподписанную копию", "ar": "إنشاء نسخة غير موقعة"},
+"このPDFの電子署名を残したまま保存できません。\n\n署名を外したコピーを作って、名前を付けて保存しますか？元のPDFは変わりません。": {"en": "This PDF can't be saved while keeping its digital signature.\n\nDo you want to make an unsigned copy and save it with Save As? The original PDF won't change.", "zh_CN": "无法在保留数字签名的情况下保存此 PDF。\n\n是否创建未签名副本并使用“另存为”保存？原始 PDF 不会更改。", "ko": "디지털 서명을 유지한 채로 이 PDF를 저장할 수 없습니다.\n\n서명되지 않은 사본을 만들어 [다른 이름으로 저장]으로 저장하시겠습니까? 원본 PDF는 변경되지 않습니다.", "es": "No se puede guardar este PDF conservando su firma digital.\n\n¿Quieres crear una copia sin firmar y guardarla con «Guardar como»? El PDF original no cambiará.", "fr": "Impossible d'enregistrer ce PDF en conservant sa signature numérique.\n\nVoulez-vous créer une copie non signée et l'enregistrer avec « Enregistrer sous » ? Le PDF d'origine ne sera pas modifié.", "ru": "Не удается сохранить этот PDF-файл с цифровой подписью.\n\nСоздать неподписанную копию и сохранить ее с помощью команды «Сохранить как»? Исходный PDF-файл не изменится.", "ar": "لا يمكن حفظ ملف PDF هذا مع الإبقاء على توقيعه الرقمي.\n\nهل تريد إنشاء نسخة غير موقعة وحفظها باستخدام «حفظ باسم»؟ لن يتغير ملف PDF الأصلي."},
+"このPDFには電子署名があります。この操作をすると、署名した人が認めた範囲を超えて文書が変わります。\n\n署名を外したコピーを作って、そちらで行いますか？元のPDFは変わりません。": {"en": "This PDF is digitally signed. This action would change the document beyond what the signer allowed.\n\nDo you want to make an unsigned copy and do it there? The original PDF won't change.", "zh_CN": "此 PDF 有数字签名。此操作会使文档的更改超出签名者允许的范围。\n\n是否创建未签名副本并在副本中执行？原始 PDF 不会更改。", "ko": "이 PDF에는 디지털 서명이 있습니다. 이 작업을 하면 서명자가 허용한 범위를 넘어 문서가 변경됩니다.\n\n서명되지 않은 사본을 만들어 사본에서 작업하시겠습니까? 원본 PDF는 변경되지 않습니다.", "es": "Este PDF tiene una firma digital. Esta acción cambiaría el documento más allá de lo que permitió el firmante.\n\n¿Quieres crear una copia sin firmar y hacerlo en ella? El PDF original no cambiará.", "fr": "Ce PDF comporte une signature numérique. Cette action modifierait le document au-delà de ce que le signataire a autorisé.\n\nVoulez-vous créer une copie non signée et l'effectuer dans celle-ci ? Le PDF d'origine ne sera pas modifié.", "ru": "Этот PDF-файл содержит цифровую подпись. Это действие изменит документ сверх того, что разрешил подписавший.\n\nСоздать неподписанную копию и выполнить действие в ней? Исходный PDF-файл не изменится.", "ar": "يحتوي ملف PDF هذا على توقيع رقمي. سيغيّر هذا الإجراء المستند بما يتجاوز ما سمح به صاحب التوقيع.\n\nهل تريد إنشاء نسخة غير موقعة وتنفيذه فيها؟ لن يتغير ملف PDF الأصلي."},
+"（理由：{reason}）": {"en": "(Reason: {reason})", "zh_CN": "（原因：{reason}）", "ko": "(이유: {reason})", "es": "(Motivo: {reason})", "fr": "(Raison : {reason})", "ru": "(Причина: {reason})", "ar": "(السبب: {reason})"},
+"電子署名": {"en": "Digital Signature", "zh_CN": "数字签名", "ko": "디지털 서명", "es": "Firma digital", "fr": "Signature numérique", "ru": "Цифровая подпись", "ar": "التوقيع الرقمي"},
+"署名を外したコピーで保存": {"en": "Save Unsigned Copy", "zh_CN": "保存未签名副本", "ko": "서명되지 않은 사본으로 저장", "es": "Guardar copia sin firmar", "fr": "Enregistrer une copie non signée", "ru": "Сохранить неподписанную копию", "ar": "حفظ نسخة غير موقعة"},
+"署名を外したコピーで行う": {"en": "Use Unsigned Copy", "zh_CN": "使用未签名副本", "ko": "서명되지 않은 사본 사용", "es": "Usar copia sin firmar", "fr": "Utiliser une copie non signée", "ru": "Выполнить в неподписанной копии", "ar": "استخدام نسخة غير موقعة"},
+"署名を外したコピーで、もう一度行ってください": {"en": "Do it again in the unsigned copy", "zh_CN": "请在未签名副本中重新执行", "ko": "서명되지 않은 사본에서 다시 작업하세요", "es": "Vuelve a hacerlo en la copia sin firmar", "fr": "Recommencez dans la copie non signée", "ru": "Повторите действие в неподписанной копии", "ar": "أعد تنفيذه في النسخة غير الموقعة"},
+"署名を外したコピーを作れませんでした。\n\n{error}": {"en": "Couldn't make the unsigned copy.\n\n{error}", "zh_CN": "无法创建未签名副本。\n\n{error}", "ko": "서명되지 않은 사본을 만들 수 없습니다.\n\n{error}", "es": "No se pudo crear la copia sin firmar.\n\n{error}", "fr": "Impossible de créer la copie non signée.\n\n{error}", "ru": "Не удалось создать неподписанную копию.\n\n{error}", "ar": "تعذر إنشاء النسخة غير الموقعة.\n\n{error}"},
+"このPDFは、開いたあとにほかのアプリで変更されています。電子署名と、その変更を守るため、上書き保存を中止しました。［名前を付けて保存］で別のファイルに保存してください。": {"en": "This PDF was changed by another app after you opened it. To protect its digital signature and that change, saving over it was stopped. Use Save As to save it to a different file.", "zh_CN": "打开此 PDF 后，它已被其他应用更改。为保护数字签名和该更改，已停止覆盖保存。请使用“另存为”保存到其他文件。", "ko": "이 PDF는 연 후에 다른 앱에서 변경되었습니다. 디지털 서명과 해당 변경 내용을 보호하기 위해 덮어쓰기 저장을 중지했습니다. [다른 이름으로 저장]을 사용하여 다른 파일에 저장하세요.", "es": "Otra aplicación ha modificado este PDF después de que lo abrieras. Para proteger la firma digital y ese cambio, se ha detenido el guardado. Usa «Guardar como» para guardarlo en otro archivo.", "fr": "Ce PDF a été modifié par une autre application après son ouverture. Pour protéger la signature numérique et cette modification, l'enregistrement a été interrompu. Utilisez « Enregistrer sous » pour l'enregistrer dans un autre fichier.", "ru": "После открытия этот PDF-файл был изменен другим приложением. Чтобы защитить цифровую подпись и это изменение, сохранение поверх файла остановлено. Сохраните документ в другой файл с помощью команды «Сохранить как».", "ar": "تم تغيير ملف PDF هذا في تطبيق آخر بعد فتحه. لحماية التوقيع الرقمي وذلك التغيير، تم إيقاف الحفظ فوق الملف. استخدم «حفظ باسم» لحفظه في ملف آخر."},
+"開くためのパスワード": {"en": "Document open password", "zh_CN": "文档打开密码", "ko": "문서 열기 암호", "es": "Contraseña de apertura", "fr": "Mot de passe d'ouverture", "ru": "Пароль для открытия", "ar": "كلمة مرور فتح المستند"},
+"PDFを復元": {"en": "Restore PDF", "zh_CN": "恢复 PDF", "ko": "PDF 복원", "es": "Restaurar PDF", "fr": "Restaurer le PDF", "ru": "Восстановление PDF", "ar": "استعادة PDF"},
+"PDFを復元...": {"en": "Restore PDF...", "zh_CN": "恢复 PDF...", "ko": "PDF 복원...", "es": "Restaurar PDF...", "fr": "Restaurer le PDF...", "ru": "Восстановить PDF...", "ar": "استعادة PDF..."},
+"このPDFには、次の制限があります：{restrictions}\n\n制限を外して復元すると、復元したPDFでは、これらの制限がなくなります。開いている元のPDFは変わりません。\n\n制限を外せるのは、その権限がある場合だけです。制限を外すことと、外したファイルの保存・利用は、利用者ご自身の責任で行ってください。": {"en": "This PDF has these restrictions: {restrictions}\n\nIf you restore it without restrictions, the restored PDF won't have them. The PDF you have open won't change.\n\nRemove restrictions only if you're entitled to do so. Removing them, and saving and using the file without them, is at your own responsibility.", "zh_CN": "此 PDF 有以下限制：{restrictions}\n\n如果去除限制进行恢复，恢复后的 PDF 将不再有这些限制。打开的原始 PDF 不会更改。\n\n只有在有权这样做时，才能去除限制。去除限制以及保存和使用去除限制后的文件，由用户自行负责。", "ko": "이 PDF에는 다음과 같은 제한이 있습니다: {restrictions}\n\n제한을 해제하고 복원하면 복원된 PDF에는 이러한 제한이 없어집니다. 열려 있는 원본 PDF는 변경되지 않습니다.\n\n제한은 해제할 권한이 있는 경우에만 해제하세요. 제한 해제와 해제한 파일의 저장 및 사용은 사용자 본인의 책임입니다.", "es": "Este PDF tiene estas restricciones: {restrictions}\n\nSi lo restauras sin restricciones, el PDF restaurado no las tendrá. El PDF que tienes abierto no cambiará.\n\nQuita las restricciones solo si tienes derecho a hacerlo. Quitarlas, y guardar y usar el archivo sin ellas, es tu responsabilidad.", "fr": "Ce PDF comporte les restrictions suivantes : {restrictions}\n\nSi vous le restaurez sans restrictions, le PDF restauré ne les aura plus. Le PDF ouvert ne sera pas modifié.\n\nNe supprimez les restrictions que si vous y êtes autorisé. La suppression des restrictions, ainsi que l'enregistrement et l'utilisation du fichier sans elles, se font sous votre propre responsabilité.", "ru": "У этого PDF-файла есть следующие ограничения: {restrictions}\n\nЕсли восстановить его без ограничений, у восстановленного PDF-файла их не будет. Открытый исходный PDF-файл не изменится.\n\nСнимайте ограничения, только если у вас есть на это право. Вы сами несете ответственность за снятие ограничений, а также за сохранение и использование файла без них.", "ar": "يحتوي ملف PDF هذا على القيود التالية: {restrictions}\n\nإذا استعدته بدون قيود، فلن تكون هذه القيود في ملف PDF المستعاد. لن يتغير ملف PDF الأصلي المفتوح.\n\nلا تُزِل القيود إلا إذا كان لديك الحق في ذلك. إزالة القيود وحفظ الملف واستخدامه بدونها على مسؤوليتك الخاصة."},
+"私は、このPDFの制限を解除し、解除後のファイルを保存・利用する正当な権限を有しています": {"en": "I'm entitled to remove this PDF's restrictions and to save and use the file without them", "zh_CN": "我有权去除此 PDF 的限制，并保存和使用去除限制后的文件", "ko": "본인은 이 PDF의 제한을 해제하고, 해제한 파일을 저장 및 사용할 정당한 권한이 있습니다", "es": "Tengo derecho a quitar las restricciones de este PDF y a guardar y usar el archivo sin ellas", "fr": "Je suis autorisé à supprimer les restrictions de ce PDF et à enregistrer et utiliser le fichier sans elles", "ru": "У меня есть право снять ограничения этого PDF-файла, а также сохранять и использовать файл без них", "ar": "لدي الحق في إزالة قيود ملف PDF هذا وحفظ الملف واستخدامه بدونها"},
+"制限を外して復元": {"en": "Restore Without Restrictions", "zh_CN": "去除限制并恢复", "ko": "제한을 해제하고 복원", "es": "Restaurar sin restricciones", "fr": "Restaurer sans restrictions", "ru": "Восстановить без ограничений", "ar": "استعادة بدون قيود"},
+"制限を残して復元": {"en": "Restore with Restrictions", "zh_CN": "保留限制并恢复", "ko": "제한을 유지하고 복원", "es": "Restaurar con restricciones", "fr": "Restaurer avec les restrictions", "ru": "Восстановить с ограничениями", "ar": "استعادة مع القيود"},
+"制限を外して復元...": {"en": "Restore Without Restrictions...", "zh_CN": "去除限制并恢复...", "ko": "제한을 해제하고 복원...", "es": "Restaurar sin restricciones...", "fr": "Restaurer sans restrictions...", "ru": "Восстановить без ограничений...", "ar": "استعادة بدون قيود..."},
+"復元したPDFを保存": {"en": "Save Restored PDF", "zh_CN": "保存恢复的 PDF", "ko": "복원한 PDF 저장", "es": "Guardar el PDF restaurado", "fr": "Enregistrer le PDF restauré", "ru": "Сохранение восстановленного PDF", "ar": "حفظ ملف PDF المستعاد"},
+"PDFを復元できませんでした。\n\n{error}": {"en": "Couldn't restore the PDF.\n\n{error}", "zh_CN": "无法恢复 PDF。\n\n{error}", "ko": "PDF를 복원할 수 없습니다.\n\n{error}", "es": "No se pudo restaurar el PDF.\n\n{error}", "fr": "Impossible de restaurer le PDF.\n\n{error}", "ru": "Не удалось восстановить PDF.\n\n{error}", "ar": "تعذرت استعادة ملف PDF.\n\n{error}"},
+"{badge} — プレミアム機能（プレミアム無料体験期間中はお使いいただけます）": {"en": "Premium feature (available during the Premium free trial)", "zh_CN": "高级功能（高级版免费试用期内可用）", "ko": "프리미엄 기능(프리미엄 무료 체험 기간 동안 사용 가능)", "es": "Característica premium (disponible durante el periodo de prueba gratuita de Premium)", "fr": "Fonctionnalité premium (disponible pendant la période d'essai gratuit de Premium)", "ru": "Премиум-функция (доступна в течение бесплатного пробного периода премиум-версии)", "ar": "ميزة متميزة (متاحة خلال الفترة التجريبية المجانية للميزات المتميزة)"},
+"プレミアムを購入...": {"en": "Buy Premium...", "zh_CN": "购买高级版...", "ko": "프리미엄 구매...", "es": "Comprar premium...", "fr": "Acheter la version premium...", "ru": "Купить премиум-версию...", "ar": "شراء الميزات المتميزة..."},
+"墨消しの範囲の指定": {"en": "Marking text for redaction", "zh_CN": "标记密文", "ko": "교정 영역 지정", "es": "Marcar texto para censurar", "fr": "Marquage de texte à biffer", "ru": "Выделение текста для скрытия", "ar": "تحديد النص للتنقيح"},
+"ショートカット メニュー（右クリック）": {"en": "Shortcut menu (right-click)", "zh_CN": "快捷菜单（右键单击）", "ko": "바로 가기 메뉴(마우스 오른쪽 단추)", "es": "Menú contextual (clic con el botón derecho)", "fr": "Menu contextuel (clic droit)", "ru": "Контекстное меню (щелчок правой кнопкой мыши)", "ar": "القائمة المختصرة (النقر بزر الماوس الأيمن)"},
+"プレミアム機能：{features}": {"en": "Premium features: {features}", "zh_CN": "高级功能：{features}", "ko": "프리미엄 기능: {features}", "es": "Características premium: {features}", "fr": "Fonctionnalités premium : {features}", "ru": "Премиум-функции: {features}", "ar": "الميزات المتميزة: {features}"},
+"その他のショートカット、テキスト ボックス・エクスポートなどは、これまでどおり無料でお使いいただけます。": {"en": "Other shortcuts, text boxes, export and more stay free, as before.", "zh_CN": "其他快捷方式、文本框、导出等功能仍可照常免费使用。", "ko": "그 밖의 바로 가기 키, 텍스트 상자, 내보내기 등은 지금처럼 무료로 사용할 수 있습니다.", "es": "Los demás métodos abreviados, los cuadros de texto, la exportación y mucho más siguen siendo gratuitos, como hasta ahora.", "fr": "Les autres raccourcis, les zones de texte, l'exportation et bien plus restent gratuits, comme avant.", "ru": "Другие сочетания клавиш, текстовые поля, экспорт и многое другое по-прежнему бесплатны.", "ar": "تبقى الاختصارات الأخرى ومربعات النص والتصدير وغيرها مجانية كما كانت."},
+"ご購入いただけると、このアプリの開発者が大層喜んで小躍りし、シェイプアップを達成することでしょう。": {"en": "If you buy it, the developer of this app will be so delighted that he'll dance a little jig and finally get in shape.", "zh_CN": "若能购买，这个应用的开发者会高兴得手舞足蹈，说不定还能顺便成功减肥。", "ko": "구매해 주시면 이 앱의 개발자가 크게 기뻐하며 덩실덩실 춤을 추다가 다이어트에도 성공할 것입니다.", "es": "Si lo compras, el desarrollador de esta aplicación se pondrá tan contento que se pondrá a bailar y, de paso, conseguirá ponerse en forma.", "fr": "Si vous l'achetez, le développeur de cette application sera si heureux qu'il en dansera de joie, et retrouvera peut-être même la ligne.", "ru": "Если вы купите ее, разработчик этого приложения так обрадуется, что пустится в пляс и наконец приведет себя в форму.", "ar": "إذا اشتريته، فسيفرح مطوّر هذا التطبيق كثيراً حتى يرقص من الفرح، وربما يستعيد رشاقته أخيراً."},
+"「{key}（{command}）」は Alt キーのショートカットで、プレミアム機能です。ツール バーのボタンからは、無料でお使いいただけます。": {"en": "“{key} ({command})” is an Alt key shortcut and a premium feature. You can use it for free from the toolbar button.", "zh_CN": "“{key}（{command}）”是 Alt 键快捷方式，属于高级功能。从工具栏按钮使用则免费。", "ko": "“{key}({command})”은(는) Alt 키 바로 가기 키이며 프리미엄 기능입니다. 도구 모음 단추로는 무료로 사용할 수 있습니다.", "es": "«{key} ({command})» es un método abreviado con Alt y una característica premium. Desde el botón de la barra de herramientas es gratuito.", "fr": "« {key} ({command}) » est un raccourci clavier avec Alt et une fonctionnalité premium. Il est gratuit depuis le bouton de la barre d'outils.", "ru": "«{key} ({command})» — это сочетание клавиш с ALT и премиум-функция. С помощью кнопки на панели инструментов она доступна бесплатно.", "ar": "«{key} ({command})» اختصار للمفتاح Alt وميزة متميزة. وهو مجاني من زر شريط الأدوات."},
+"右クリックのメニュー（ショートカット メニュー）はプレミアム機能です。同じ操作は、ツール バーのボタンや Ctrl キーのショートカットから無料でお使いいただけます。": {"en": "The right-click menu (shortcut menu) is a premium feature. You can do the same things for free with the toolbar buttons and Ctrl key shortcuts.", "zh_CN": "右键菜单（快捷菜单）是高级功能。相同的操作可以通过工具栏按钮或 Ctrl 键快捷方式免费使用。", "ko": "마우스 오른쪽 단추 메뉴(바로 가기 메뉴)는 프리미엄 기능입니다. 같은 작업을 도구 모음 단추나 Ctrl 키 바로 가기 키로 무료로 할 수 있습니다.", "es": "El menú contextual (clic con el botón derecho) es una característica premium. Puedes hacer lo mismo gratis con los botones de la barra de herramientas y los métodos abreviados con Ctrl.", "fr": "Le menu contextuel (clic droit) est une fonctionnalité premium. Vous pouvez faire la même chose gratuitement avec les boutons de la barre d'outils et les raccourcis clavier avec Ctrl.", "ru": "Контекстное меню (щелчок правой кнопкой мыши) — премиум-функция. Те же действия можно бесплатно выполнять с помощью кнопок на панели инструментов и сочетаний клавиш с CTRL.", "ar": "القائمة التي تظهر بالنقر بزر الماوس الأيمن (القائمة المختصرة) ميزة متميزة. يمكنك تنفيذ الإجراءات نفسها مجاناً من أزرار شريط الأدوات واختصارات المفتاح Ctrl."},
+"「{feature}」はプレミアム機能です。{days} 日間のプレミアム無料体験期間が終わったため、使うにはプレミアムの購入が必要です。": {"en": "“{feature}” is a premium feature. Your {days}-day Premium free trial has ended, so you need to buy Premium to use it.", "zh_CN": "“{feature}”是高级功能。{days} 天的高级版免费试用期已结束，需要购买高级版才能使用。", "ko": "“{feature}”은(는) 프리미엄 기능입니다. {days}일 프리미엄 무료 체험 기간이 끝나서 사용하려면 프리미엄을 구매해야 합니다.", "es": "«{feature}» es una característica premium. Tu periodo de prueba gratuita de Premium de {days} días ha terminado, así que necesitas comprar premium para usarla.", "fr": "« {feature} » est une fonctionnalité premium. Votre période d'essai gratuit de Premium de {days} jours est terminée : vous devez acheter la version premium pour l'utiliser.", "ru": "«{feature}» — премиум-функция. Бесплатный пробный период премиум-версии ({days} дн.) закончился, поэтому для ее использования нужно купить премиум-версию.", "ar": "«{feature}» ميزة متميزة. انتهت الفترة التجريبية المجانية للميزات المتميزة ومدتها {days} يوماً، لذا يلزمك شراء الميزات المتميزة لاستخدامها."},
+"{days} 日間のプレミアム無料体験期間が終わりました。プレミアム機能を使うには、プレミアムの購入が必要です。": {"en": "Your {days}-day Premium free trial has ended. To use the premium features, buy Premium.", "zh_CN": "{days} 天的高级版免费试用期已结束。要使用高级功能，请购买高级版。", "ko": "{days}일 프리미엄 무료 체험 기간이 끝났습니다. 프리미엄 기능을 사용하려면 프리미엄을 구매하세요.", "es": "Tu periodo de prueba gratuita de Premium de {days} días ha terminado. Para usar las características premium, compra premium.", "fr": "Votre période d'essai gratuit de Premium de {days} jours est terminée. Pour utiliser les fonctionnalités premium, achetez la version premium.", "ru": "Бесплатный пробный период премиум-версии ({days} дн.) закончился. Чтобы пользоваться премиум-функциями, купите премиум-версию.", "ar": "انتهت الفترة التجريبية المجانية للميزات المتميزة ومدتها {days} يوماً. لاستخدام الميزات المتميزة، اشترِ الميزات المتميزة."},
+"プレミアム無料体験期間: あと {count} 日": {"en": "Premium free trial: {count} days left", "zh_CN": "高级版免费试用期：还剩 {count} 天", "ko": "프리미엄 무료 체험 기간: {count}일 남음", "es": "Periodo de prueba gratuita de Premium: quedan {count} días", "fr": "Essai gratuit de Premium : {count} jours restants", "ru": "Бесплатный пробный период премиум-версии: осталось дней: {count}", "ar": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} يوم"},
+"プレミアム無料体験期間が終わりました": {"en": "Premium free trial ended", "zh_CN": "高级版免费试用期已结束", "ko": "프리미엄 무료 체험 기간이 끝났습니다", "es": "El periodo de prueba gratuita de Premium ha terminado", "fr": "Période d'essai gratuit de Premium terminée", "ru": "Бесплатный пробный период премиум-версии закончился", "ar": "انتهت الفترة التجريبية المجانية للميزات المتميزة"},
+"プレミアム無料体験期間: あと {count} 日（{date} まで）": {"en": "Premium free trial: {count} days left (until {date})", "zh_CN": "高级版免费试用期：还剩 {count} 天（至 {date}）", "ko": "프리미엄 무료 체험 기간: {count}일 남음({date}까지)", "es": "Periodo de prueba gratuita de Premium: quedan {count} días (hasta el {date})", "fr": "Essai gratuit de Premium : {count} jours restants (jusqu'au {date})", "ru": "Бесплатный пробный период премиум-версии: осталось дней: {count} (до {date})", "ar": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} يوم (حتى {date})"},
+"プレミアム無料体験期間中は、すべての機能をお使いいただけます。期間が終わる前でも、プレミアムを購入できます。": {"en": "During the Premium free trial, you can use every feature. You can buy Premium before it ends, too.", "zh_CN": "在高级版免费试用期内，所有功能均可使用。也可以在试用期结束前购买高级版。", "ko": "프리미엄 무료 체험 기간 동안에는 모든 기능을 사용할 수 있습니다. 기간이 끝나기 전에도 프리미엄을 구매할 수 있습니다.", "es": "Durante el periodo de prueba gratuita de Premium, puedes usar todas las funciones. También puedes comprar premium antes de que termine.", "fr": "Pendant la période d'essai gratuit de Premium, vous pouvez utiliser toutes les fonctionnalités. Vous pouvez aussi acheter la version premium avant la fin de la période.", "ru": "В течение бесплатного пробного периода премиум-версии можно пользоваться всеми функциями. Купить премиум-версию можно и до его окончания.", "ar": "خلال الفترة التجريبية المجانية للميزات المتميزة، يمكنك استخدام جميع الميزات. ويمكنك أيضاً شراء الميزات المتميزة قبل انتهائها."},
+"プレミアム無料体験期間が終わると、次の機能にはプレミアムの購入が必要になります。": {"en": "When the Premium free trial ends, you'll need to buy Premium for these features.", "zh_CN": "高级版免费试用期结束后，以下功能需要购买高级版。", "ko": "프리미엄 무료 체험 기간이 끝나면 다음 기능은 프리미엄을 구매해야 사용할 수 있습니다.", "es": "Cuando termine el periodo de prueba gratuita de Premium, necesitarás comprar premium para estas características.", "fr": "À la fin de la période d'essai gratuit de Premium, les fonctionnalités suivantes nécessiteront l'achat de la version premium.", "ru": "После окончания бесплатного пробного периода премиум-версии для следующих функций потребуется купить премиум-версию.", "ar": "عند انتهاء الفترة التجريبية المجانية للميزات المتميزة، ستحتاج إلى شراء الميزات المتميزة لاستخدام الميزات التالية."},
+"{app}を初めて起動した時から{days}日間は、すべての機能を無料でお使いいただけます。その後、OCR や墨消しの範囲の指定などのプレミアム機能を使うには、購入が必要です。購入の前に、必要な機能が使えることをプレミアム無料体験期間中にお確かめください。": {"en": "Every feature is free for {days} days from the first time you start {app}. After that, premium features such as OCR and marking text for redaction need a purchase. Please use the Premium free trial to make sure the features you need work for you before you buy.", "zh_CN": "从首次启动 {app} 起 {days} 天内，所有功能均可免费使用。之后，OCR、标记密文等高级功能需要购买。购买前，请在高级版免费试用期内确认所需的功能可以正常使用。", "ko": "{app}을(를) 처음 시작한 때부터 {days}일 동안 모든 기능을 무료로 사용할 수 있습니다. 그 후에는 OCR, 교정 영역 지정 등 프리미엄 기능을 사용하려면 구매해야 합니다. 구매하기 전에 프리미엄 무료 체험 기간 동안 필요한 기능이 제대로 작동하는지 확인하세요.", "es": "Todas las funciones son gratuitas durante {days} días desde la primera vez que inicias {app}. Después, las características premium, como el OCR y marcar texto para censurar, requieren una compra. Antes de comprar, aprovecha el periodo de prueba gratuita de Premium para comprobar que las funciones que necesitas te sirven.", "fr": "Toutes les fonctionnalités sont gratuites pendant {days} jours à partir du premier démarrage de {app}. Ensuite, les fonctionnalités premium, comme l'OCR et le marquage de texte à biffer, nécessitent un achat. Avant d'acheter, profitez de la période d'essai gratuit de Premium pour vérifier que les fonctionnalités dont vous avez besoin vous conviennent.", "ru": "Все функции бесплатны в течение {days} дней с первого запуска {app}. После этого для премиум-функций, например OCR и выделения текста для скрытия, нужна покупка. Прежде чем покупать, убедитесь в течение бесплатного пробного периода премиум-версии, что нужные вам функции работают.", "ar": "جميع الميزات مجانية لمدة {days} يوماً من أول تشغيل لـ {app}. بعد ذلك، تتطلب الميزات المتميزة، مثل التعرف الضوئي على الحروف (OCR) وتحديد النص للتنقيح، إجراء عملية شراء. قبل الشراء، استفد من الفترة التجريبية المجانية للميزات المتميزة للتأكد من أن الميزات التي تحتاجها تعمل كما تريد."},
+"内容をご確認のうえ、［Microsoft Store で購入］を押してください。次に開く Microsoft Store の画面で購入を確定すると、購入が完了します。": {"en": "Check the details, then select Buy in Microsoft Store. The purchase is complete when you confirm it in the Microsoft Store window that opens next.", "zh_CN": "请确认内容，然后选择“在 Microsoft Store 中购买”。在接下来打开的 Microsoft Store 窗口中确认购买后，即完成购买。", "ko": "내용을 확인한 후 [Microsoft Store에서 구매]를 선택하세요. 다음에 열리는 Microsoft Store 창에서 구매를 확정하면 구매가 완료됩니다.", "es": "Revisa los detalles y selecciona «Comprar en Microsoft Store». La compra se completa cuando la confirmas en la ventana de Microsoft Store que se abre a continuación.", "fr": "Vérifiez les détails, puis sélectionnez « Acheter dans le Microsoft Store ». L'achat est terminé lorsque vous le confirmez dans la fenêtre du Microsoft Store qui s'ouvre ensuite.", "ru": "Проверьте сведения, а затем выберите «Купить в Microsoft Store». Покупка будет завершена, когда вы подтвердите ее в окне Microsoft Store, которое откроется следующим.", "ar": "راجع التفاصيل، ثم حدد «الشراء من Microsoft Store». تكتمل عملية الشراء عندما تؤكدها في نافذة Microsoft Store التي تُفتح بعد ذلك."},
+"この Microsoft Store 版の pdfNote で、プレミアム機能（OCR、墨消しの範囲の指定、右クリックのメニュー、Alt キーのショートカット）が使えるようになります。購入に使う Microsoft アカウントに結び付きます。": {"en": "Unlocks the premium features (OCR, marking text for redaction, the right-click menu and Alt key shortcuts) in this Microsoft Store edition of pdfNote. Linked to the Microsoft account you buy with.", "zh_CN": "在此 Microsoft Store 版 pdfNote 中启用高级功能（OCR、标记密文、右键菜单和 Alt 键快捷方式）。与购买时使用的 Microsoft 帐户关联。", "ko": "이 Microsoft Store 버전의 pdfNote에서 프리미엄 기능(OCR, 교정 영역 지정, 마우스 오른쪽 단추 메뉴, Alt 키 바로 가기 키)을 사용할 수 있게 됩니다. 구매에 사용한 Microsoft 계정에 연결됩니다.", "es": "Activa las características premium (OCR, marcar texto para censurar, el menú contextual y los métodos abreviados con Alt) en esta edición de Microsoft Store de pdfNote. Se vincula a la cuenta Microsoft con la que compras.", "fr": "Active les fonctionnalités premium (OCR, marquage de texte à biffer, menu contextuel et raccourcis clavier avec Alt) dans cette édition Microsoft Store de pdfNote. Associé au compte Microsoft utilisé pour l'achat.", "ru": "Открывает премиум-функции (OCR, выделение текста для скрытия, контекстное меню и сочетания клавиш с ALT) в этой версии pdfNote из Microsoft Store. Привязывается к учетной записи Майкрософт, с которой совершается покупка.", "ar": "يتيح الميزات المتميزة (التعرف الضوئي على الحروف (OCR)، وتحديد النص للتنقيح، والقائمة المختصرة، واختصارات المفتاح Alt) في إصدار Microsoft Store هذا من pdfNote. يرتبط بحساب Microsoft الذي تشتري به."},
 }
 
 
@@ -2603,29 +2986,40 @@ TRANSLATIONS = {
 # "two" forms name the number in words, so they carry no {count}.
 PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
     "{count} か月ごとに自動更新されます": {
+        "zh_CN": {"=1": "每月自动续订"},
+        "ko": {"=1": "매월 자동으로 갱신됩니다"},
         "en": {"one": "Renews automatically every month"},
         "es": {"one": "Se renueva automáticamente cada mes"},
-        "fr": {"one": "Renouvelé automatiquement chaque mois"},
-        "ru": {"one": "Продлевается автоматически каждый месяц"},
+        "fr": {"=1": "Renouvelé automatiquement chaque mois"},
+        "ru": {"=1": "Продлевается автоматически каждый месяц"},
         "ar": {"one": "يتجدد تلقائياً كل شهر", "two": "يتجدد تلقائياً كل شهرين", "few": "يتجدد تلقائياً كل {count} أشهر", "many": "يتجدد تلقائياً كل {count} شهراً"},
     },
     "{count} 年ごとに自動更新されます": {
+        "zh_CN": {"=1": "每年自动续订"},
+        "ko": {"=1": "매년 자동으로 갱신됩니다"},
         "en": {"one": "Renews automatically every year"},
         "es": {"one": "Se renueva automáticamente cada año"},
-        "fr": {"one": "Renouvelé automatiquement chaque année"},
-        "ru": {"one": "Продлевается автоматически каждый год", "few": "Продлевается автоматически каждые {count} года"},
+        "fr": {"=1": "Renouvelé automatiquement chaque année"},
+        "ru": {"=1": "Продлевается автоматически каждый год", "few": "Продлевается автоматически каждые {count} года"},
         "ar": {"one": "يتجدد تلقائياً كل سنة", "two": "يتجدد تلقائياً كل سنتين", "few": "يتجدد تلقائياً كل {count} سنوات"},
     },
-    "無料試用版: 残り {count} 日": {
-        "en": {"one": "Free trial: {count} day left"},
-        "es": {"one": "Prueba gratuita: queda {count} día"},
-        "fr": {"one": "Essai gratuit : {count} jour restant"},
-        "ar": {
-            "one": "التجربة المجانية: متبقٍ يوم واحد",
-            "two": "التجربة المجانية: متبقٍ يومان",
-            "few": "التجربة المجانية: متبقٍ {count} أيام",
-            "many": "التجربة المجانية: متبقٍ {count} يوماً",
-        },
+    "サブスクリプション（{count} か月ごとに自動更新されます）": {
+        "zh_CN": {"=1": "订阅（每月自动续订）"},
+        "ko": {"=1": "구독(매월 자동 갱신)"},
+        "en": {"one": "Subscription (renews automatically every month)"},
+        "es": {"one": "Suscripción (se renueva automáticamente cada mes)"},
+        "fr": {"=1": "Abonnement (renouvelé automatiquement chaque mois)"},
+        "ru": {"=1": "Подписка (продлевается автоматически каждый месяц)"},
+        "ar": {"one": "اشتراك (يتجدد تلقائياً كل شهر)", "two": "اشتراك (يتجدد تلقائياً كل شهرين)", "few": "اشتراك (يتجدد تلقائياً كل {count} أشهر)", "many": "اشتراك (يتجدد تلقائياً كل {count} شهراً)"},
+    },
+    "サブスクリプション（{count} 年ごとに自動更新されます）": {
+        "zh_CN": {"=1": "订阅（每年自动续订）"},
+        "ko": {"=1": "구독(매년 자동 갱신)"},
+        "en": {"one": "Subscription (renews automatically every year)"},
+        "es": {"one": "Suscripción (se renueva automáticamente cada año)"},
+        "fr": {"=1": "Abonnement (renouvelé automatiquement chaque année)"},
+        "ru": {"=1": "Подписка (продлевается автоматически каждый год)", "few": "Подписка (продлевается автоматически каждые {count} года)"},
+        "ar": {"one": "اشتراك (يتجدد تلقائياً كل سنة)", "two": "اشتراك (يتجدد تلقائياً كل سنتين)", "few": "اشتراك (يتجدد تلقائياً كل {count} سنوات)"},
     },
     "{count}件": {
         "en": {"one": "{count} match"},
@@ -2666,7 +3060,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
     "同じ名前のファイルが{count}個あります。上書きしますか？\n\n{names}": {
         "en": {"one": "A file with the same name already exists. Replace it?\n\n{names}"},
         "es": {"one": "Ya existe un archivo con el mismo nombre. ¿Quieres reemplazarlo?\n\n{names}"},
-        "fr": {"one": "Un fichier portant le même nom existe déjà. Voulez-vous le remplacer ?\n\n{names}"},
+        "fr": {"=1": "Un fichier portant le même nom existe déjà. Voulez-vous le remplacer ?\n\n{names}"},
         "ar": {"one": "يوجد ملف بالاسم نفسه. هل تريد استبداله؟\n\n{names}", "two": "يوجد ملفان بالأسماء نفسها. هل تريد استبدالهما؟\n\n{names}", "few": "توجد {count} ملفات بالأسماء نفسها. هل تريد استبدالها؟\n\n{names}", "many": "يوجد {count} ملفاً بالأسماء نفسها. هل تريد استبدالها؟\n\n{names}"},
     },
     "墨消しが{count}件マークされています。適用すると完全に削除されます": {
@@ -2694,7 +3088,7 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
     "選んだ {count} 言語の言語データを削除しますか？": {
         "en": {"one": "Delete the language data for the selected language?"},
         "es": {"one": "¿Quieres eliminar los datos del idioma seleccionado?"},
-        "fr": {"one": "Supprimer les données de la langue sélectionnée ?"},
+        "fr": {"=1": "Supprimer les données de la langue sélectionnée ?"},
         "ar": {"one": "هل تريد حذف بيانات اللغة المحددة؟", "two": "هل تريد حذف بيانات اللغتين المحددتين؟"},
     },
     "{languages} ほか {count} 言語": {
@@ -2724,6 +3118,25 @@ PLURAL_FORMS: dict[str, dict[str, dict[str, str]]] = {
         "es": {"one": "No se pudo quitar {count} elemento o campo de formulario. Puede quedar contenido en las zonas censuradas; revisa el documento antes de guardarlo."},
         "fr": {"one": "Impossible de supprimer {count} élément ou champ de formulaire. Du contenu peut subsister dans les zones biffées ; vérifiez le document avant de l'enregistrer."},
         "ar": {"one": "تعذر حذف عنصر أو حقل نموذج واحد. قد يبقى محتوى في المناطق المنقّحة؛ تحقق من المستند قبل حفظه.", "two": "تعذر حذف عنصرين أو حقلي نموذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقق من المستند قبل حفظه.", "few": "تعذر حذف {count} عناصر أو حقول نماذج. قد يبقى محتوى في المناطق المنقّحة؛ تحقق من المستند قبل حفظه."},
+    },
+    "（返信 {count}）": {
+        "en": {"one": "({count} reply)"},
+        "es": {"one": "({count} respuesta)"},
+        "fr": {"one": "({count} réponse)"},
+        "ru": {"one": "({count} ответ)", "few": "({count} ответа)", "many": "({count} ответов)"},
+        "ar": {"one": "(رد واحد)", "two": "(ردّان)", "few": "({count} ردود)", "many": "({count} رداً)"},
+    },
+    "プレミアム無料体験期間: あと {count} 日": {
+        "en": {"one": "Premium free trial: {count} day left"},
+        "es": {"one": "Periodo de prueba gratuita de Premium: queda {count} día"},
+        "fr": {"one": "Essai gratuit de Premium : {count} jour restant"},
+        "ar": {"zero": "الفترة التجريبية المجانية للميزات المتميزة: لم يتبق أي يوم", "one": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ يوم واحد", "two": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ يومان", "few": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} أيام", "many": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} يوماً"},
+    },
+    "プレミアム無料体験期間: あと {count} 日（{date} まで）": {
+        "en": {"one": "Premium free trial: {count} day left (until {date})"},
+        "es": {"one": "Periodo de prueba gratuita de Premium: queda {count} día (hasta el {date})"},
+        "fr": {"one": "Essai gratuit de Premium : {count} jour restant (jusqu'au {date})"},
+        "ar": {"zero": "الفترة التجريبية المجانية للميزات المتميزة: لم يتبق أي يوم (حتى {date})", "one": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ يوم واحد (حتى {date})", "two": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ يومان (حتى {date})", "few": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} أيام (حتى {date})", "many": "الفترة التجريبية المجانية للميزات المتميزة: متبقٍ {count} يوماً (حتى {date})"},
     },
 }
 
@@ -2755,6 +3168,14 @@ QT_STRINGS: dict[str, dict[tuple[str, str], str]] = {}
 
 
 _load_language_files()
+
+
+def acrobat_review_state_text(resolved: bool, author: str) -> str:
+    """What a reply that sets a note's review state says, in Acrobat's own
+    words: "Completed set by Name" or "None set by Name". It is data in the
+    PDF, for Acrobat's list of comments, and English in every language, as
+    Acrobat writes it -- no text of pdfNote's screens (7.10)."""
+    return f"{'Completed' if resolved else 'None'} set by {author}"
 
 
 def plural_category(language: str, count: int) -> str:
@@ -2837,7 +3258,13 @@ class I18N:
         if I18N.current == "ja":
             return source_text(key)
         forms = PLURAL_FORMS.get(key, {}).get(I18N.current, {})
-        text = forms.get(plural_category(I18N.current, count))
+        # A form for one exact number ("=1") comes before the number's
+        # category: "every month" is said for 1, where the category that
+        # holds 1 holds other numbers too -- 0 in French and Brazilian
+        # Portuguese, Hindi and Bengali, 21 in Russian (2026-11-21).
+        text = forms.get(f"={abs(int(count))}")
+        if text is None:
+            text = forms.get(plural_category(I18N.current, count))
         return text if text is not None else I18N.t(key)
 
 
@@ -2968,6 +3395,39 @@ def key_text(keys: str) -> str:
     return "+".join(names + [tr(last)])
 
 
+# The slide show's commands (7.0): its name, its words, its keys in Qt's
+# portable names, and its picture. The show's keys, its right-click menu
+# and the F1 list are all made from this, and the checks hold it against a
+# key used twice. A number and Enter, which goes to that page, is the one
+# key the show reads by itself.
+PRESENTATION_COMMANDS: tuple[tuple[str, str, tuple[str, ...], "str | None"], ...] = (
+    ("next", "次のページ", ("N", "Right", "Down", "PgDown", "Space", "Return", "Enter"), "page_next"),
+    ("previous", "前のページ", ("P", "Left", "Up", "PgUp", "Backspace"), "page_prev"),
+    ("first", "最初のページ", ("Home",), "page_first"),
+    ("last", "最後のページ", ("End",), "page_last"),
+    ("laser", "レーザー ポインター", ("Ctrl+L",), "laser_pointer"),
+    ("pen", "ペン", ("Ctrl+P",), "presentation_pen"),
+    ("highlighter", "蛍光ペン", ("Ctrl+I",), "presentation_highlighter"),
+    ("eraser", "消しゴム", ("Ctrl+E",), "presentation_eraser"),
+    ("arrow", "矢印", ("Ctrl+A",), "pointer_arrow"),
+    ("erase_ink", "すべてのインクを消去", ("E",), None),
+    ("hide_pointer", "ポインターを表示しない", ("Ctrl+H",), None),
+    ("hide_ink", "インクを表示しない", ("Ctrl+M",), None),
+    ("black", "黒い画面", ("B", "."), "screen_black"),
+    ("white", "白い画面", ("W", ","), "screen_white"),
+    ("sidebar", "サイド バーを表示/非表示", ("Alt+B",), "sidebar"),
+    # The window's zoom keys (7.9, the owner: the show could not be zoomed),
+    # as PowerPoint zooms into a slide during a show; Ctrl+wheel too.
+    ("zoom_in", "拡大", ("Ctrl++", "Ctrl+Up"), "zoom_in"),
+    ("zoom_out", "縮小", ("Ctrl+-", "Ctrl+Down"), "zoom_out"),
+    ("zoom_fit", "ページに合わせる", ("Ctrl+0", "Ctrl+Alt+O"), "fit_page"),
+    ("end", "発表を終了", ("Esc", "-"), "presentation_end"),
+)
+# How far a show zooms in, and by how much a step.
+PRESENTATION_ZOOM_MAX = 4.0
+PRESENTATION_ZOOM_STEP = 1.25
+
+
 # The keyboard shortcut guide (F1). A row: its keys, in Qt's portable names
 # or as a phrase from TRANSLATIONS ("矢印キー"); what they do; and the action
 # they are bound to ("act_new", "edit:text" for a tool), or None for keys
@@ -2990,16 +3450,22 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("F1",), "キーボード ショートカット", "act_shortcuts"),
     )),
     ("ウィンドウ", (
-        (("Tab", "Shift+Tab"), "ナビゲーションとページを切り替え", None),
+        (("Tab", "Shift+Tab"), "サイド バーとページを切り替え", None),
         (("F6", "Shift+F6"), "ウィンドウ枠の切り替え", None),
         (("Shift+F10", "アプリケーション キー"), "ショートカット メニュー", None),
         (("Alt キー",), "キー ヒントを表示", None),
+        (("Ctrl+Shift+L",), "種類と色で絞り込む", "act_writing_filter"),
         (("Esc",), "ページに戻る", None),
+    )),
+    # The slide show's rows come from PRESENTATION_COMMANDS.
+    ("発表", (
+        (("Shift+F5",), "現在のページから発表", "act_present_current"),
+        *((keys, label, None) for _command, label, keys, _icon in PRESENTATION_COMMANDS),
+        (("Tab", "Shift+Tab"), "サイド バーとページを切り替え", None),
     )),
     ("ページのテキスト", (
         (("F7",), "カーソルを表示/非表示", "act_text_cursor"),
         (("矢印キー",), "カーソルを移動", None),
-        (("Ctrl+Left", "Ctrl+Right"), "単語単位で移動", None),
         (("Home", "End"), "行頭 / 行末", None),
         (("Shift+矢印キー",), "選択範囲を拡張", None),
         (("Ctrl+Shift+Left", "Ctrl+Shift+Right"), "単語単位で選択", None),
@@ -3019,6 +3485,9 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("Shift+矢印キー",), "サイズ変更", None),
         (("Shift+角をドラッグ",), "縦横比を保ってサイズ変更", None),
         (("Alt+Left", "Alt+Right"), "回転〔動詞〕", None),
+        (("Alt+Shift+W",), "幅を入力", "act_focus_width"),
+        (("Alt+Shift+H",), "高さを入力", "act_focus_height"),
+        (("Alt+Shift+R",), "回転角度を入力", "act_focus_angle"),
         (("Ctrl+Shift+]",), "前面へ移動", "act_bring_forward"),
         (("Ctrl+Shift+[",), "背面へ移動", "act_send_backward"),
         (("Return", "F2"), "選択した項目を編集", None),
@@ -3039,17 +3508,21 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
         (("Alt+1",), "単ページ", "act_single_page"),
         (("Alt+2",), "見開き", "act_facing_pages"),
         (("Alt+3",), "ページを固定", "act_fix_page"),
-        (("Alt+B",), "ナビゲーション", "act_sidebar"),
+        (("Alt+B",), "サイド バー", "act_sidebar"),
         (("F5",), "更新", "act_refresh"),
     )),
-    ("ナビゲーション", (
-        (("Ctrl+Left", "Ctrl+Right"), "ナビゲーションのタブを切り替え", None),
+    ("サイド バー", (
+        (("Ctrl+Left", "Ctrl+Right"), "サイド バーのタブを切り替え", None),
         (("Return",), "選択した項目へ移動", None),
         (("Ctrl+Up", "Ctrl+Down"), "ページを上下に移動", None),
         (("Ctrl+Shift+Up", "Ctrl+Shift+Down"), "ページを先頭 / 末尾へ移動", None),
         (("Ctrl+X", "Ctrl+C", "Ctrl+V"), "ページの切り取り・コピー・貼り付け", None),
         (("Ctrl+D",), "ページを複製", None),
         (("Del",), "ページを削除", None),
+        # The outline's entries, as Word's outline view promotes and
+        # demotes headings (7.9).
+        (("Alt+Shift+Left",), "目次のレベル上げ", None),
+        (("Alt+Shift+Right",), "目次のレベル下げ", None),
     )),
     ("ページ管理", (
         (("Ctrl+M", "Alt+Q"), "空白ページを挿入", "act_insert_blank"),
@@ -3096,8 +3569,6 @@ SHORTCUT_GUIDE: tuple[tuple[str, tuple[GuideRow, ...]], ...] = (
     )),
     ("検索〔見出し〕", (
         (("Ctrl+F",), "検索", "act_find"),
-        (("Return", "F3"), "次の検索結果", "act_next_match"),
-        (("Shift+Return", "Shift+F3"), "前の検索結果", "act_prev_match"),
         (("Esc",), "検索を閉じる", None),
     )),
 )
@@ -3147,6 +3618,23 @@ def install_qt_translations(code: str) -> bool:
 # Every edit state a document passes through gets a number of its own, so an
 # undo that comes back to the state last saved can tell (see DocumentSession).
 DOCUMENT_STATE_IDS = itertools.count(1)
+_DOCUMENT_KEYS = itertools.count(1)
+
+
+def document_key(document: Any) -> int:
+    """A number for `document` that no other Document is given while this
+    process runs: what the caches of drawn pages and characters, the marks
+    hidden on screen, the scan of the notes and the clipboard of marks name
+    a document by. They used id(), which Python gives again to an object
+    made after one has gone: a document opened after another was closed
+    could find the other's pages drawn, or take a mark copied from it for
+    one of its own -- the copy naming objects of a document that was no
+    longer there (7.9's review)."""
+    key = getattr(document, "_pdfnote_key", None)
+    if key is None:
+        key = next(_DOCUMENT_KEYS)
+        document._pdfnote_key = key
+    return key
 
 
 # ---- Undo: MuPDF's journal --------------------------------------------------
@@ -3295,7 +3783,7 @@ def _patch_pymupdf_journal() -> None:
     fitz.Page.delete_link = delete_link
     original_insert_pdf = fitz.Document.insert_pdf
 
-    def insert_pdf(self: fitz.Document, *args: Any, **kwargs: Any) -> Any:
+    def insert_journalled(self: fitz.Document, *args: Any, **kwargs: Any) -> Any:
         if not _journalled(self) or not hasattr(fitz, "g_use_extra"):
             return original_insert_pdf(self, *args, **kwargs)
         # The pure-Python path, for this call only. Another thread using
@@ -3307,8 +3795,64 @@ def _patch_pymupdf_journal() -> None:
         finally:
             fitz.g_use_extra = previous
 
+    def insert_pdf(self: fitz.Document, *args: Any, **kwargs: Any) -> Any:
+        # An annotation written into its page's list itself, not as an
+        # object of its own, was copied as "0 0 R" -- gone from the copy
+        # (7.9's review): the extracted page, the split pieces, a duplicated
+        # or pasted page, a merge, a print to PDF. Copied from a copy whose
+        # such annotations are objects of their own; the source itself is
+        # not touched (it may be the open document, or a signed one).
+        source = args[0] if args else kwargs.get("docsrc")
+        if isinstance(source, fitz.Document) and inline_annotation_pages(source):
+            # In memory only, for the copying: what goes into `self` is
+            # protected as the caller protects it, as from the source.
+            scratch = fitz.open(stream=source.tobytes(encryption=fitz.PDF_ENCRYPT_NONE), filetype="pdf")
+            try:
+                indirect_inline_annotations(scratch)
+                if args:
+                    return insert_journalled(self, scratch, *args[1:], **kwargs)
+                return insert_journalled(self, **dict(kwargs, docsrc=scratch))
+            finally:
+                scratch.close()
+        return insert_journalled(self, *args, **kwargs)
+
     fitz.Document.insert_pdf = insert_pdf
     fitz._pdfnote_journal_patched = True
+
+
+def inline_annotation_pages(document: fitz.Document) -> list[int]:
+    """The pages whose list of annotations holds one written into the list
+    itself, with no number of its own (PyMuPDF lists it as 0)."""
+    found: list[int] = []
+    try:
+        for index in range(len(document)):
+            if any(not xref for xref, _kind, _name in document[index].annot_xrefs()):
+                found.append(index)
+    except Exception:
+        return []
+    return found
+
+
+def indirect_inline_annotations(document: fitz.Document) -> int:
+    """Make each annotation written into its page's list itself an object
+    of its own, the list pointing to it, as ISO 32000 has it: what copying
+    pages and changing the order of annotations work with. How many."""
+    mupdf = fitz.mupdf
+    pdf = fitz._as_pdf_document(document)
+    made = 0
+    for index in inline_annotation_pages(document):
+        page = mupdf.pdf_lookup_page_obj(pdf, index)
+        annots = mupdf.pdf_dict_get(page, mupdf.pdf_new_name("Annots"))
+        if not annots.m_internal or not mupdf.pdf_is_array(annots):
+            continue
+        for position in range(mupdf.pdf_array_len(annots)):
+            item = mupdf.pdf_array_get(annots, position)
+            if mupdf.pdf_is_dict(item) and not mupdf.pdf_is_indirect(item):
+                mupdf.pdf_array_put(annots, position, mupdf.pdf_add_object(pdf, item))
+                made += 1
+    if made:
+        document._reset_page_refs()
+    return made
 
 
 _patch_pymupdf_journal()
@@ -3884,6 +4428,25 @@ class DocumentSession:
     # (bytes on disk, bytes once saved) for a file an older pdfNote made
     # larger than it needs to be; the notice bar offers to save it (6.1).
     shrink_estimate: tuple[int, int] | None = None
+    # A signed PDF (7.9): where the last signed revision ends, its bytes
+    # (kept for a file of up to OPEN_IN_MEMORY_BYTES; a larger one is read
+    # again, against `signed_digest`), the file as it is on disk
+    # (`disk_digest`, to see another program changed it), what the signers
+    # allow after signing, and -- when the signature cannot be kept by a
+    # save -- why.
+    signed_end: int | None = None
+    signed_bytes: bytes | None = None
+    signed_digest: str = ""
+    disk_digest: str = ""
+    signature_rules: dict[str, Any] = field(default_factory=dict)
+    signed_refused: str = ""
+    # Who signed it, and whether the file had changed after the last
+    # signature when it was opened (7.9, D5).
+    signed_names: list[str] = field(default_factory=list)
+    signed_changed: bool = False
+    # The name Save As offers for a document with no file yet: an unsigned
+    # copy's (7.9).
+    suggested_name: str = ""
 
     def __post_init__(self) -> None:
         # A new, merged or recovered document was never saved as it is.
@@ -3893,7 +4456,10 @@ class DocumentSession:
     @property
     def title(self) -> str:
         marker = " *" if self.dirty else ""
-        return f"{Path(self.file_path).name if self.file_path else tr('無題.pdf')}{marker}"
+        name = Path(self.file_path).name if self.file_path else (
+            Path(self.suggested_name).name if self.suggested_name else tr('無題.pdf')
+        )
+        return f"{name}{marker}"
 
 
 class OcrWorker(QObject):
@@ -4161,47 +4727,41 @@ def read_last_events(child: Any, seconds: float = 2.0) -> None:
         child._read_events()
 
 
-class OcrProcess(QObject):
-    """An OCR run in a process of its own, with OcrWorker's signals.
+class WorkerProcess(QObject):
+    """A run in a process of its own -- OCR (OcrProcess), an export
+    (ExportProcess) -- and what the two have in common.
 
     The copy of the document and the settings go into a private temporary
-    folder, the child (ocr_worker_main) writes its events to a file there,
-    and they are read back every 150 ms and turned into signals on the GUI
-    thread -- which is the only thread of pdfNote that ever uses PyMuPDF
-    (6.2). Cancelling ends the child at once. The folder goes when the run
-    ends."""
+    folder, the child writes its events to a file there, and they are read
+    back every 150 ms and turned into signals on the GUI thread -- which is
+    the only thread of pdfNote that ever uses PyMuPDF (6.2). Cancelling
+    ends the child at once. (The two were written out one beside the
+    other, alike but for what a run is given, what it sends back and what
+    is said when it ends early; 7.9's review.)"""
 
-    pageReady = Signal(int, object)
     progress = Signal(int, int)
     failed = Signal(str)
-    finished = Signal(bool)
     # The test suite runs a stand-in worker instead of pdfNote's own; the
     # folder is appended to this command.
     command_override: list[str] | None = None
+    # What a kind of run is: its command-line flag, the prefix of its
+    # folder, the variable its password goes in, its name in crash.log.
+    WORKER_FLAG = ""
+    FOLDER_PREFIX = ""
+    PASSWORD_VARIABLE = ""
+    FAULT_KIND = ""
 
-    def __init__(
-        self,
-        data: bytes,
-        page_indices: list[int],
-        language: str = "eng",
-        tessdata: str | None = None,
-        skip_threshold: int | None = None,
-        password: str | None = None,
-        parent: QObject | None = None,
-    ) -> None:
+    def __init__(self, data: bytes, password: str | None, parent: QObject | None) -> None:
         super().__init__(parent)
         self._data = data
-        self._pages = list(page_indices)
-        self._language = language
-        self._tessdata = tessdata
-        self._skip_threshold = skip_threshold
         self._password = password
-        self.candidates = 0
         self._cancelled = False
         self._ended = False
         self._worker_finished = False
         self._read_offset = 0
         self._pending = b""
+        self._reading_events = False
+        self._finish_pending = False
         self._folder: Path | None = None
         self._process = QProcess(self)
         self._process.finished.connect(self._process_finished)
@@ -4210,27 +4770,35 @@ class OcrProcess(QObject):
         self._timer.setInterval(150)
         self._timer.timeout.connect(self._read_events)
 
-    @staticmethod
-    def command() -> list[str]:
-        """pdfNote itself, in its OCR worker mode."""
+    @classmethod
+    def command(cls) -> list[str]:
+        """pdfNote itself, in this kind of worker's mode."""
         if getattr(sys, "frozen", False):
-            return [sys.executable, "--ocr-worker"]
-        return [sys.executable, str(Path(__file__).resolve()), "--ocr-worker"]
+            return [sys.executable, cls.WORKER_FLAG]
+        return [sys.executable, str(Path(__file__).resolve()), cls.WORKER_FLAG]
+
+    def _job(self) -> dict[str, Any]:
+        """The run's settings, for job.json."""
+        raise NotImplementedError
+
+    def _take_event(self, event: dict[str, Any]) -> bool:
+        """An event of this kind of run's own; False for one of every run's."""
+        return False
+
+    def _ended_early(self, code: str) -> str:
+        """What is said of a child that ended without saying it had finished."""
+        raise NotImplementedError
+
+    def _finish(self) -> None:
+        """The run is over: the folder, and the signal that says so."""
+        raise NotImplementedError
 
     def start(self) -> None:
         try:
-            self._folder = Path(tempfile.mkdtemp(prefix="pdfnote-ocr-"))
+            self._folder = make_work_folder(self.FOLDER_PREFIX)
             (self._folder / "input.pdf").write_bytes(self._data)
             (self._folder / "job.json").write_text(
-                json.dumps(
-                    {
-                        "pages": self._pages,
-                        "language": self._language,
-                        "tessdata": self._tessdata,
-                        "skip_threshold": self._skip_threshold,
-                    }
-                ),
-                encoding="utf-8",
+                json.dumps(self._job(), ensure_ascii=False), encoding="utf-8"
             )
             (self._folder / "out.jsonl").write_bytes(b"")
         except OSError as exc:
@@ -4241,9 +4809,9 @@ class OcrProcess(QObject):
             return
         self._data = b""
         environment = QProcessEnvironment.systemEnvironment()
-        environment.remove(OCR_PASSWORD_VARIABLE)
+        environment.remove(self.PASSWORD_VARIABLE)
         if self._password:
-            environment.insert(OCR_PASSWORD_VARIABLE, self._password)
+            environment.insert(self.PASSWORD_VARIABLE, self._password)
         self._process.setProcessEnvironment(environment)
         self._process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
         program, *arguments = list(self.command_override or self.command()) + [str(self._folder)]
@@ -4266,11 +4834,21 @@ class OcrProcess(QObject):
         if self._process.state() != QProcess.NotRunning:
             self._process.kill()
             self._process.waitForFinished(3000)
-        self._remove_folder()
+        self.remove_folder()
 
     def _read_events(self) -> None:
-        if self._folder is None or self._ended:
+        if self._folder is None or self._ended or self._reading_events:
             return
+        self._reading_events = True
+        try:
+            self._read_event_batch()
+        finally:
+            self._reading_events = False
+            if self._finish_pending:
+                self._finish_pending = False
+                self._process_finished()
+
+    def _read_event_batch(self) -> None:
         try:
             with open(self._folder / "out.jsonl", "rb") as stream:
                 stream.seek(self._read_offset)
@@ -4281,6 +4859,8 @@ class OcrProcess(QObject):
         lines = (self._pending + chunk).split(b"\n")
         self._pending = lines.pop()
         for line in lines:
+            if self._ended:
+                break
             if not line.strip():
                 continue
             try:
@@ -4289,14 +4869,11 @@ class OcrProcess(QObject):
                 continue
             if self._cancelled:
                 continue  # nothing more is applied once cancelled
-            if "page" in event:
-                words = [tuple(word) for word in event.get("words") or []]
-                self.pageReady.emit(int(event["page"]), words)
-            elif "progress" in event:
+            if self._take_event(event):
+                continue
+            if "progress" in event:
                 done, total = event["progress"]
                 self.progress.emit(int(done), int(total))
-            elif "candidates" in event:
-                self.candidates = int(event["candidates"])
             elif "failed" in event:
                 self.failed.emit(str(event["failed"]))
             elif event.get("finished"):
@@ -4305,14 +4882,16 @@ class OcrProcess(QObject):
     def _process_finished(self, *_args: Any) -> None:
         if self._ended:
             return
+        if self._reading_events:
+            # A modal progress dialog pumps events in setValue(). Its
+            # QProcess exit can arrive while done/finished are still in
+            # the batch above, whose bytes have already been consumed.
+            self._finish_pending = True
+            return
         read_last_events(self)
         if not self._worker_finished and not self._cancelled:
-            keep_worker_fault(self, "OCR")
-            self.failed.emit(
-                tr("OCRの処理が途中で終了しました（終了コード {code}）").format(
-                    code=worker_exit_text(self)
-                )
-            )
+            keep_worker_fault(self, self.FAULT_KIND)
+            self.failed.emit(self._ended_early(worker_exit_text(self)))
         self._end()
 
     def _process_error(self, error: Any) -> None:
@@ -4325,13 +4904,67 @@ class OcrProcess(QObject):
             return
         self._ended = True
         self._timer.stop()
-        self._remove_folder()
-        self.finished.emit(self._cancelled)
+        self._finish()
 
-    def _remove_folder(self) -> None:
+    def remove_folder(self) -> None:
         if self._folder is not None:
             shutil.rmtree(self._folder, ignore_errors=True)
             self._folder = None
+
+
+class OcrProcess(WorkerProcess):
+    """An OCR run in a process of its own (ocr_worker_main), with
+    OcrWorker's signals. The folder goes when the run ends."""
+
+    pageReady = Signal(int, object)
+    finished = Signal(bool)
+    command_override: list[str] | None = None
+    WORKER_FLAG = "--ocr-worker"
+    FOLDER_PREFIX = "pdfnote-ocr-"
+    PASSWORD_VARIABLE = OCR_PASSWORD_VARIABLE
+    FAULT_KIND = "OCR"
+
+    def __init__(
+        self,
+        data: bytes,
+        page_indices: list[int],
+        language: str = "eng",
+        tessdata: str | None = None,
+        skip_threshold: int | None = None,
+        password: str | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(data, password, parent)
+        self._pages = list(page_indices)
+        self._language = language
+        self._tessdata = tessdata
+        self._skip_threshold = skip_threshold
+        self.candidates = 0
+
+    def _job(self) -> dict[str, Any]:
+        return {
+            "pages": self._pages,
+            "language": self._language,
+            "tessdata": self._tessdata,
+            "skip_threshold": self._skip_threshold,
+        }
+
+    def _take_event(self, event: dict[str, Any]) -> bool:
+        if "page" in event:
+            words = [tuple(word) for word in event.get("words") or []]
+            self.pageReady.emit(int(event["page"]), words)
+            return True
+        if "candidates" in event and "progress" not in event:
+            self.candidates = int(event["candidates"])
+            return True
+        return False
+
+    def _ended_early(self, code: str) -> str:
+        return tr("OCRの処理が途中で終了しました（終了コード {code}）").format(code=code)
+
+    def _finish(self) -> None:
+        self.remove_folder()
+        self.finished.emit(self._cancelled)
 
 
 # ---- Export to Word, PowerPoint and Excel (6.7) -----------------------------
@@ -5291,19 +5924,18 @@ def export_worker_main(job: str) -> int:
     return 0
 
 
-class ExportProcess(QObject):
+class ExportProcess(WorkerProcess):
     """An export in a process of its own (export_worker_main), the way
-    OcrProcess runs OCR: the copy and the settings go into a private
-    temporary folder, the child's events are read back every 150 ms and
-    turned into signals, and cancelling ends the child at once. `output`
-    is the file written, once `finished` says it is done; the folder goes
-    when the object is told to clean up."""
+    OcrProcess runs OCR. `output` is the file written, once `finished` says
+    it is done; the folder goes when the object is told to clean up."""
 
-    progress = Signal(int, int)
-    failed = Signal(str)
     # cancelled, and the pages (from 0) that could not be converted
     finished = Signal(bool, list)
     command_override: list[str] | None = None
+    WORKER_FLAG = "--export-worker"
+    FOLDER_PREFIX = "pdfnote-export-"
+    PASSWORD_VARIABLE = EXPORT_PASSWORD_VARIABLE
+    FAULT_KIND = "export"
 
     def __init__(
         self,
@@ -5314,35 +5946,12 @@ class ExportProcess(QObject):
         sheet_name: str = "{page}",
         parent: QObject | None = None,
     ) -> None:
-        super().__init__(parent)
-        self._data = data
+        super().__init__(data, password, parent)
         self.kind = kind
-        self._password = password
         self._fonts = fonts
         self._sheet_name = sheet_name
-        self._cancelled = False
-        self._ended = False
         self._done = False
         self._skipped: list[int] = []
-        self._worker_finished = False
-        self._read_offset = 0
-        self._pending = b""
-        self._reading_events = False
-        self._finish_pending = False
-        self._folder: Path | None = None
-        self._process = QProcess(self)
-        self._process.finished.connect(self._process_finished)
-        self._process.errorOccurred.connect(self._process_error)
-        self._timer = QTimer(self)
-        self._timer.setInterval(150)
-        self._timer.timeout.connect(self._read_events)
-
-    @staticmethod
-    def command() -> list[str]:
-        """pdfNote itself, in its export worker mode."""
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--export-worker"]
-        return [sys.executable, str(Path(__file__).resolve()), "--export-worker"]
 
     @property
     def output(self) -> Path | None:
@@ -5350,134 +5959,23 @@ class ExportProcess(QObject):
             return None
         return self._folder / f"output.{self.kind}"
 
-    def start(self) -> None:
-        try:
-            self._folder = Path(tempfile.mkdtemp(prefix="pdfnote-export-"))
-            (self._folder / "input.pdf").write_bytes(self._data)
-            (self._folder / "job.json").write_text(
-                json.dumps(
-                    {"format": self.kind, "fonts": self._fonts, "sheet_name": self._sheet_name},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            (self._folder / "out.jsonl").write_bytes(b"")
-        except OSError as exc:
-            # Read now: Python forgets `exc` when the except clause ends, and
-            # the call below runs after it -- the failure was never told.
-            message = str(exc)
-            QTimer.singleShot(0, self, lambda: (self.failed.emit(message), self._end()))
-            return
-        self._data = b""
-        environment = QProcessEnvironment.systemEnvironment()
-        environment.remove(EXPORT_PASSWORD_VARIABLE)
-        if self._password:
-            environment.insert(EXPORT_PASSWORD_VARIABLE, self._password)
-        self._process.setProcessEnvironment(environment)
-        self._process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
-        program, *arguments = list(self.command_override or self.command()) + [str(self._folder)]
-        self._timer.start()
-        self._process.start(program, arguments)
+    def _job(self) -> dict[str, Any]:
+        return {"format": self.kind, "fonts": self._fonts, "sheet_name": self._sheet_name}
 
-    def cancel(self) -> None:
-        self._cancelled = True
-        if self._process.state() != QProcess.NotRunning:
-            self._process.kill()
+    def _take_event(self, event: dict[str, Any]) -> bool:
+        if event.get("done") and "progress" not in event:
+            self._done = True
+            self._skipped = [int(page) for page in event.get("skipped") or []]
+            return True
+        return False
 
-    def running(self) -> bool:
-        return not self._ended
+    def _ended_early(self, code: str) -> str:
+        return tr("エクスポートの処理が途中で終了しました（終了コード {code}）").format(code=code)
 
-    def stop(self) -> None:
-        """End the export without a word: the window is going."""
-        self._cancelled = True
-        self._ended = True
-        self._timer.stop()
-        if self._process.state() != QProcess.NotRunning:
-            self._process.kill()
-            self._process.waitForFinished(3000)
-        self.remove_folder()
-
-    def _read_events(self) -> None:
-        if self._folder is None or self._ended or self._reading_events:
-            return
-        self._reading_events = True
-        try:
-            self._read_event_batch()
-        finally:
-            self._reading_events = False
-            if self._finish_pending:
-                self._finish_pending = False
-                self._process_finished()
-
-    def _read_event_batch(self) -> None:
-        try:
-            with open(self._folder / "out.jsonl", "rb") as stream:
-                stream.seek(self._read_offset)
-                chunk = stream.read()
-        except OSError:
-            return
-        self._read_offset += len(chunk)
-        lines = (self._pending + chunk).split(b"\n")
-        self._pending = lines.pop()
-        for line in lines:
-            if self._ended:
-                break
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if self._cancelled:
-                continue
-            if "progress" in event:
-                done, total = event["progress"]
-                self.progress.emit(int(done), int(total))
-            elif event.get("done"):
-                self._done = True
-                self._skipped = [int(page) for page in event.get("skipped") or []]
-            elif "failed" in event:
-                self.failed.emit(str(event["failed"]))
-            elif event.get("finished"):
-                self._worker_finished = True
-
-    def _process_finished(self, *_args: Any) -> None:
-        if self._ended:
-            return
-        if self._reading_events:
-            # A modal progress dialog pumps events in setValue(). Its
-            # QProcess exit can arrive while done/finished are still in
-            # the batch above, whose bytes have already been consumed.
-            self._finish_pending = True
-            return
-        read_last_events(self)
-        if not self._worker_finished and not self._cancelled:
-            keep_worker_fault(self, "export")
-            self.failed.emit(
-                tr("エクスポートの処理が途中で終了しました（終了コード {code}）").format(
-                    code=worker_exit_text(self)
-                )
-            )
-        self._end()
-
-    def _process_error(self, error: Any) -> None:
-        if error == QProcess.FailedToStart and not self._ended:
-            self.failed.emit(self._process.errorString())
-            self._end()
-
-    def _end(self) -> None:
-        if self._ended:
-            return
-        self._ended = True
-        self._timer.stop()
+    def _finish(self) -> None:
         if self._cancelled or not self._done:
             self.remove_folder()
         self.finished.emit(self._cancelled, list(self._skipped))
-
-    def remove_folder(self) -> None:
-        if self._folder is not None:
-            shutil.rmtree(self._folder, ignore_errors=True)
-            self._folder = None
 
 
 def page_content_fingerprint(document: fitz.Document, index: int) -> str:
@@ -5619,7 +6117,10 @@ class RecoverySnapshotWriter:
             failure: str | None = None
             try:
                 self._write(partial, pdf_path, meta_path, data, meta)
-            except OSError as exc:
+            except Exception as exc:
+                # Every failure, not OSError alone: another would end this
+                # thread with _thread still set, and no snapshot would ever
+                # be written again, without a word (7.9's review).
                 failure = str(exc) or exc.__class__.__name__
                 for leftover in (partial, meta_partial):
                     try:
@@ -5660,7 +6161,7 @@ class RecoverySnapshotWriter:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(partial, target)
+        replace_file(partial, target)
 
 
 _SHARED_RECOVERY_WRITER: RecoverySnapshotWriter | None = None
@@ -5726,6 +6227,13 @@ DEFAULT_FORMAT_GLYPHS = {"bold": "B", "underline": "U", "color": "A"}
 def format_glyph(kind: str) -> str:
     """The letter of a formatting button in the UI language."""
     return FORMAT_GLYPHS[kind].get(I18N.current, DEFAULT_FORMAT_GLYPHS[kind])
+
+
+def _icon_wave_path() -> QPainterPath:
+    """A short drawn stroke under a pen."""
+    path = QPainterPath(QPointF(3, 19))
+    path.cubicTo(QPointF(6, 15), QPointF(9, 21), QPointF(12, 18))
+    return path
 
 
 def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
@@ -6161,16 +6669,18 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
                 QPolygonF([QPointF(9, 11), QPointF(12, 13.5), QPointF(7.2, 15.2)])
             )
         elif kind == "rectangle":
+            # The outline only, the inside clear, as the rectangle it draws:
+            # a pale fill made it a sticky note (7.9, the owner).
             frame = QRectF(3, 5, 16, 12)
             if tint is None:
-                fill(QColor("#7EB4E4"), hue["blue_deep"], 1.5)
+                stroke(hue["blue_deep"], 2.2, Qt.MiterJoin)
             else:
                 if halo is not None:
                     stroke(halo, 4.2, Qt.MiterJoin)
+                    painter.setBrush(Qt.NoBrush)
                     painter.drawRect(frame)
-                face = QColor(tint)
-                face.setAlpha(90)
-                fill(face, tint, 2.2)
+                stroke(tint, 2.2, Qt.MiterJoin)
+            painter.setBrush(Qt.NoBrush)
             painter.drawRect(frame)
         elif kind == "arrow":
             if halo is not None:
@@ -6235,6 +6745,18 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
             stroke(foreground, 1.6)
             painter.drawLine(QPointF(left + 4.4, top + 1.3), QPointF(13.5, top + 1.3))
         badge(QPointF(16.4, 16.2), "plus", hue["green"])
+    elif kind in ("level_up", "level_down"):
+        # Word's promote and demote: lines of an outline, and an arrow out
+        # to the left or in to the right (7.9).
+        stroke(foreground, 1.6)
+        for top in (4.0, 9.0, 14.0, 19.0):
+            painter.drawLine(QPointF(10.0, top), QPointF(19.5, top))
+        fill(hue["blue"])
+        if kind == "level_up":
+            painter.drawPolygon(QPolygonF([QPointF(2.0, 11.5), QPointF(7.6, 7.0), QPointF(7.6, 16.0)]))
+        else:
+            painter.drawPolygon(QPolygonF([QPointF(7.6, 11.5), QPointF(2.0, 7.0), QPointF(2.0, 16.0)]))
+        painter.setBrush(Qt.NoBrush)
     elif kind in ("zoom_in", "zoom_out", "find"):
         stroke(hue["blue"], 2.0)
         painter.drawEllipse(QRectF(3, 3, 12, 12))
@@ -6444,11 +6966,14 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
         if kind == "redact_apply":
             badge(QPointF(16.6, 16.8), "check", hue["green"])
     elif kind == "duplicate":
-        # PowerPoint's Duplicate: the same shape twice, the copy in front.
-        fill(hue["steel"], hue["steel_deep"], 1.2)
-        painter.drawRoundedRect(QRectF(2.5, 2.5, 11, 10), 1.5, 1.5)
-        fill(QColor("#7EB4E4"), hue["blue_deep"], 1.4)
-        painter.drawRoundedRect(QRectF(8.5, 9.5, 11, 10), 1.5, 1.5)
+        # The same shape twice, the copy straight below it, as pdfNote's
+        # Duplicate places it (7.0). It was a grey shape and a blue one
+        # overlapping corner to corner -- Bring Forward's picture all but
+        # exactly, beside it on the row (the owner, 2026-11-21: "［複製］
+        # ［前面へ移動］の見た目がほぼ同じなんですけど気づきませんでした？").
+        for rect in (QRectF(4.5, 2.5, 13, 7.5), QRectF(4.5, 12, 13, 7.5)):
+            fill(hue["blue"], hue["blue_deep"], 1.3)
+            painter.drawRoundedRect(rect, 1.5, 1.5)
         painter.setBrush(Qt.NoBrush)
     elif kind in ("bring_front", "bring_forward", "send_backward", "send_back"):
         # PowerPoint's Arrange pictures: the selected shape (blue) over or
@@ -6479,20 +7004,6 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
         stroke(foreground, 2.0, Qt.MiterJoin)
         painter.drawPolyline(QPolygonF([QPointF(6, 1.5), QPointF(6, 16), QPointF(20.5, 16)]))
         painter.drawPolyline(QPolygonF([QPointF(1.5, 6), QPointF(16, 6), QPointF(16, 20.5)]))
-    elif kind == "font":
-        letter("Aa", 10)
-    elif kind == "font_size":
-        # A large A and a small one, like Office's Grow / Shrink Font.
-        for value, size, box in (
-            ("A", 12, QRectF(0, 1, 13, 19)),
-            ("A", 8, QRectF(11, 6, 10, 14)),
-        ):
-            font = QFont("Segoe UI", size)
-            font.setBold(True)
-            font.setStyleStrategy(QFont.PreferAntialias | QFont.NoSubpixelAntialias)
-            painter.setFont(font)
-            painter.setPen(QPen(foreground))
-            painter.drawText(box, Qt.AlignCenter, value)
     elif kind in ("align_left", "align_center", "align_right"):
         stroke(foreground, 1.8)
         for index, width in enumerate((16.0, 10.0, 16.0, 10.0)):
@@ -6504,6 +7015,72 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
             else:
                 x0 = 11.0 - width / 2
             painter.drawLine(QPointF(x0, y), QPointF(x0 + width, y))
+    elif kind.startswith("obj_align_"):
+        # PowerPoint's Align (7.0): two objects against the line they are
+        # put in line with -- an edge, or the middle.
+        edge = kind.removeprefix("obj_align_")
+        stroke(foreground, 1.5)
+        if edge in ("left", "hcenter", "right"):
+            x = {"left": 3.0, "hcenter": 11.0, "right": 19.0}[edge]
+            painter.drawLine(QPointF(x, 2.5), QPointF(x, 19.5))
+            for top, width in ((4.5, 12.0), (12.0, 7.0)):
+                left = x if edge == "left" else x - width if edge == "right" else x - width / 2
+                fill(hue["blue"], hue["blue_deep"])
+                painter.drawRect(QRectF(left + (1 if edge == "left" else 0), top, width - 1, 5.5))
+        else:
+            y = {"top": 3.0, "vcenter": 11.0, "bottom": 19.0}[edge]
+            painter.drawLine(QPointF(2.5, y), QPointF(19.5, y))
+            for left, height in ((4.5, 12.0), (12.0, 7.0)):
+                top = y if edge == "top" else y - height if edge == "bottom" else y - height / 2
+                fill(hue["blue"], hue["blue_deep"])
+                painter.drawRect(QRectF(left, top + (1 if edge == "top" else 0), 5.5, height - 1))
+    elif kind == "presentation":
+        # A screen on its stand, with a play triangle: the slide show (7.0).
+        fill(hue["paper"], hue["steel_deep"])
+        painter.drawRect(QRectF(2.5, 3.5, 17, 11))
+        stroke(hue["steel_deep"], 1.6)
+        painter.drawLine(QPointF(11, 14.5), QPointF(11, 18.5))
+        painter.drawLine(QPointF(7, 19), QPointF(15, 19))
+        fill(hue["red"])
+        painter.drawPolygon(QPolygonF([QPointF(9, 6), QPointF(14.5, 9), QPointF(9, 12)]))
+    elif kind == "laser_pointer":
+        fill(QColor(220, 30, 30, 90))
+        painter.drawEllipse(QPointF(11, 11), 7.5, 7.5)
+        fill(QColor(230, 20, 20))
+        painter.drawEllipse(QPointF(11, 11), 3.6, 3.6)
+    elif kind == "presentation_pen":
+        stroke(hue["red"], 2.0)
+        painter.drawPath(_icon_wave_path())
+        fill(hue["ink"])
+        painter.drawPolygon(QPolygonF([QPointF(14, 3), QPointF(19, 8), QPointF(10, 17), QPointF(5, 12)]))
+    elif kind == "presentation_highlighter":
+        fill(QColor(255, 214, 51, 170))
+        painter.drawRect(QRectF(2, 14, 18, 5))
+        fill(hue["gold_deep"])
+        painter.drawPolygon(QPolygonF([QPointF(13, 2), QPointF(19, 8), QPointF(12, 15), QPointF(6, 9)]))
+    elif kind == "presentation_eraser":
+        fill(hue["paper"], hue["steel_deep"])
+        painter.drawPolygon(QPolygonF([QPointF(4, 13), QPointF(12, 5), QPointF(19, 12), QPointF(11, 20)]))
+        fill(hue["red"], hue["steel_deep"])
+        painter.drawPolygon(QPolygonF([QPointF(4, 13), QPointF(8, 9), QPointF(15, 16), QPointF(11, 20)]))
+    elif kind == "pointer_arrow":
+        fill(hue["paper"], hue["ink"])
+        painter.drawPolygon(QPolygonF([
+            QPointF(6, 3), QPointF(6, 18), QPointF(9.5, 14.5), QPointF(12, 20),
+            QPointF(14.5, 19), QPointF(12, 13.5), QPointF(17, 13.5),
+        ]))
+    elif kind == "screen_black":
+        fill(QColor("#111111"), hue["steel_deep"])
+        painter.drawRect(QRectF(2.5, 4.5, 17, 13))
+    elif kind == "screen_white":
+        fill(QColor("#FFFFFF"), hue["steel_deep"])
+        painter.drawRect(QRectF(2.5, 4.5, 17, 13))
+    elif kind == "presentation_end":
+        fill(hue["paper"], hue["steel_deep"])
+        painter.drawRect(QRectF(2.5, 3.5, 17, 13))
+        stroke(hue["red"], 2.2)
+        painter.drawLine(QPointF(7, 6.5), QPointF(15, 13.5))
+        painter.drawLine(QPointF(15, 6.5), QPointF(7, 13.5))
     elif kind == "confirm":
         # A tick: the text is done.
         stroke(hue["green"], 3.0)
@@ -6539,19 +7116,36 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
         stroke(hue["ink"], 1.3)
         painter.drawLine(QPointF(7, 5.8), QPointF(7, 8.7))
     elif kind in ("ocr", "ocr_document"):
-        # A scanner's corner marks around what gets read: letters for one
-        # page, a stack of pages for the whole document.
-        stroke(hue["blue"], 1.9, Qt.MiterJoin)
-        for x, y, dx, dy in ((2, 2, 1, 1), (20, 2, -1, 1), (2, 20, 1, -1), (20, 20, -1, -1)):
-            painter.drawPolyline(QPolygonF([
-                QPointF(x, y + 4.5 * dy), QPointF(x, y), QPointF(x + 4.5 * dx, y),
-            ]))
-        if kind == "ocr":
-            letter("Ab", 9)
-        else:
-            plain_sheet(QRectF(8, 4.5, 9, 11))
-            plain_sheet(QRectF(5, 7, 9, 11))
-            text_lines(QRectF(6.5, 9.5, 6, 6), 3)
+        # A picture, an arrow, a T: a picture becomes text (7.9, the
+        # owner chose it over the scanner's corner marks round "Ab"). The
+        # whole document: a page stands behind the picture.
+        top = 3.0
+        if kind == "ocr_document":
+            plain_sheet(QRectF(4.0, 1.5, 9.5, 8.5))
+            top = 4.5
+        picture = QRectF(1.5, top, 9.5, 8.5)
+        fill(QColor("#BFE0F5"), hue["paper_line"])
+        painter.drawRect(picture)
+        fill(hue["gold"])
+        painter.drawEllipse(QPointF(picture.right() - 2.2, picture.top() + 2.2), 1.4, 1.4)
+        fill(QColor("#5AAE5E"))
+        painter.drawPolygon(QPolygonF([
+            QPointF(picture.left(), picture.bottom()),
+            QPointF(picture.left() + 3.8, picture.top() + 3.6),
+            QPointF(picture.left() + 7.0, picture.bottom()),
+        ]))
+        fill(Qt.transparent, hue["paper_line"], 1.0)
+        painter.drawRect(picture)
+        stroke(hue["blue"], 1.6, Qt.MiterJoin)
+        painter.drawLine(QPointF(6.5, 16), QPointF(10.8, 16))
+        painter.drawPolyline(QPolygonF([QPointF(9.2, 14), QPointF(11.2, 16), QPointF(9.2, 18)]))
+        font = QFont("Segoe UI")
+        font.setPixelSize(14)
+        font.setBold(True)
+        font.setStyleStrategy(QFont.PreferAntialias | QFont.NoSubpixelAntialias)
+        painter.setFont(font)
+        painter.setPen(QPen(foreground))
+        painter.drawText(QRectF(10, 7, 12, 15), Qt.AlignCenter, "T")
     elif kind == "sanitize":
         # A shield with a tick: a copy cleared of hidden content.
         shield = QPainterPath()
@@ -6566,6 +7160,16 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
         painter.drawPath(shield)
         stroke(QColor("#FFFFFF"), 2.2)
         painter.drawPolyline(QPolygonF([QPointF(7, 11), QPointF(10, 14), QPointF(15.5, 7.5)]))
+    elif kind == "repair":
+        # A page with a spanner over its corner: the document mended (7.9).
+        fill(hue["paper"], hue["paper_line"], 1.1)
+        painter.drawRect(QRectF(3, 2, 12, 16))
+        stroke(hue["paper_line"], 1.0)
+        for y in (6.0, 9.0, 12.0):
+            painter.drawLine(QPointF(5.5, y), QPointF(12.5, y))
+        stroke(hue["steel"], 3.0)
+        painter.drawLine(QPointF(10.5, 19.5), QPointF(15.8, 14.2))
+        painter.drawArc(QRectF(14.2, 8.4, 6.6, 6.6), 70 * 16, 290 * 16)
     elif kind == "tools":
         # A spanner.
         stroke(hue["steel"], 3.2)
@@ -6590,15 +7194,6 @@ def render_ribbon_icon(kind: str, color: QColor | None = None) -> QIcon:
         painter.drawRoundedRect(QRectF(2.5, 3, 13, 11), 1.6, 1.6)
         painter.setBrush(Qt.NoBrush)
         badge(QPointF(16.2, 16.2), "plus", hue["green"])
-    elif kind == "format":
-        # A brush, as on Office's Format Painter.
-        fill(hue["gold"], hue["gold_deep"])
-        painter.drawRoundedRect(QRectF(3, 2.5, 16, 6), 1.4, 1.4)
-        fill(hue["steel"], hue["steel_deep"])
-        painter.drawRect(QRectF(9.5, 8.5, 3, 3))
-        painter.setBrush(Qt.NoBrush)
-        stroke(hue["steel_deep"], 3.0)
-        painter.drawLine(QPointF(11, 12), QPointF(11, 19.5))
     elif kind in ("tab_close", "tab_close_others", "tab_close_right"):
         # Document tabs on their bar, the red close badge under each one
         # that goes. The pale tab is the one right-clicked.
@@ -6799,39 +7394,462 @@ def neutralize_marker_xrefs(document: fitz.Document) -> None:
 
     A garbage-collecting save renumbers objects, so a cached number would
     afterwards name an unrelated one. The lookups fall back to finding the
-    right object again.
+    right object again. (The same on every page as
+    neutralize_marker_xrefs_on() does on some: it was written out twice.)
     """
-    for page in document:
-        for xref, _kind, _name in page.annot_xrefs():
-            try:
-                annot = page.load_annot(xref)
-                subject = str(annot.info.get("subject") or "")
-            except Exception:
-                continue
-            parts = subject.split("|")
-            if subject.startswith("SumiRichText|") and len(parts) >= 5:
-                parts[4] = "0"
-            elif subject.startswith("SumiEditableImage|") and len(parts) >= 4:
-                parts[1] = parts[2] = parts[3] = "0"
-            else:
-                continue
-            try:
-                annot.set_info(subject="|".join(parts))
-                annot.update()
-                if subject.startswith("SumiEditableImage|") and _kind != fitz.PDF_ANNOT_STAMP:
-                    # The original it kept goes with the number naming it. A
-                    # stamp's picture is the one it draws, and its original
-                    # is a reference the save renumbers with it (6.19).
-                    delete_pdf_key(document, xref, "SumiSource")
-            except Exception:
-                continue
+    neutralize_marker_xrefs_on(document, range(len(document)))
 
 
-def serialize_session(session: "DocumentSession", compact: bool = True) -> bytes:
+# ---- signed PDFs (7.9, the owner: saving keeps the signed revision) -----
+#
+# A signed PDF is saved as the bytes the last signature covers, unchanged,
+# and one incremental update that turns them into the document as it is:
+# rebuilt at every save, so what was added and taken away after signing does
+# not pile up (docs/INCREMENTAL_SAVE_RISKS.md). An unsigned PDF is saved as
+# it always was.
+
+class SignedSaveRefused(Exception):
+    """The signed revision cannot be kept by this save; the caller asks."""
+
+
+def signature_dictionaries(document: fitz.Document) -> list[tuple[int, str]]:
+    """The signatures of a document: (object number, its /ByteRange as
+    written) of every object that has one."""
+    found: list[tuple[int, str]] = []
+    try:
+        count = document.xref_length()
+    except Exception:
+        return found
+    for xref in range(1, count):
+        try:
+            kind, value = document.xref_get_key(xref, "ByteRange")
+        except Exception:
+            continue
+        if kind == "array":
+            found.append((xref, value))
+    return found
+
+
+def signed_revision_end(
+    data: bytes, document: fitz.Document, signatures: list[tuple[int, str]] | None = None,
+) -> int | None:
+    """Where the last signed revision of `data` ends: the largest end of the
+    signatures' byte ranges (/ByteRange [a b c d] covers a..a+b and c..c+d).
+    None with no signature. Raises SignedSaveRefused when a range does not
+    hold together -- outside the file, not starting at the beginning, not
+    ending at an end of file -- so a crafted or broken file is never cut in
+    the middle of what was signed. `signatures`: signature_dictionaries(),
+    when the caller has it already."""
+    end = 0
+    found = False
+    if signatures is None:
+        signatures = signature_dictionaries(document)
+    for _xref, value in signatures:
+        try:
+            parts = [int(part) for part in value.strip("[] ").split()]
+        except ValueError:
+            raise SignedSaveRefused("a signature's byte range is not numbers")
+        if len(parts) != 4:
+            raise SignedSaveRefused("a signature's byte range does not have four numbers")
+        a, b, c, d = parts
+        if a != 0 or b <= 0 or c <= b or d < 0 or c + d > len(data):
+            raise SignedSaveRefused("a signature's byte range does not fit the file")
+        found = True
+        end = max(end, c + d)
+    if not found:
+        return None
+    if not data[max(0, end - 64):end].rstrip(b"\r\n\x00 \t").endswith(b"%%EOF"):
+        raise SignedSaveRefused("the signed bytes do not end at an end of file")
+    return end
+
+
+def signature_permissions(document: fitz.Document) -> dict[str, Any]:
+    """What the signers allow after signing (ISO 32000-1, 12.8.2): `docmdp`,
+    the certification's P (1 no changes, 2 form filling and signing, 3 also
+    annotations; None when the document is not certified); `lock_all`, a
+    signature locks every form field; `locked`, the names of the fields a
+    signature locks (FieldMDP). Read from the signatures' references, which
+    are usually written inside the signature, not as objects of their own."""
+    docmdp: int | None = None
+    locked: set[str] = set()
+    lock_all = False
+    try:
+        count = document.xref_length()
+    except Exception:
+        count = 0
+    for xref in range(1, count):
+        try:
+            text = document.xref_object(xref, compressed=True)
+        except Exception:
+            continue
+        if "/TransformMethod" not in text:
+            continue
+        for method, params in re.findall(
+            r"/TransformMethod\s*/(\w+).*?/TransformParams\s*<<(.*?)>>", text, re.S
+        ):
+            if method == "DocMDP":
+                found = re.search(r"/P\s+(\d)", params)
+                level = int(found.group(1)) if found else 2
+                docmdp = level if docmdp is None else min(docmdp, level)
+            elif method == "FieldMDP":
+                action = re.search(r"/Action\s*/(\w+)", params)
+                if action is None or action.group(1) == "All":
+                    lock_all = True
+                elif action.group(1) == "Include":
+                    names = re.search(r"/Fields\s*\[(.*?)\]", params, re.S)
+                    if names:
+                        locked.update(re.findall(r"\(([^)]*)\)", names.group(1)))
+                else:
+                    # Exclude: every field but those named; treated as all,
+                    # the safe side.
+                    lock_all = True
+    return {"docmdp": docmdp, "locked": locked, "lock_all": lock_all}
+
+
+def _reachable_objects(document: fitz.Document) -> dict[int, str]:
+    """The objects the document reaches from its trailer -- what a reader
+    can get to; what was deleted is not among them -- each with its source
+    as it was read to find the next ones ("" for one that cannot be read)."""
+    count = document.xref_length()
+    todo: list[int] = []
+    for key in ("Root", "Info", "Encrypt"):
+        try:
+            kind, value = document.xref_get_key(-1, key)
+        except Exception:
+            continue
+        if kind == "xref":
+            todo.append(int(value.split()[0]))
+    reach: dict[int, str] = {}
+    while todo:
+        xref = todo.pop()
+        if xref in reach or not 0 < xref < count:
+            continue
+        try:
+            text = document.xref_object(xref, compressed=True)
+        except Exception:
+            reach[xref] = ""
+            continue
+        reach[xref] = text
+        todo.extend(int(number) for number in re.findall(r"(\d+) \d+ R", text))
+    return reach
+
+
+def _raw_stream(pdf: Any, xref: int) -> bytes | None:
+    """The stream of an object as it is stored, None for an object without
+    one. By MuPDF's own calls on one handle of the document (`pdf`):
+    PyMuPDF's xref_is_stream and xref_stream_raw make a handle at every
+    call, most of the time of a save of a long signed document (7.9's
+    review: 8.0 s for 90,000 objects)."""
+    mupdf = fitz.mupdf
+    if not mupdf.pdf_obj_num_is_stream(pdf, xref):
+        return None
+    return mupdf.fz_buffer_extract_copy(mupdf.pdf_load_raw_stream_number(pdf, xref))
+
+
+def read_signature_state(
+    document: fitz.Document, path: str, password: str | None = None,
+    content: bytes | None = None,
+) -> dict[str, Any]:
+    """What DocumentSession keeps of a signed file at `path` -- or of the
+    bytes `content`, for a document that arrived without a file (7.9): {}
+    for an unsigned one. A signature that cannot be kept by a save is noted
+    in `signed_refused`, not hidden."""
+    try:
+        if content is not None:
+            data: Any = content
+        elif Path(path).stat().st_size <= OPEN_IN_MEMORY_BYTES:
+            data = Path(path).read_bytes()
+        else:
+            handle = open(path, "rb")
+            data = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+            handle.close()
+    except (OSError, ValueError):
+        return {}
+    if isinstance(data, bytes) and b"/ByteRange" not in data:
+        # No signature without this name in the file's own bytes: what a
+        # signature covers is told by position, so its dictionary is never
+        # inside a compressed object, and names are not encrypted. Looked
+        # for first, as asking MuPDF for every object took most of a second
+        # at each opening of a long unsigned PDF (90,000 objects: 0.9 s;
+        # 7.9's review). (A name spelled with "#" escapes is not found: such
+        # a file is saved as it was before 7.9. A file read from the disk as
+        # it is needed is not read through for this; its objects are asked.)
+        return {}
+    state: dict[str, Any] = {}
+    try:
+        try:
+            signatures = signature_dictionaries(document)
+            end = signed_revision_end(data, document, signatures)
+        except SignedSaveRefused as exc:
+            # A signature is there, but its range does not hold together:
+            # keep nothing, and ask before every save.
+            return {"signed_end": 0, "signed_refused": str(exc)}
+        except Exception as exc:
+            # Whatever else a file can do to the reading of it: opening goes
+            # on, and the save asks first, as for a range that does not fit.
+            return {"signed_end": 0, "signed_refused": str(exc) or exc.__class__.__name__}
+        if end is None:
+            return {}
+        state["signed_end"] = end
+        state["signed_names"] = signer_names(document, [xref for xref, _range in signatures])
+        state["signed_changed"] = len(data) > end
+        state["signed_digest"] = hashlib.sha256(data[:end]).hexdigest()
+        state["disk_digest"] = hashlib.sha256(data[:]).hexdigest()
+        if isinstance(data, bytes):
+            state["signed_bytes"] = data[:end]
+        state["signature_rules"] = signature_permissions(document)
+        if not incremental_write_supported():
+            state["signed_refused"] = "this PyMuPDF has no incremental writer"
+    finally:
+        if not isinstance(data, bytes):
+            data.close()
+    return state
+
+
+def signer_names(document: fitz.Document, signatures: list[int] | None = None) -> list[str]:
+    """Who signed the document, as their certificates name them (the common
+    name), read from the signatures' PKCS #7 data with asn1crypto; the
+    signature's own /Name where that cannot be read. No certificate is
+    checked: this is who it says, not who it is (7.9, D5). `signatures`:
+    the signatures' object numbers, when the caller has them already."""
+    names: list[str] = []
+    if signatures is None:
+        signatures = [xref for xref, _range in signature_dictionaries(document)]
+    for xref in signatures:
+        try:
+            source = document.xref_object(xref, compressed=True)
+        except Exception:
+            continue
+        name = ""
+        found = re.search(r"/Contents\s*<([0-9A-Fa-f]+)>", source)
+        if found:
+            try:
+                from asn1crypto import cms
+
+                content = cms.ContentInfo.load(bytes.fromhex(found.group(1)).rstrip(b"\x00") or b"0")
+                signed_data = content["content"]
+                signer = signed_data["signer_infos"][0]["sid"]
+                for certificate in signed_data["certificates"]:
+                    chosen = certificate.chosen
+                    if signer.name == "issuer_and_serial_number" and (
+                        chosen.serial_number == signer.chosen["serial_number"].native
+                    ):
+                        name = chosen.subject.native.get("common_name") or ""
+                        break
+                if not name and len(signed_data["certificates"]):
+                    name = signed_data["certificates"][0].chosen.subject.native.get("common_name") or ""
+            except Exception:
+                name = ""
+        if not name:
+            try:
+                kind, value = document.xref_get_key(xref, "Name")
+                name = value if kind == "string" else ""
+            except Exception:
+                name = ""
+        if isinstance(name, list):
+            name = " ".join(str(part) for part in name)
+        name = str(name).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def strip_signatures(document: fitz.Document) -> None:
+    """Take the signatures off a document: the signed values and the
+    signature fields' appearance go, the fields stay, empty; the
+    certification (/Perms) and the flag that signatures exist go."""
+    for xref in range(1, document.xref_length()):
+        try:
+            if document.xref_get_key(xref, "FT") != ("name", "/Sig"):
+                continue
+        except Exception:
+            continue
+        document.xref_set_key(xref, "V", "null")
+        document.xref_set_key(xref, "AP", "null")
+        try:
+            kids = document.xref_get_key(xref, "Kids")
+        except Exception:
+            kids = ("null", "")
+        if kids[0] == "array":
+            for kid in re.findall(r"(\d+) 0 R", kids[1]):
+                document.xref_set_key(int(kid), "AP", "null")
+    root = document.pdf_catalog()
+    document.xref_set_key(root, "Perms", "null")
+    try:
+        if document.xref_get_key(root, "AcroForm")[0] != "null":
+            document.xref_set_key(root, "AcroForm/SigFlags", "null")
+    except Exception:
+        pass
+
+
+def incremental_write_supported() -> bool:
+    """Whether this PyMuPDF exposes MuPDF's incremental writer to memory."""
+    try:
+        options = fitz.mupdf.PdfWriteOptions()
+        return hasattr(options, "do_incremental") and hasattr(fitz.mupdf, "pdf_write_document")
+    except Exception:
+        return False
+
+
+def _incremental_bytes(document: fitz.Document) -> bytes:
+    """The document's own bytes and, after them, what changed since it was
+    opened -- MuPDF's incremental writer, to memory (PyMuPDF's own refuses
+    a document read from memory)."""
+    mupdf = fitz.mupdf
+    pdf = mupdf.pdf_specifics(document.this)
+    options = mupdf.PdfWriteOptions()
+    options.do_incremental = 1
+    buffer = mupdf.fz_new_buffer(65536)
+    output = mupdf.FzOutput(buffer)
+    mupdf.pdf_write_document(pdf, output, options)
+    output.fz_close_output()
+    return bytes(mupdf.fz_buffer_extract(buffer))
+
+
+def _without_length(source: str) -> str:
+    return re.sub(r"/Length \d+", "/Length", source)
+
+
+def consolidated_signed_bytes(
+    document: fitz.Document, signed: bytes, password: str | None = None,
+) -> bytes:
+    """`signed` -- the bytes the last signature covers -- unchanged, and one
+    update that turns them into `document`: the objects it reaches that are
+    new or differ, nothing it no longer reaches. Checked before it is
+    handed back; raises SignedSaveRefused when it cannot be trusted."""
+    if not incremental_write_supported():
+        raise SignedSaveRefused("this PyMuPDF has no incremental writer")
+    base = fitz.open(stream=signed, filetype="pdf")
+    try:
+        # Read once, before unlocking: read after, needs_pass locks the
+        # document again in PyMuPDF 1.28 (7.9).
+        if base.needs_pass and not (password and base.authenticate(password)):
+            raise SignedSaveRefused("the signed revision could not be unlocked")
+        if base.is_repaired:
+            raise SignedSaveRefused("the signed revision had to be repaired")
+        base_count = base.xref_length()
+        mupdf = fitz.mupdf
+        pdf = mupdf.pdf_specifics(base.this)
+        ours = mupdf.pdf_specifics(document.this)
+        # Each object's source is read once, and its stream's digest kept
+        # for the check below (7.9's review).
+        sources = _reachable_objects(document)
+        reach = sorted(sources)
+        digests: dict[int, bytes] = {}
+        for xref in reach:
+            source = sources[xref] or document.xref_object(xref, compressed=True)
+            sources[xref] = source
+            if source == "null":
+                continue
+            stream = _raw_stream(ours, xref)
+            if stream is not None:
+                digests[xref] = hashlib.sha256(stream).digest()
+            if xref < base_count:
+                try:
+                    same = base.xref_object(xref, compressed=True) == source and (
+                        stream is None or _raw_stream(pdf, xref) == stream
+                    )
+                except Exception:
+                    same = False
+                if same:
+                    continue
+            while base.xref_length() <= xref:
+                base.get_new_xref()
+            base.update_object(xref, source)
+            if stream is not None:
+                # The stream as it is stored -- compressed or not, as its
+                # dictionary says. PyMuPDF's update_stream(compress=False)
+                # takes the /Filter off and would leave compressed bytes
+                # named as plain ones (7.9: a highlight's appearance).
+                target = mupdf.pdf_new_indirect(pdf, xref, 0)
+                mupdf.pdf_update_stream(
+                    pdf, target, mupdf.fz_new_buffer_from_copied_data(stream), 1
+                )
+        for key in ("Root", "Info"):
+            kind, value = document.xref_get_key(-1, key)
+            if kind != "null" and base.xref_get_key(-1, key) != (kind, value):
+                base.xref_set_key(-1, key, value)
+        data = _incremental_bytes(base)
+    finally:
+        base.close()
+    if data[: len(signed)] != signed:
+        raise SignedSaveRefused("the signed bytes did not come out unchanged")
+    check = fitz.open(stream=data, filetype="pdf")
+    try:
+        if check.needs_pass and not (password and check.authenticate(password)):
+            raise SignedSaveRefused("the rebuilt document could not be unlocked")
+        if len(check) != len(document):
+            raise SignedSaveRefused("the rebuilt document has another number of pages")
+        for index in range(len(document)):
+            if len(check[index].annot_xrefs()) != len(document[index].annot_xrefs()):
+                raise SignedSaveRefused(f"page {index + 1} lost or gained annotations")
+        # Everything the document reaches is in the file as it is in the
+        # document: nothing that changed was left out (docs, R-2-2).
+        for key in ("Root", "Info"):
+            if check.xref_get_key(-1, key) != document.xref_get_key(-1, key):
+                raise SignedSaveRefused(f"the rebuilt document has another /{key}")
+        count = check.xref_length()
+        written = fitz.mupdf.pdf_specifics(check.this)
+        for xref in reach:
+            source = sources[xref]
+            if source == "null":
+                continue
+            if xref >= count:
+                raise SignedSaveRefused(f"object {xref} did not reach the file as it is")
+            found = check.xref_object(xref, compressed=True)
+            # But for a stream's /Length, which encryption pads.
+            if found != source and _without_length(found) != _without_length(source):
+                raise SignedSaveRefused(f"object {xref} did not reach the file as it is")
+            stream = _raw_stream(written, xref)
+            if (hashlib.sha256(stream).digest() if stream is not None else None) != digests.get(xref):
+                raise SignedSaveRefused(f"the stream of object {xref} did not reach the file as it is")
+    finally:
+        check.close()
+    return data
+
+
+def signed_bytes_of(session: "DocumentSession") -> bytes:
+    """The bytes the last signature of a session's file covers: kept since
+    it was opened, or read again from its file and checked."""
+    if session.signed_bytes is not None:
+        return session.signed_bytes
+    if not session.file_path or session.signed_end is None:
+        raise SignedSaveRefused("the signed bytes are not at hand")
+    try:
+        with open(session.file_path, "rb") as handle:
+            data = handle.read(session.signed_end)
+    except OSError as exc:
+        raise SignedSaveRefused(f"the signed file cannot be read: {exc}")
+    if hashlib.sha256(data).hexdigest() != session.signed_digest:
+        raise SignedSaveRefused("the signed part of the file has changed")
+    return data
+
+
+def serialize_session(
+    session: "DocumentSession", compact: bool = True, strict: bool = False,
+) -> bytes:
     """A session's document as bytes. Once redactions have been applied it
-    gets the full rewrite, so the removed objects are really gone."""
+    gets the full rewrite, so the removed objects are really gone. A signed
+    one is its signed revision and one update (7.9); when that cannot be
+    made, `strict` raises SignedSaveRefused, otherwise -- a recovery copy,
+    a snapshot -- the document is written as an unsigned one would be."""
     if session.document is None:
         return b""
+    if session.signed_end is not None:
+        try:
+            if session.signed_refused:
+                raise SignedSaveRefused(session.signed_refused)
+            if session.needs_full_rewrite:
+                raise SignedSaveRefused("redactions were applied")
+            return consolidated_signed_bytes(
+                session.document, signed_bytes_of(session), session.password
+            )
+        except SignedSaveRefused:
+            if strict:
+                raise
+        except Exception as exc:
+            if strict:
+                raise SignedSaveRefused(str(exc) or exc.__class__.__name__)
     return serialize_document(
         session.document, session.needs_full_rewrite, compact, password=session.password
     )
@@ -6926,12 +7944,13 @@ def protection_options(document: fitz.Document, password: str | None = None) -> 
     restrictions on a new file made from its pages (an extracted page, the
     pieces of a split). Empty for a PDF with neither.
 
-    pdfNote shows a PDF's restrictions without enforcing them, but it must
-    not strip them out of the files it writes. METI's commentary on the
-    Unfair Competition Prevention Act puts a program that merely does not
-    act on a restriction outside article 2(1)(xvii); removing the signal is
-    what the Copyright Act names as circumvention (article 30(1)(ii)). A
-    user password carries over as the one the document was opened with.
+    pdfNote shows a PDF's restrictions without enforcing them, and does
+    not strip them out of the files it writes as a side effect: METI's
+    commentary on the Unfair Competition Prevention Act puts a program that
+    merely does not act on a restriction outside article 2(1)(xvii). They
+    are lifted only by PDFを復元, on the user's statement that they have
+    the right to (7.9, the owner's decision; restore_document_copy). A user
+    password carries over as the one the document was opened with.
     """
     if not pdf_is_protected(document):
         return {}
@@ -7329,6 +8348,11 @@ def prune_unused_resources(document: fitz.Document) -> int:
         )
         page = document[index]
         for annotation, _kind, _name in page.annot_xrefs():
+            if not annotation:
+                # Written into the page's list itself, with no number of its
+                # own: MuPDF raises when asked by 0, and what it draws is
+                # left in place (7.9's review).
+                return 0
             for state in ("N", "D", "R"):
                 kind, value = document.xref_get_key(annotation, f"AP/{state}")
                 if kind == "xref":
@@ -7347,6 +8371,28 @@ def prune_unused_resources(document: fitz.Document) -> int:
     return removed
 
 
+# How often, and how far apart, a refused swap is tried again (7.3). On
+# Windows a file just written can be held for a moment by a cloud folder's
+# sync (iCloud, OneDrive) or a virus scan, and the swap that puts it in
+# place is refused with "Access is denied" -- then a moment later it works.
+REPLACE_ATTEMPTS = 6
+REPLACE_PAUSE_SECONDS = 0.25
+
+
+def replace_file(source: str | Path, target: str | Path) -> None:
+    """os.replace(), tried again a few times while Windows refuses it
+    (PermissionError: a file held by sync or a scan), as Office's own save
+    waits for such a lock. The last refusal is raised."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_PAUSE_SECONDS)
+
+
 def write_file_atomically(target: str | Path, data: bytes) -> None:
     """Put `data` at `target` whole or not at all: written to a temporary
     file beside it, flushed to the disk, then swapped in. What was there
@@ -7354,7 +8400,7 @@ def write_file_atomically(target: str | Path, data: bytes) -> None:
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temp_name = tempfile.mkstemp(
-        prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
+        prefix=".pdfnote-", suffix=".sumi.tmp", dir=str(target.parent)
     )
     temp_path: Path | None = Path(temp_name)
     try:
@@ -7362,7 +8408,7 @@ def write_file_atomically(target: str | Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_path, target)
+        replace_file(temp_path, target)
         temp_path = None
     finally:
         if temp_path is not None:
@@ -7384,6 +8430,29 @@ def page_list_label(pages: list[int]) -> str:
             runs.append(f"{start + 1}" if start == previous else f"{start + 1}-{previous + 1}")
         start = previous = page
     return ",".join(runs)
+
+
+# A picture drawn over at least this share of its page is the page itself
+# -- a scan, a background -- and a click does not take it up (7.9).
+PAGE_BACKGROUND_IMAGE_SHARE = 0.8
+
+
+def is_page_background_image(page: fitz.Page, bbox: fitz.Rect) -> bool:
+    """Does a picture drawn at `bbox` cover (nearly) the whole page? A
+    scanned page is one picture; so is a page with a full-page background.
+    Neither is something put on the page to move or crop, as a photo in a
+    report is."""
+    try:
+        area = page.rect
+    except Exception:
+        return False
+    page_area = area.get_area()
+    if page_area <= 0:
+        return False
+    shown = fitz.Rect(bbox) & area
+    if shown.is_empty:
+        return False
+    return shown.get_area() >= PAGE_BACKGROUND_IMAGE_SHARE * page_area
 
 
 def compact_page_copy(document: fitz.Document) -> dict[str, Any]:
@@ -7431,7 +8500,9 @@ def neutralize_marker_xrefs_on(document: fitz.Document, pages: Iterable[int]) ->
                 annot.set_info(subject="|".join(parts))
                 annot.update()
                 if subject.startswith("SumiEditableImage|") and _kind != fitz.PDF_ANNOT_STAMP:
-                    # A stamp's original is a reference, copied with it (6.19).
+                    # The original it kept goes with the number naming it. A
+                    # stamp's picture is the one it draws, and its original
+                    # is a reference, copied or renumbered with it (6.19).
                     delete_pdf_key(document, xref, "SumiSource")
             except Exception:
                 continue
@@ -7824,8 +8895,11 @@ def insert_html_subset(
     archive: Any = None,
     scale_low: float = 0,
     scale_word_width: bool = True,
+    angle: float = 0.0,
 ) -> tuple[float, float]:
     """Page.insert_htmlbox, with the fonts cut down to what the box shows.
+    `angle`: the box turned clockwise about its middle by that many degrees
+    (7.0); the text keeps its size.
 
     insert_htmlbox lays the HTML out on a page of a scratch document and
     shows that page here; the scratch page embeds every font whole -- a
@@ -7853,7 +8927,13 @@ def insert_html_subset(
     scratch = story.write_with_links(lambda *_args: (fit.rect, fit.rect, None))
     try:
         subset_scratch_fonts(scratch)
-        page.show_pdf_page(rect, scratch, 0)
+        if abs(angle) >= 0.05:
+            # show_pdf_page turns counter-clockwise and fits what it turns
+            # into the target: the rectangle round the turned box is where
+            # it fits at its own size.
+            page.show_pdf_page(rotated_bounds(rect, angle), scratch, 0, rotate=-angle)
+        else:
+            page.show_pdf_page(rect, scratch, 0)
     finally:
         scratch.close()
     return (spare_height, scale)
@@ -8117,6 +9197,8 @@ def tidy_pdfnote_leftovers(document: fitz.Document) -> int:
     for index in pages:
         page = document[index]
         for xref, annotation_kind, _name in page.annot_xrefs():
+            if not xref:
+                continue  # no number of its own, and none of pdfNote's marks (7.9's review)
             kind, subject = document.xref_get_key(xref, "Subj")
             if kind != "string" or not subject.startswith("SumiEditableImage|"):
                 continue
@@ -8259,6 +9341,79 @@ class CappedComboBox(QComboBox):
             container.resize(container.width(), height)
 
 
+class ChoiceGroup(QObject):
+    """Check boxes as one choice: ticking one clears the others, and the
+    one ticked is not cleared by itself (7.1). Not a QButtonGroup: Qt
+    makes the buttons of any group -- exclusive or not -- a single stop of
+    Tab, as radio buttons are, the very thing the check boxes are for. The
+    calls are a QButtonGroup's."""
+
+    buttonToggled = Signal(object, bool)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._buttons: list[QAbstractButton] = []
+
+    def addButton(self, button: QAbstractButton) -> None:  # noqa: N802 - QButtonGroup's name
+        self._buttons.append(button)
+        button.toggled.connect(lambda checked, b=button: self._toggled(b, checked))
+
+    def buttons(self) -> list[QAbstractButton]:
+        return list(self._buttons)
+
+    def checkedButton(self) -> QAbstractButton | None:  # noqa: N802 - QButtonGroup's name
+        return next((button for button in self._buttons if button.isChecked()), None)
+
+    def _toggled(self, button: QAbstractButton, checked: bool) -> None:
+        if checked:
+            for other in self._buttons:
+                if other is not button and other.isChecked():
+                    other.setChecked(False)
+        elif not any(other.isChecked() for other in self._buttons):
+            button.setChecked(True)
+            return
+        self.buttonToggled.emit(button, checked)
+
+
+def choice_boxes(parent: QWidget | None, labels: list[str]) -> tuple[ChoiceGroup, list[QCheckBox]]:
+    """One-of-several choices as check boxes (7.1, the owner's ask): each
+    is a stop of Tab and Space ticks it, where radio buttons were one stop
+    for the lot, moved through with the arrow keys -- which nobody found.
+    Ticking one clears the others."""
+    group = ChoiceGroup(parent)
+    boxes = []
+    for label in labels:
+        box = QCheckBox(label, parent)
+        group.addButton(box)
+        boxes.append(box)
+    return group, boxes
+
+
+class _ChooseOnEntry(QObject):
+    """Clicking into a choice's own box -- or arriving in it with Tab --
+    ticks that choice, so the range can be typed at once (7.1): it had to
+    be ticked first, and its box stayed greyed until then."""
+
+    def __init__(self, choice: QAbstractButton, parent: QObject) -> None:
+        super().__init__(parent)
+        self.choice = choice
+
+    def eventFilter(self, watched: Any, event: QEvent) -> bool:  # noqa: N802 - Qt's name
+        if event.type() in (QEvent.FocusIn, QEvent.MouseButtonPress) and not self.choice.isChecked():
+            self.choice.setChecked(True)
+        return False
+
+
+def choose_on_entry(field: QWidget, choice: QAbstractButton) -> None:
+    """`field` ticks `choice` when it is clicked or reached (7.1)."""
+    targets = [field]
+    line_edit = getattr(field, "lineEdit", None)
+    if callable(line_edit) and line_edit() is not None:
+        targets.append(line_edit())
+    for target in targets:
+        target.installEventFilter(_ChooseOnEntry(choice, target))
+
+
 class PrintDialog(QDialog):
     """pdfNote's print dialog. The system one is never shown.
 
@@ -8344,12 +9499,12 @@ class PrintDialog(QDialog):
         self.pdf_writer_note.setVisible(is_pdf_writer_printer(self.printer_box.currentText()))
         form.addRow("", self.pdf_writer_note)
 
-        self.range_all = QRadioButton(tr("すべてのページ"))
-        self.range_current = QRadioButton(tr("現在のページ"))
         # Not "ページ指定": that key belongs to the navigation command
         # (Ctrl+G / Alt+J), whose English is "Go to Page" -- which is what this
-        # radio button said.
-        self.range_custom = QRadioButton(tr("範囲を指定"))
+        # choice said. Check boxes, each a stop of Tab (7.1).
+        self.range_group, (self.range_all, self.range_current, self.range_custom) = choice_boxes(
+            self, [tr("すべてのページ"), tr("現在のページ"), tr("範囲を指定")]
+        )
         self.range_all.setChecked(True)
         range_column = QVBoxLayout()
         range_column.setSpacing(4)
@@ -8365,6 +9520,9 @@ class PrintDialog(QDialog):
         range_row.addWidget(self.range_from)
         range_row.addWidget(QLabel("–"))
         range_row.addWidget(self.range_to)
+        # Clicking either page box chooses 範囲を指定 (7.1).
+        choose_on_entry(self.range_from, self.range_custom)
+        choose_on_entry(self.range_to, self.range_custom)
         range_row.addStretch(1)
         range_column.addLayout(range_row)
         form.addRow(tr("印刷範囲"), range_column)
@@ -8811,8 +9969,6 @@ class PrintDialog(QDialog):
             return
         custom = self.per_sheet.currentData() == 0
         self._set_row_visible(self.grid_row_label, self.grid_widget, custom)
-        self.range_from.setEnabled(self.range_custom.isChecked())
-        self.range_to.setEnabled(self.range_custom.isChecked())
         self.scale_percent.setEnabled(self.scale_mode.currentData() == "percent")
         self.apply_to_printer()
 
@@ -8897,6 +10053,8 @@ class PageCanvasMixin:
         self.selectable_text_boxes: list[QRectF] = []
         self.editable_text_boxes: list[QRectF] = []
         self.selected_annotation_boxes: list[QRectF] = []
+        # The words a selected note is on, lit while it is selected (7.9).
+        self.note_anchor_boxes: list[QRectF] = []
         self.form_field_boxes: list[QRectF] = []
         self.link_boxes: list[tuple[QRectF, dict[str, Any]]] = []
         self.text_selection_range: tuple[int, int] | None = None
@@ -9537,6 +10695,13 @@ class PageCanvasMixin:
             painter.setBrush(QColor(49, 130, 246, 38))
             for box in self.form_field_boxes:
                 painter.drawRect(box.translated(offset))
+        if self.note_anchor_boxes:
+            # The words a selected note is on, lit as Google Slides lights
+            # the text of the comment in hand (7.9); nothing is written.
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(NOTE_ANCHOR_COLOR))
+            for box in self.note_anchor_boxes:
+                painter.drawRect(box.translated(offset))
         if self.selected_annotation_boxes:
             # A thin frame round each, as PowerPoint marks every object of
             # a selection, a little off it so a shape's own line shows; no
@@ -10009,6 +11174,7 @@ class PageSurface(PageCanvasMixin, QWidget):
         self.set_text_layout([], [], [])
         self.editable_text_boxes.clear()
         self.selected_annotation_boxes.clear()
+        self.note_anchor_boxes.clear()
         self.text_selection_range = None
         self.line_preview = None
         self.ink_preview = None
@@ -10281,45 +11447,114 @@ class ThumbnailListWidget(QListWidget):
             self.pageReordered.emit(dragged)
 
 
-class TextBoxMoveHandle(QLabel):
-    moveRequested = Signal(QPoint)
-    moveFinished = Signal()
+def drag_has_started(press: QPointF | None, current: QPointF) -> bool:
+    """Has the mouse gone far enough from where it was pressed to move what
+    it holds? Windows starts a drag only past the system drag distance
+    (4 px), so a click that wobbles a little moves nothing; pdfNote moved a
+    picture or a box on the first pixel, and a click on a picture became
+    an edit (7.9)."""
+    if press is None:
+        return True
+    return (current - press).manhattanLength() >= QApplication.startDragDistance()
 
-    def __init__(self, parent: QWidget, label: str | None = None) -> None:
-        super().__init__(label if label is not None else tr("⋮⋮  テキスト ボックス"), parent)
-        self._last_global: QPointF | None = None
-        self.setCursor(Qt.SizeAllCursor)
-        self.setStyleSheet(
-            "background:#D94B45; color:white; font-size:10px; font-weight:600; padding:1px 5px;"
-        )
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton:
-            self._last_global = event.globalPosition()
+class PointerDrag:
+    """A widget dragged with the left button: the press, the moves in whole
+    pixels, the release. For the boxes on the page and their handles.
+
+    It was written out in each of them (7.9's review), and not the same
+    way: the picture's and the shape's box kept what rounding a move to
+    whole pixels left over for the next move, while the text box, the
+    title handle, the resize handles and a line's end handles dropped it at
+    every move. Where the pointer moves by parts of a pixel -- Windows at
+    125 % or 150 % -- the dropped parts added up, and what was dragged fell
+    behind the pointer; moved slowly enough, it did not move at all. Kept
+    here, for all of them.
+    """
+
+    # Wait for the system's drag distance before the first move (7.9), so a
+    # click that wobbles moves nothing.
+    DRAG_WAITS_FOR_A_DISTANCE = True
+    # Hold the mouse while dragged: for a handle small enough to lose it.
+    DRAG_GRABS_THE_MOUSE = False
+    _drag_from: QPointF | None = None
+    _drag_press: QPointF | None = None
+
+    def _drag_accepts(self, event: Any) -> bool:
+        """Is a press here one that drags?"""
+        return True
+
+    def _drag_started(self, event: Any) -> None:
+        pass
+
+    def _drag_step(self, step: QPoint) -> None:
+        raise NotImplementedError
+
+    def _drag_ended(self, event: Any) -> None:
+        pass
+
+    def _pointer_hovers(self, event: Any) -> None:
+        """A move with nothing being dragged."""
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        if event.button() == Qt.LeftButton and self._drag_accepts(event):
+            self._drag_from = event.globalPosition()
+            self._drag_press = event.globalPosition() if self.DRAG_WAITS_FOR_A_DISTANCE else None
+            if self.DRAG_GRABS_THE_MOUSE:
+                self.grabMouse()
+            self._drag_started(event)
             event.accept()
             return
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if self._last_global is not None and event.buttons() & Qt.LeftButton:
+    def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        if self._drag_from is not None and event.buttons() & Qt.LeftButton:
             current = event.globalPosition()
-            delta = current - self._last_global
-            self._last_global = current
-            self.moveRequested.emit(QPoint(round(delta.x()), round(delta.y())))
+            if not drag_has_started(self._drag_press, current):
+                event.accept()
+                return
+            self._drag_press = None
+            delta = current - self._drag_from
+            step = QPoint(round(delta.x()), round(delta.y()))
+            if not step.isNull():
+                # What rounding leaves is kept for the next move.
+                self._drag_from += QPointF(step)
+                self._drag_step(step)
             event.accept()
             return
+        self._pointer_hovers(event)
         super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._last_global is not None:
-            self._last_global = None
-            self.moveFinished.emit()
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        if event.button() == Qt.LeftButton and self._drag_from is not None:
+            self._drag_from = None
+            if self.DRAG_GRABS_THE_MOUSE:
+                self.releaseMouse()
+            self._drag_ended(event)
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
 
-class OverlayResizeHandle(QFrame):
+class TextBoxMoveHandle(PointerDrag, QLabel):
+    moveRequested = Signal(QPoint)
+    moveFinished = Signal()
+
+    def __init__(self, parent: QWidget, label: str | None = None) -> None:
+        super().__init__(label if label is not None else tr("⋮⋮  テキスト ボックス"), parent)
+        self.setCursor(Qt.SizeAllCursor)
+        self.setStyleSheet(
+            "background:#D94B45; color:white; font-size:10px; font-weight:600; padding:1px 5px;"
+        )
+
+    def _drag_step(self, step: QPoint) -> None:
+        self.moveRequested.emit(step)
+
+    def _drag_ended(self, event: Any) -> None:
+        self.moveFinished.emit()
+
+
+class OverlayResizeHandle(PointerDrag, QFrame):
     resizeRequested = Signal(str, QPoint)
     resizeFinished = Signal()
 
@@ -10337,52 +11572,32 @@ class OverlayResizeHandle(QFrame):
     def __init__(self, parent: QWidget, direction: str) -> None:
         super().__init__(parent)
         self.direction = direction
-        self._last_global: QPointF | None = None
         self.setFixedSize(10, 10)
         self.setCursor(self.CURSORS[direction])
         self.setStyleSheet(
             "background:#FFFFFF; border:2px solid #D94B45; border-radius:1px;"
         )
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton:
-            self._last_global = event.globalPosition()
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    def _drag_step(self, step: QPoint) -> None:
+        self.resizeRequested.emit(self.direction, step)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if self._last_global is not None and event.buttons() & Qt.LeftButton:
-            current = event.globalPosition()
-            delta = current - self._last_global
-            self._last_global = current
-            self.resizeRequested.emit(
-                self.direction, QPoint(round(delta.x()), round(delta.y()))
-            )
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._last_global is not None:
-            self._last_global = None
-            self.resizeFinished.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+    def _drag_ended(self, event: Any) -> None:
+        self.resizeFinished.emit()
 
 
-class LineEndpointHandle(QFrame):
+class LineEndpointHandle(PointerDrag, QFrame):
     """A PowerPoint-style free endpoint handle for lines and arrows."""
 
     moved = Signal(int, QPoint)
     moveFinished = Signal()
+    # An end follows the pointer from its first pixel, and keeps the mouse.
+    DRAG_WAITS_FOR_A_DISTANCE = False
+    DRAG_GRABS_THE_MOUSE = True
 
     def __init__(self, parent: QWidget, endpoint_index: int, is_head: bool) -> None:
         super().__init__(parent)
         self.endpoint_index = endpoint_index
         self.is_head = is_head
-        self._last_global: QPointF | None = None
         self.setFixedSize(14, 14)
         self.setCursor(Qt.CrossCursor)
         self.setToolTip(tr("ドラッグして矢印の先端を移動") if is_head else tr("ドラッグして線の始点を移動"))
@@ -10395,34 +11610,11 @@ class LineEndpointHandle(QFrame):
             f"background:{background}; border:2px solid {border}; border-radius:7px;"
         )
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton:
-            self._last_global = event.globalPosition()
-            self.grabMouse()
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    def _drag_step(self, step: QPoint) -> None:
+        self.moved.emit(self.endpoint_index, step)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if self._last_global is not None and event.buttons() & Qt.LeftButton:
-            current = event.globalPosition()
-            delta = current - self._last_global
-            self._last_global = current
-            self.moved.emit(
-                self.endpoint_index, QPoint(round(delta.x()), round(delta.y()))
-            )
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._last_global is not None:
-            self._last_global = None
-            self.releaseMouse()
-            self.moveFinished.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+    def _drag_ended(self, event: Any) -> None:
+        self.moveFinished.emit()
 
 
 class ShapeRotationHandle(QFrame):
@@ -10511,6 +11703,16 @@ class ResizableCanvasFrame(QFrame):
     # Pixels between the frame's edges and what it holds, where it has no
     # content widget to measure them from (content_insets).
     CONTENT_INSETS: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+    def _move_by(self, delta: QPoint) -> None:
+        """Move the frame, kept inside what it stands on. (The text box and
+        the shape's box each had this written out; 7.9's review.)"""
+        bounds = self.parentWidget().rect().adjusted(0, 0, -self.width(), -self.height())
+        target = self.pos() + delta
+        target.setX(min(max(bounds.left(), target.x()), max(bounds.left(), bounds.right())))
+        target.setY(min(max(bounds.top(), target.y()), max(bounds.top(), bounds.bottom())))
+        self.move(target)
+        self.geometryEdited.emit()
 
     def content_widget(self) -> QWidget | None:
         """The child whose rectangle maps 1:1 onto the PDF rectangle.
@@ -10767,9 +11969,6 @@ def _available_text_box_fonts() -> dict[str, tuple[str, str, str | None]]:
 
 
 TEXT_BOX_FONTS = _available_text_box_fonts()
-# The fonts the right-click menus offer -- the ones above and the common
-# ones below; the toolbar's list has every font (6.3).
-MAIN_TEXT_BOX_FONT_KEYS: set[str] = set(TEXT_BOX_FONTS)
 # Japanese names of the fonts added from what is installed, for the
 # Japanese UI; the six above are keyed by theirs.
 TEXT_BOX_FONT_LABELS_JA: dict[str, str] = {}
@@ -10934,7 +12133,6 @@ def extend_text_box_fonts() -> None:
         TEXT_BOX_FONTS[family] = (family, regular, bold)
         if japanese and japanese != family:
             TEXT_BOX_FONT_LABELS_JA[family] = japanese
-    MAIN_TEXT_BOX_FONT_KEYS.update(common)
 # Fall back to the previous hardcoded font if none of the curated
 # candidates exist on this machine at all (very old/stripped-down Windows).
 # DEFAULT_TEXT_BOX_FONT is the *display* name (combo box item / dict key,
@@ -11404,6 +12602,54 @@ class CanvasTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
+def font_row_action(
+    menu: QMenu, family_key: str, size: float,
+    on_family: Callable[[str], None], on_size: Callable[[float], None],
+) -> QWidgetAction:
+    """The toolbar's font box and font size box, in a right-click menu
+    (7.9, the owner: the same as the toolbar's -- the menus had six fonts
+    and a list of sizes): every font the toolbar lists, any size from 4 to
+    144 pt, showing those of the text. A font chosen closes the menu, as an
+    entry does; the size applies at each step and at Enter. `on_family`
+    takes the font's key in TEXT_BOX_FONTS."""
+    row = QWidget(menu)
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(8, 3, 8, 3)
+    layout.setSpacing(4)
+    fonts = QComboBox(row)
+    for key in TEXT_BOX_FONTS:
+        fonts.addItem(PDFReaderWindow.font_display_name(key), key)
+    index = fonts.findData(family_key)
+    fonts.setCurrentIndex(index if index >= 0 else 0)
+    fonts.setFixedWidth(118)
+    fonts.setToolTip(tr("フォント"))
+    sizes = FontSizeSpinBox(row)
+    sizes.setRange(4, 144)
+    sizes.setDecimals(1)
+    sizes.setValue(size)
+    sizes.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    set_unit_suffix(sizes, " pt", -1)
+    sizes.setToolTip(tr("フォント サイズ"))
+    sizes.setKeyboardTracking(False)
+
+    def font_chosen(position: int) -> None:
+        key = fonts.itemData(position)
+        if isinstance(key, str) and key in TEXT_BOX_FONTS:
+            on_family(key)
+            menu.close()
+
+    fonts.currentIndexChanged.connect(font_chosen)
+    sizes.valueChanged.connect(on_size)
+    layout.addWidget(fonts)
+    layout.addWidget(sizes)
+    layout.addStretch(1)
+    action = QWidgetAction(menu)
+    action.setDefaultWidget(row)
+    menu._pdfnote_font_box = fonts  # type: ignore[attr-defined]
+    menu._pdfnote_size_box = sizes  # type: ignore[attr-defined]
+    return action
+
+
 class RichTextFormatMixin:
     """Shared bold/underline/strikethrough/color mini-toolbar and per-run
     formatting helpers for any widget with a `self.editor` QTextEdit --
@@ -11553,60 +12799,43 @@ class RichTextFormatMixin:
             keys_of("act_finish_text", "Ctrl+Return"),
         )
         menu.addSeparator()
-        format_menu = submenu("書式", "format")
+        # The font and its size first, as the toolbar's own box and list
+        # (7.9, the owner: the same as the toolbar's -- the menu had six
+        # fonts and a list of sizes), then what was under 書式, each a
+        # click away (7.9, the owner).
+        menu.addAction(self._editor_menu_font_row(menu))
         char_format = self.editor.textCursor().charFormat()
         bold_action = entry(
-            format_menu, "太字", self._toggle_bold, "text_bold_run",
+            menu, "太字", self._toggle_bold, "text_bold_run",
             keys_of("act_text_bold", "Ctrl+B"),
         )
         bold_action.setCheckable(True)
         bold_action.setChecked(char_format.fontWeight() > QFont.Normal)
         highlight_color = getattr(window, "_markup_color", QColor("#FFD633"))
         highlight_action = entry(
-            format_menu, "ハイライト", lambda: self._toggle_highlight(highlight_color),
+            menu, "ハイライト", lambda: self._toggle_highlight(highlight_color),
             menu_icon("text_highlight_run", highlight_color),
             keys_of("act_unified_highlight", "Ctrl+H"),
         )
         highlight_action.setCheckable(True)
         highlight_action.setChecked(char_format_highlighted(char_format))
         underline_action = entry(
-            format_menu, "下線", self._toggle_underline, "text_underline_run",
+            menu, "下線", self._toggle_underline, "text_underline_run",
             keys_of("act_unified_underline", "Ctrl+U"),
         )
         underline_action.setCheckable(True)
         underline_action.setChecked(char_format.fontUnderline())
         strike_action = entry(
-            format_menu, "取り消し線", self._toggle_strike, "text_strike_run",
+            menu, "取り消し線", self._toggle_strike, "text_strike_run",
             keys_of("act_unified_strikeout", "Ctrl+K"),
         )
         strike_action.setCheckable(True)
         strike_action.setChecked(char_format.fontStrikeOut())
-        format_menu.addSeparator()
         entry(
-            format_menu, "フォントの色...", self._choose_char_color,
+            menu, "フォントの色...", self._choose_char_color,
             menu_icon("text_color", getattr(window, "_text_color", None)),
         )
-        # Font and size sit at the top level, not buried under "書式":
-        # they are the two things most often reached for, and PowerPoint
-        # surfaces them directly on the text right-click too.
-        font_menu = submenu("フォント", "font")
-        menu.addMenu(font_menu)
-        for display_name, (qt_family, _regular, _bold) in TEXT_BOX_FONTS.items():
-            if display_name not in MAIN_TEXT_BOX_FONT_KEYS:
-                continue  # the toolbar's list has every font
-            # Same localised label the toolbar's font picker shows.
-            font_menu.addAction(
-                PDFReaderWindow.font_display_name(display_name),
-                lambda _checked=False, family=qt_family: self._set_char_font_family(family),
-            )
-        size_menu = submenu("フォント サイズ", "font_size")
-        menu.addMenu(size_menu)
-        for size in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48):
-            size_menu.addAction(
-                str(size),
-                lambda _checked=False, value=size: self._set_char_font_size(value),
-            )
-        menu.addMenu(format_menu)
+        menu.addSeparator()
         # PowerPoint's Paragraph group offers alignment here too. The
         # submenu carries the picture of the alignment in effect.
         align_menu = submenu("配置", "align_left")
@@ -11639,16 +12868,50 @@ class RichTextFormatMixin:
         # PySide's Python wrapper for a QMenu without one can be collected
         # (taking the underlying C++ object with it, since nothing else
         # references it either) before a caller gets to inspect it.
-        menu._pdfnote_format_menu = format_menu
-        menu._pdfnote_font_menu = font_menu
-        menu._pdfnote_size_menu = size_menu
         menu._pdfnote_align_menu = align_menu
         return assign_access_keys(menu)
 
-    def _show_editor_context_menu(self, point: QPoint) -> None:
-        if premium_menu_blocked(self):
+    def _editor_menu_font_row(self, menu: QMenu) -> QWidgetAction:
+        size, family = self._menu_format_at_caret()
+        return font_row_action(
+            menu, text_box_font_key(family), size,
+            lambda key: self._apply_menu_format(family=TEXT_BOX_FONTS[key][0]),
+            lambda value: self._apply_menu_format(size=value),
+        )
+
+    def _menu_format_at_caret(self) -> tuple[float, str]:
+        """The size and Qt family of the text at the caret."""
+        at_caret = getattr(self, "format_at_caret", None)
+        if callable(at_caret):
+            return at_caret()
+        fmt = self.editor.currentCharFormat()
+        families = fmt.fontFamilies() or [self.editor.font().family()]
+        size = fmt.fontPointSize() or self.editor.font().pointSizeF() or 12.0
+        return float(size), str(families[0])
+
+    def _apply_menu_format(self, size: float | None = None, family: str | None = None) -> None:
+        """A font or size from the menu's boxes, without taking the
+        keyboard from the menu, as the toolbar's boxes apply theirs."""
+        if hasattr(self, "apply_text_size"):
+            if size is not None:
+                self.apply_text_size(size)
+            if family is not None:
+                self.apply_text_family(family)
+            signal = getattr(self, "formatApplied", None)
+            if signal is not None:
+                signal.emit()
             return
-        self._build_editor_context_menu(point).exec(self.editor.mapToGlobal(point))
+        if size is not None:
+            RichTextFormatMixin._set_char_font_size(self, size)
+        if family is not None:
+            RichTextFormatMixin._set_char_font_family(self, family)
+
+    def _show_editor_context_menu(self, point: QPoint) -> None:
+        menu = self._build_editor_context_menu(point)
+        ready = getattr(self.window(), "_context_menu_ready", None)
+        if ready is not None:
+            ready(menu)
+        menu.exec(self.editor.mapToGlobal(point))
 
     def has_mixed_formatting(self) -> bool:
         """True when any run of text in the editor differs from the first
@@ -11677,7 +12940,7 @@ class RichTextFormatMixin:
         return False
 
 
-class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
+class CanvasTextBox(PointerDrag, RichTextFormatMixin, ResizableCanvasFrame):
     finishRequested = Signal()
     deleteRequested = Signal()
     # A click on the box held as an object: where (in the box), and whether
@@ -11701,7 +12964,6 @@ class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
         super().__init__(parent, QSize(36, 22))
         self.setObjectName("canvasTextBox")
         self.setMouseTracking(True)
-        self._drag_last_global: QPointF | None = None
         self._drag_moved = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -11774,29 +13036,18 @@ class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
             if len(direction) == 1:
                 handle.setVisible(not small)
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton:
-            self._drag_last_global = event.globalPosition()
-            self._drag_moved = False
-            self.setCursor(Qt.SizeAllCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    def _drag_started(self, event: Any) -> None:
+        self._drag_moved = False
+        self.setCursor(Qt.SizeAllCursor)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if self._drag_last_global is not None and event.buttons() & Qt.LeftButton:
-            current = event.globalPosition()
-            delta = current - self._drag_last_global
-            if delta.manhattanLength() > 0:
-                self._drag_moved = True
-            self._drag_last_global = current
-            self._move_by(QPoint(round(delta.x()), round(delta.y())))
-            event.accept()
-            return
+    def _drag_step(self, step: QPoint) -> None:
+        self._drag_moved = True
+        self._move_by(step)
+
+    def _pointer_hovers(self, event: Any) -> None:
         # Hover feedback (border while editing, anywhere while object-selected):
         # PowerPoint shows the 4-way move cursor before you even press down.
         self.setCursor(Qt.SizeAllCursor)
-        super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event: Any) -> None:
         # The second press of a double-click, which Qt sends as one of its
@@ -11805,18 +13056,13 @@ class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
             self._double_click = True
         self.mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._drag_last_global is not None:
-            was_click = not self._drag_moved
-            double, self._double_click = getattr(self, "_double_click", False), False
-            self._drag_last_global = None
-            self.setCursor(Qt.SizeAllCursor)
-            self.geometryEdited.emit()
-            event.accept()
-            if was_click:
-                self.objectClicked.emit(QPointF(event.position()), double)
-            return
-        super().mouseReleaseEvent(event)
+    def _drag_ended(self, event: Any) -> None:
+        was_click = not self._drag_moved
+        double, self._double_click = getattr(self, "_double_click", False), False
+        self.setCursor(Qt.SizeAllCursor)
+        self.geometryEdited.emit()
+        if was_click:
+            self.objectClicked.emit(QPointF(event.position()), double)
 
     def place_caret_at(self, position: QPointF, select_word: bool = False) -> None:
         """The caret where the box was clicked (`position`, in the box), or
@@ -11842,14 +13088,6 @@ class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
         new_height = min(desired_height, max(self.height(), maximum_height))
         if new_height > self.height():
             self.resize(self.width(), new_height)
-
-    def _move_by(self, delta: QPoint) -> None:
-        bounds = self.parentWidget().rect().adjusted(0, 0, -self.width(), -self.height())
-        target = self.pos() + delta
-        target.setX(min(max(bounds.left(), target.x()), max(bounds.left(), bounds.right())))
-        target.setY(min(max(bounds.top(), target.y()), max(bounds.top(), bounds.bottom())))
-        self.move(target)
-        self.geometryEdited.emit()
 
     def _style_editor(self) -> None:
         """The box's own font and colour on the editor itself, for text that
@@ -11981,6 +13219,35 @@ class CanvasTextBox(RichTextFormatMixin, ResizableCanvasFrame):
                 self.editor.mergeCurrentCharFormat(change)
         self._grow_to_fit_content()
 
+    def all_bold(self) -> bool:
+        """Is every character of the box bold? An empty box is not."""
+        document = self.editor.document()
+        block = document.begin()
+        seen = False
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.text().strip():
+                    if fragment.charFormat().fontWeight() <= QFont.Normal:
+                        return False
+                    seen = True
+                iterator += 1
+            block = block.next()
+        return seen
+
+    def _toggle_bold(self) -> None:
+        """Bold for the words selected while the box is typed in; for the
+        whole box while it is held as an object, as its font, size and
+        colour are set then (7.9, the owner: the button was greyed for a
+        held box, where PowerPoint makes all of its words bold)."""
+        if not self.editor.isReadOnly():
+            RichTextFormatMixin._toggle_bold(self)
+            return
+        change = QTextCharFormat()
+        change.setFontWeight(QFont.Normal if self.all_bold() else QFont.Bold)
+        self._change_format(True, change, lambda: None)
+
     def apply_text_size(self, size: float, whole: bool | None = None) -> None:
         size = float(size)
         self._change_format(
@@ -12066,16 +13333,74 @@ class StickyNoteEditDialog(RichTextFormatMixin, QDialog):
     uses that same menu and the same keys (5.35).
     """
 
-    def __init__(self, parent: QWidget, title: str, text: str, html: str | None) -> None:
+    # The keyboard went from the note's words to a reply, or back, or the
+    # caret moved: the toolbar shows the format of the text it is in (7.9).
+    formatTargetChanged = Signal()
+
+    def __init__(
+        self, parent: QWidget, title: str, text: str, html: str | None,
+        quote: str = "", replies: list[tuple[int, str, str, str]] | None = None,
+        author: tuple[str, str] | None = None, resolved: bool = False,
+        thread_actions: dict[str, Callable[..., Any]] | None = None,
+    ) -> None:
+        """`quote`: the words the note is on (7.9); `replies`: its thread,
+        (xref, who, when, what) oldest first -- with it, a box for a reply;
+        `author`: who wrote the note and when; `resolved`: whether its
+        thread is resolved; `thread_actions`: "edit" and "delete" a reply,
+        each answering the thread as it is then (7.9, after Google
+        Slides' comments)."""
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(360, 260)
+        self.resize(400, 320 if replies is None else 460)
+        self._thread_actions = thread_actions or {}
+        # Resolve or Re-open, chosen in the window: done by the window that
+        # opened it, after OK (7.9).
+        self.resolve_choice: bool | None = None
         # Not modal: the toolbar has to stay reachable, because the buttons
         # that format this text are on it (5.36). A window of its own, kept
         # above the reader.
         self.setModal(False)
         self.setWindowFlag(Qt.Tool, True)
         layout = QVBoxLayout(self)
+        # Who wrote the note and when, and Resolve -- or, resolved, the
+        # word and Re-open -- at the top of the card, as Google Slides has
+        # them (7.9).
+        self.author_label: QLabel | None = None
+        self.resolve_button: QPushButton | None = None
+        if author is not None or replies is not None:
+            head = QHBoxLayout()
+            who, when = author or ("", "")
+            self.author_label = QLabel(self._byline(who, when))
+            self.author_label.setObjectName("noteAuthor")
+            self.author_label.setTextFormat(Qt.RichText)
+            head.addWidget(self.author_label, 1)
+            if replies is not None:
+                self.resolve_button = QPushButton(tr("再開") if resolved else tr("解決"))
+                self.resolve_button.setObjectName("noteResolve")
+                self.resolve_button.setIcon(menu_icon("undo" if resolved else "confirm"))
+                self.resolve_button.setToolTip(
+                    tr("スレッドを再開して、ページに戻します") if resolved
+                    else tr("スレッドを解決済みにして、ページから隠します")
+                )
+                self.resolve_button.clicked.connect(
+                    lambda _checked=False, again=resolved: self._choose_resolve(not again)
+                )
+                head.addWidget(self.resolve_button)
+            layout.addLayout(head)
+            if resolved:
+                done = QLabel(tr("解決済み"))
+                done.setObjectName("noteResolved")
+                done.setStyleSheet(f"color: {COLORS['muted']};")
+                layout.addWidget(done)
+        # The words the note is on, over it, as Google Slides shows them
+        # over a comment (7.9).
+        self.quote_label: QLabel | None = None
+        if quote:
+            self.quote_label = QLabel(tr("「{quote}」").format(quote=quote))
+            self.quote_label.setWordWrap(True)
+            self.quote_label.setObjectName("noteQuote")
+            self.quote_label.setStyleSheet(f"color: {COLORS['muted']};")
+            layout.addWidget(self.quote_label)
         self.editor = QTextEdit()
         self.editor.setAcceptRichText(False)
         self._install_editor_context_menu()
@@ -12084,6 +13409,26 @@ class StickyNoteEditDialog(RichTextFormatMixin, QDialog):
             self.editor.setHtml(html)
         else:
             self.editor.setPlainText(text)
+        # The thread: the replies, each with its menu (Edit, Delete), then
+        # a box for one more (7.9).
+        self.thread_view: QScrollArea | None = None
+        self.reply_rows: dict[int, dict[str, Any]] = {}
+        self.reply_edit: QTextEdit | None = None
+        if replies is not None:
+            self.thread_view = QScrollArea()
+            self.thread_view.setObjectName("noteThread")
+            self.thread_view.setWidgetResizable(True)
+            self.thread_view.setFrameShape(QFrame.NoFrame)
+            layout.addWidget(self.thread_view, 1)
+            self._show_thread(replies)
+            # Formatted as the note's words are -- from the toolbar, the
+            # right-click menu and the keys (7.9, the owner: a reply took
+            # no formatting while the note did).
+            self.reply_edit = self._rich_box()
+            self.reply_edit.setObjectName("noteReply")
+            self.reply_edit.setPlaceholderText(tr("返信を入力"))
+            self.reply_edit.setFixedHeight(72)
+            layout.addWidget(self.reply_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText(tr("OK"))
         buttons.button(QDialogButtonBox.Cancel).setText(tr("キャンセル"))
@@ -12093,14 +13438,88 @@ class StickyNoteEditDialog(RichTextFormatMixin, QDialog):
         self.editor.moveCursor(QTextCursor.End)
         self.editor.setFocus()
         self.editor.installEventFilter(self)
+        # Tab goes on to OK and Cancel, as in a Windows dialog's box of
+        # several lines; Ctrl+Tab types a tab (7.1). Tab typed a tab, and
+        # the buttons could not be reached from the keyboard.
+        self.editor.setTabChangesFocus(True)
+        # The note's words. `editor` is the box the keyboard is in -- the
+        # note's words, the reply, or a reply being edited -- which the
+        # toolbar, the menu and the keys format (7.9).
+        self.body = self.editor
+        self._rich_boxes = [self.body] + ([self.reply_edit] if self.reply_edit is not None else [])
+        self._follow_caret(self.body)
+        # Its right-click menu for its own words, wherever the keyboard was.
+        self.body.customContextMenuRequested.disconnect()
+        self.body.customContextMenuRequested.connect(
+            lambda point: self._box_menu(self.body, point)
+        )
+
+    def _rich_box(self, html: str | None = None, text: str = "") -> QTextEdit:
+        """A box for a reply, formatted as the note's words are."""
+        box = QTextEdit()
+        box.setAcceptRichText(False)
+        box.setTabChangesFocus(True)
+        if html is not None:
+            box.setHtml(html)
+        elif text:
+            box.setPlainText(text)
+        box.installEventFilter(self)
+        box.setContextMenuPolicy(Qt.CustomContextMenu)
+        box.customContextMenuRequested.connect(
+            lambda point, target=box: self._box_menu(target, point)
+        )
+        boxes = getattr(self, "_rich_boxes", None)
+        if boxes is not None:
+            boxes.append(box)
+        self._follow_caret(box)
+        return box
+
+    def _follow_caret(self, box: QTextEdit) -> None:
+        """The toolbar's buttons show the format at the caret, as they do
+        for a text box (7.9's review: in a note they kept the state they
+        had when it opened)."""
+        box.cursorPositionChanged.connect(self.formatTargetChanged)
+        box.selectionChanged.connect(self.formatTargetChanged)
+
+    def _box_menu(self, box: QTextEdit, point: QPoint) -> None:
+        """The note's right-click menu, on a reply's box."""
+        self._make_current(box)
+        self._show_editor_context_menu(point)
+
+    def _make_current(self, box: QTextEdit) -> None:
+        if box is not self.editor:
+            self.editor = box
+            self.formatTargetChanged.emit()
+
+    def _html_of(self, box: QTextEdit) -> str | None:
+        """A box's HTML, whenever anything in it was formatted."""
+        current = self.editor
+        self.editor = box
+        try:
+            if self.has_mixed_formatting() or self._has_any_formatting():
+                return box.document().toHtml()
+            return None
+        finally:
+            self.editor = current
 
     def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802 - Qt's name
+        boxes = getattr(self, "_rich_boxes", [self.editor])
+        if event.type() == QEvent.FocusIn and watched in boxes:
+            self._make_current(watched)
+        if (
+            watched in boxes
+            and event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Tab
+            and event.modifiers() == Qt.ControlModifier
+        ):
+            watched.insertPlainText("\t")
+            return True
         # Ctrl+Enter puts the note down, as it does a text box: the note is
         # written with a text box's keys (5.35). With the keyboard alone
         # there was no way to OK -- Tab is a tab in the text, and Ctrl+Enter
         # did nothing (6.29).
         if (
-            watched is self.editor
+            watched in (self.body if hasattr(self, "body") else self.editor, self.reply_edit)
             and event.type() == QEvent.KeyPress
             and event.key() in (Qt.Key_Return, Qt.Key_Enter)
             and event.modifiers() & Qt.ControlModifier
@@ -12110,7 +13529,155 @@ class StickyNoteEditDialog(RichTextFormatMixin, QDialog):
         return super().eventFilter(watched, event)
 
     def plain_text(self) -> str:
-        return self.editor.toPlainText()
+        return self.body.toPlainText()
+
+    @staticmethod
+    def _byline(who: str, when: str) -> str:
+        """Who and when, the time in the muted colour."""
+        name = f"<b>{escape_html(who)}</b>" if who else ""
+        if not when:
+            return name
+        time = f"<span style='color:{COLORS['muted']}'>{escape_html(when)}</span>"
+        if not name:
+            return time
+        # The space between them is each language's (7.10): it was an
+        # ideographic space put in by the code, in every language.
+        return tr("{author}　{time}").format(author=name, time=time)
+
+    def _choose_resolve(self, resolve: bool) -> None:
+        """Resolve (or Re-open): what is typed is kept, and the window
+        closes -- a resolved thread leaves the page, as in Google Slides."""
+        self.resolve_choice = resolve
+        self.accept()
+
+    def thread_text(self) -> str:
+        """The replies shown, one after the other (for the checks)."""
+        return "\n".join(row["text"] for row in self.reply_rows.values())
+
+    def _show_thread(self, replies: list[tuple[int, str, str, str, str | None]]) -> None:
+        """The replies, each a byline, its words and a menu button: Edit
+        for one's own (as Google Slides: only the writer edits; the owner
+        kept it so, 2026-11-10), Delete."""
+        assert self.thread_view is not None
+        box = QWidget()
+        rows = QVBoxLayout(box)
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(8)
+        self.reply_rows = {}
+        me = os.environ.get("USERNAME", tr("ユーザー"))
+        if getattr(self, "_rich_boxes", None) is not None:
+            # The boxes of replies being edited go with the rows.
+            self._rich_boxes = [box for box in self._rich_boxes if box in (self.body, self.reply_edit)]
+            if self.editor not in self._rich_boxes:
+                self._make_current(self.body)
+        for xref, who, when, said, rich in replies:
+            row = QFrame()
+            row.setObjectName("noteReplyRow")
+            column = QVBoxLayout(row)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(2)
+            head = QHBoxLayout()
+            byline = QLabel(self._byline(who, when))
+            byline.setTextFormat(Qt.RichText)
+            head.addWidget(byline, 1)
+            more = QToolButton()
+            more.setObjectName("noteReplyMenu")
+            more.setText("…")
+            more.setAutoRaise(True)
+            more.setPopupMode(QToolButton.InstantPopup)
+            more.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0; }")
+            more.setToolTip(tr("その他の操作"))
+            menu = QMenu(more)
+            edit = menu.addAction(menu_icon("text"), tr("編集"))
+            edit.setProperty("pdfnoteKey", "編集")
+            edit.setEnabled(who == me and "edit" in self._thread_actions)
+            edit.triggered.connect(lambda _checked=False, x=xref: self._start_reply_edit(x))
+            delete = menu.addAction(menu_icon("delete"), tr("削除"))
+            delete.setProperty("pdfnoteKey", "削除")
+            delete.setEnabled("delete" in self._thread_actions)
+            delete.triggered.connect(lambda _checked=False, x=xref: self._delete_reply(x))
+            more.setMenu(assign_access_keys(menu))
+            head.addWidget(more)
+            column.addLayout(head)
+            # Its formatting shown, as the note's words show theirs.
+            body = QLabel(rich if rich else escape_html(said).replace("\n", "<br>"))
+            body.setTextFormat(Qt.RichText)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            column.addWidget(body)
+            rows.addWidget(row)
+            self.reply_rows[xref] = {
+                "row": row, "body": body, "menu": menu, "edit": edit, "delete": delete,
+                "text": said, "html": rich, "column": column,
+            }
+        rows.addStretch(1)
+        self.thread_view.setWidget(box)
+        self.thread_view.setVisible(bool(replies))
+
+    def _start_reply_edit(self, xref: int) -> None:
+        """The reply's words in a box, with Save and Cancel under it, as
+        Google Slides edits a comment in its place."""
+        entry = self.reply_rows.get(xref)
+        if entry is None or entry.get("editor") is not None:
+            return
+        editor = self._rich_box(entry["html"], entry["text"])
+        editor.setObjectName("noteReplyEditor")
+        editor.setFixedHeight(72)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        save = QPushButton(tr("保存"))
+        cancel = QPushButton(tr("キャンセル"))
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        entry["body"].hide()
+        entry["column"].addWidget(editor)
+        entry["column"].addLayout(buttons)
+        entry["editor"], entry["save"], entry["cancel"] = editor, save, cancel
+        save.clicked.connect(lambda _checked=False: self._finish_reply_edit(xref, True))
+        cancel.clicked.connect(lambda _checked=False: self._finish_reply_edit(xref, False))
+        editor.setFocus(Qt.OtherFocusReason)
+        editor.moveCursor(QTextCursor.End)
+
+    def _finish_reply_edit(self, xref: int, keep: bool) -> None:
+        entry = self.reply_rows.get(xref)
+        if entry is None or entry.get("editor") is None:
+            return
+        text = entry["editor"].toPlainText().strip()
+        rich = self._html_of(entry["editor"])
+        if keep and text and (text != entry["text"] or rich != entry["html"]):
+            replies = self._thread_actions["edit"](xref, text, rich)
+            if replies is not None:
+                self._show_thread(replies)
+                return
+        self._show_thread_as_is()
+
+    def _show_thread_as_is(self) -> None:
+        replies = self._thread_actions.get("list")
+        if replies is not None:
+            self._show_thread(replies())
+
+    def _delete_reply(self, xref: int) -> None:
+        """Delete a reply, after asking, as Google Slides asks."""
+        answer = QMessageBox.question(
+            self, tr("返信を削除"),
+            tr("この返信を削除しますか？"),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        replies = self._thread_actions["delete"](xref)
+        if replies is not None:
+            self._show_thread(replies)
+
+    def reply_text(self) -> str:
+        """The reply typed, or "" (7.9)."""
+        return self.reply_edit.toPlainText().strip() if self.reply_edit is not None else ""
+
+    def reply_html(self) -> str | None:
+        """The reply's HTML, whenever any of it was formatted (7.9)."""
+        if self.reply_edit is None or not self.reply_text():
+            return None
+        return self._html_of(self.reply_edit)
 
     def rich_html(self) -> str | None:
         """The note's HTML, whenever anything was formatted at all.
@@ -12121,9 +13688,7 @@ class StickyNoteEditDialog(RichTextFormatMixin, QDialog):
         the way through would lose its bold, so any formatting at all is
         reason to keep the HTML (5.35).
         """
-        if self.has_mixed_formatting() or self._has_any_formatting():
-            return self.editor.document().toHtml()
-        return None
+        return self._html_of(self.body if hasattr(self, "body") else self.editor)
 
     def _has_any_formatting(self) -> bool:
         block = self.editor.document().begin()
@@ -12157,6 +13722,9 @@ class CropPreview(QWidget):
         # (selected, not yet changed): drawn here as well, a picture with
         # transparent parts came out darker, laid over itself.
         self.page_shows_it = False
+        # How far the picture is turned (7.9): turned, it is drawn by the
+        # box's TurnedPicture, not here.
+        self.turn = 0.0
         self._drag_mode: str | None = None
         self._last_position = QPointF()
         # As small as a picture can be on screen: a preview held larger
@@ -12223,7 +13791,7 @@ class CropPreview(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         if not self.crop_mode:
-            if self.page_shows_it:
+            if self.page_shows_it or self.turn:
                 return
             source = QRectF(
                 self.crop_rect.left() * self.pixmap.width(),
@@ -12319,7 +13887,7 @@ class CropPreview(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class CanvasObjectBox(ResizableCanvasFrame):
+class CanvasObjectBox(PointerDrag, ResizableCanvasFrame):
     deleteRequested = Signal()
     copyRequested = Signal()
 
@@ -12343,7 +13911,6 @@ class CanvasObjectBox(ResizableCanvasFrame):
         layout.addStretch(1)
         self.handle.moveRequested.connect(self._move_by)
         self.handle.moveFinished.connect(self.geometryEdited)
-        self._drag_last_global: QPointF | None = None
         self.setMouseTracking(True)
 
     # A shape's outline lies 2 px inside the border, under the 18 px title
@@ -12386,35 +13953,20 @@ class CanvasObjectBox(ResizableCanvasFrame):
         super().resizeEvent(event)
         self._update_mask()
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._grabs(event.position()):
-            self._drag_last_global = event.globalPosition()
-            self.setCursor(Qt.SizeAllCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    def _drag_accepts(self, event: Any) -> bool:
+        return self._grabs(event.position())
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if self._drag_last_global is not None and event.buttons() & Qt.LeftButton:
-            current = event.globalPosition()
-            delta = current - self._drag_last_global
-            step = QPoint(round(delta.x()), round(delta.y()))
-            if not step.isNull():
-                # What rounding leaves is kept for the next move.
-                self._drag_last_global += QPointF(step)
-                self._move_by(step)
-            event.accept()
-            return
+    def _drag_started(self, event: Any) -> None:
+        self.setCursor(Qt.SizeAllCursor)
+
+    def _drag_step(self, step: QPoint) -> None:
+        self._move_by(step)
+
+    def _drag_ended(self, event: Any) -> None:
+        self.geometryEdited.emit()
+
+    def _pointer_hovers(self, event: Any) -> None:
         self.setCursor(Qt.SizeAllCursor if self._grabs(event.position()) else Qt.ArrowCursor)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.LeftButton and self._drag_last_global is not None:
-            self._drag_last_global = None
-            self.geometryEdited.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
 
     def set_accent_color(self, color: QColor) -> None:
         self.setStyleSheet(
@@ -12428,13 +13980,36 @@ class CanvasObjectBox(ResizableCanvasFrame):
                 f"background:#FFFFFF; border:2px solid {color.name()}; border-radius:1px;"
             )
 
-    def _move_by(self, delta: QPoint) -> None:
-        bounds = self.parentWidget().rect().adjusted(0, 0, -self.width(), -self.height())
-        target = self.pos() + delta
-        target.setX(min(max(bounds.left(), target.x()), max(bounds.left(), bounds.right())))
-        target.setY(min(max(bounds.top(), target.y()), max(bounds.top(), bounds.bottom())))
-        self.move(target)
-        self.geometryEdited.emit()
+
+class TurnedPicture(QWidget):
+    """A turned picture while its box is moved or sized (7.9): drawn turned,
+    about the middle of its box, on the widget the box is on -- the box's
+    own preview is upright and as large as the box, and what it draws is
+    cut off at its edges. The mouse goes through it to the box."""
+
+    def __init__(self, parent: QWidget, preview: "CropPreview") -> None:
+        super().__init__(parent)
+        self.preview = preview
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+
+    def paintEvent(self, _event: Any) -> None:  # noqa: N802 - Qt's name
+        preview = self.preview
+        try:
+            pixmap, crop, size = preview.pixmap, preview.crop_rect, preview.size()
+        except RuntimeError:
+            return  # the box has gone
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.rotate(preview.turn)
+        source = QRectF(
+            crop.left() * pixmap.width(), crop.top() * pixmap.height(),
+            crop.width() * pixmap.width(), crop.height() * pixmap.height(),
+        )
+        painter.drawPixmap(
+            QRectF(-size.width() / 2, -size.height() / 2, size.width(), size.height()), pixmap, source
+        )
 
 
 class CanvasImageBox(CanvasObjectBox):
@@ -12466,9 +14041,66 @@ class CanvasImageBox(CanvasObjectBox):
         # one at its own size, any at a low zoom -- that much larger on the
         # page when it was moved (6.27).
         self.setMinimumSize(QSize(10, 28))
+        self._turned: TurnedPicture | None = None
 
     def content_widget(self) -> QWidget | None:
         return self.preview
+
+    def sync_turned(self) -> None:
+        """Show the picture turned, over the middle of the box, while the
+        box and not the page is what shows it (7.9) -- not while it is
+        cropped, which is done on the upright picture."""
+        preview = self.preview
+        wanted = (
+            bool(preview.turn) and not preview.page_shows_it and not preview.crop_mode and self.isVisible()
+        )
+        if self._turned is not None:
+            try:
+                self._turned.isVisible()
+            except RuntimeError:
+                # Gone with the widget it was on (the pages laid out again).
+                self._turned = None
+        if not wanted:
+            if self._turned is not None:
+                self._turned.hide()
+            return
+        host = self.parentWidget()
+        if host is None:
+            return
+        if self._turned is None:
+            self._turned = TurnedPicture(host, preview)
+            self.destroyed.connect(self._drop_turned)
+        radians = math.radians(preview.turn)
+        cosine, sine = abs(math.cos(radians)), abs(math.sin(radians))
+        width = math.ceil(preview.width() * cosine + preview.height() * sine) + 2
+        height = math.ceil(preview.width() * sine + preview.height() * cosine) + 2
+        middle = preview.mapTo(host, preview.rect().center())
+        self._turned.setGeometry(middle.x() - width // 2, middle.y() - height // 2, width, height)
+        self._turned.show()
+        self._turned.stackUnder(self)
+        self._turned.update()
+
+    def _drop_turned(self, *_args: Any) -> None:
+        turned, self._turned = self._turned, None
+        if turned is not None:
+            try:
+                turned.deleteLater()
+            except RuntimeError:
+                pass  # went with the widget it was on
+
+    def moveEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        super().moveEvent(event)
+        self.sync_turned()
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        super().resizeEvent(event)
+        self.sync_turned()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        super().hideEvent(event)
+        # Hidden is how a box is put away (deleteLater follows): its turned
+        # picture goes now, not when Qt gets round to the box.
+        self._drop_turned()
 
     def _grabs(self, point: QPointF) -> bool:
         """The edge, and -- unless it is being cropped, when the picture
@@ -12553,6 +14185,7 @@ class CanvasImageBox(CanvasObjectBox):
             self.width() + round(width) - before.width(),
             self.height() + round(height) - before.height(),
         )
+        self.sync_turned()
         self.geometryEdited.emit()
         self.cropModeChanged.emit(enabled)
 
@@ -12918,9 +14551,8 @@ class DocumentTabBar(QTabBar):
                     button.setToolTip(tip)
 
     def _show_tab_menu(self, position: QPoint) -> None:
-        if self.owner._premium_blocked(self.owner.PREMIUM_CONTEXT_MENU):
-            return
-        self.build_tab_menu(self.tabAt(position)).exec(self.mapToGlobal(position))
+        menu = self.owner._context_menu_ready(self.build_tab_menu(self.tabAt(position)))
+        menu.exec(self.mapToGlobal(position))
 
     def build_tab_menu(self, index: int) -> QMenu:
         """Chrome-style tab menu -- the tab strip had no right-click at all.
@@ -13063,14 +14695,17 @@ class DocumentTabBar(QTabBar):
             self.owner._transfer_session_from(source, identity, target_index)
         elif mime.hasFormat(self.MIME_DOCUMENT):
             try:
-                document = fitz.open(
-                    stream=bytes(mime.data(self.MIME_DOCUMENT)), filetype="pdf"
-                )
+                payload = bytes(mime.data(self.MIME_DOCUMENT))
+                document = fitz.open(stream=payload, filetype="pdf")
                 # The payload keeps its encryption and carries no password,
                 # so ask, as opening the file would; it arrived locked and
                 # unusable before.
+                # Asked before it is unlocked: read once it is, needs_pass
+                # undoes the unlocking in PyMuPDF 1.28 (7.9) -- the pages go
+                # blank and a save writes streams no one can read.
+                locked = document.needs_pass
                 password = self.owner._unlock_document(document)
-                if document.needs_pass and password is None:
+                if locked and password is None:
                     document.close()
                     event.ignore()
                     return
@@ -13091,6 +14726,11 @@ class DocumentTabBar(QTabBar):
                     dirty=True,
                     needs_full_rewrite=bool(metadata.get("needs_full_rewrite")),
                 )
+                # A signed document stays signed (7.9): it has no file yet,
+                # and Save As writes its signed revision and one update.
+                for key, value in read_signature_state(document, "", password, payload).items():
+                    setattr(session, key, value)
+                session.disk_digest = ""
                 self.owner._insert_transferred_session(session, target_index)
             except Exception:
                 event.ignore()
@@ -13740,7 +15380,7 @@ class OcrDataDownload(QObject):
                         os.fsync(stream.fileno())
                     if received != size or hasher.hexdigest() != digest:
                         raise ValueError(self.CORRUPT)
-                    os.replace(partial, target)
+                    replace_file(partial, target)
                 finally:
                     try:
                         partial.unlink(missing_ok=True)
@@ -14630,6 +16270,8 @@ class OcrMixin:
         """OCR the page on screen, off the UI thread. Tesseract takes
         seconds over a page, and run here it held the window still for
         every one of them."""
+        if not self._signed_gate("content", lambda: self.ocr_current_page()):  # 7.9: a signed PDF
+            return False
         if self.document is None or self._premium_blocked("OCR"):
             return False
         if not self._ocr_language_data_ready(self.ocr_current_page):
@@ -14645,7 +16287,7 @@ class OcrMixin:
         """
         document = session.document
         if document is not None:
-            self._page_characters_cache.pop((id(document), page_index), None)
+            self._page_characters_cache.pop((document_key(document), page_index), None)
         session.dirty = True
         session.revision += 1
         session.state_id = next(DOCUMENT_STATE_IDS)
@@ -14662,6 +16304,8 @@ class OcrMixin:
 
     def ocr_document(self) -> bool:
         """OCR every scanned page, off the UI thread."""
+        if not self._signed_gate("content", lambda: self.ocr_document()):  # 7.9: a signed PDF
+            return False
         if self.document is None or self._premium_blocked("OCR"):
             return False
         if not self._ocr_language_data_ready(self.ocr_document):
@@ -14899,6 +16543,56 @@ class FormTextEditor(QPlainTextEdit):
             self.editingFinished.emit()
 
 
+class FormButtonFocus(QWidget):
+    """Where the keyboard is on a form's check box or radio button: a
+    frame around it, as Acrobat and a browser draw one. Space ticks it,
+    Tab goes on to the next field, Enter or Esc goes back to the page. Tab
+    used to skip these fields, so the keyboard could not tick one (7.9).
+    The mouse goes through it to the box, which a click ticks as before."""
+
+    pressed = Signal()
+    left = Signal()
+    abandoned = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+
+    def paintEvent(self, _event: Any) -> None:  # noqa: N802 - Qt's name
+        painter = QPainter(self)
+        pen = QPen(QColor(COLORS["accent"]), FORM_BUTTON_FOCUS_WIDTH)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        half = FORM_BUTTON_FOCUS_WIDTH / 2
+        painter.drawRect(QRectF(self.rect()).adjusted(half, half, -half, -half))
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        if event.modifiers() in (Qt.NoModifier, Qt.KeypadModifier):
+            if event.key() == Qt.Key_Space:
+                self.pressed.emit()
+                event.accept()
+                return
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.left.emit()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        super().focusOutEvent(event)
+        # A dialog of its own (a signed PDF asks) or another window in
+        # front is not leaving the field.
+        if event.reason() not in (Qt.PopupFocusReason, Qt.ActiveWindowFocusReason):
+            self.abandoned.emit()
+
+
+# The frame's line, and how far it stands off the box it is around.
+FORM_BUTTON_FOCUS_WIDTH = 2
+FORM_BUTTON_FOCUS_MARGIN = 3
+
+
 class FormFieldsMixin:
     """Interactive AcroForm fields: hit testing, editing and clearing.
 
@@ -14936,6 +16630,11 @@ class FormFieldsMixin:
                         "name": widget.field_name,
                         "flags": int(widget.field_flags or 0),
                         "maxlen": int(widget.text_maxlen or 0),
+                        # How the field writes its value, for its editor
+                        # to look the same (7.9).
+                        "fontsize": float(widget.text_fontsize or 0),
+                        "text_color": list(widget.text_color or []),
+                        "fill_color": list(widget.fill_color or []),
                     }
                 )
             except Exception:
@@ -14992,6 +16691,14 @@ class FormFieldsMixin:
             widget = next((w for w in page.widgets() if w.xref == xref), None)
             if widget is None:
                 raise LookupError(f"form field {xref} is not on page {index + 1}")
+            # By the field's whole name, as its editor asked by and as a
+            # signature's lock names it: the name was read from the field's
+            # own /T, which is only the last part for a field inside a group
+            # ("form.Name"), and a locked one was not known for locked
+            # (7.9's review).
+            if not self._signed_edit_allowed("form", str(widget.field_name or "")):
+                # Asked when its editor opened; never written in place (7.9).
+                return "unchanged"
             if int(widget.field_flags or 0) & fitz.PDF_FIELD_IS_READ_ONLY:
                 self.status_label.setText(tr("この欄は読み取り専用です"))
                 return "unchanged"
@@ -15036,16 +16743,124 @@ class FormFieldsMixin:
             fitz.PDF_WIDGET_TYPE_CHECKBOX,
             fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
         ):
+            # A check box has no editor to ask as it opens: asked here. In a
+            # signed PDF that does not allow it, a click on one did nothing
+            # and said nothing (7.9's review).
+            if not self._signed_gate("form", self._again_on_form_field(field), field_name=str(field.get("name") or "")):
+                return False
             return self._toggle_form_check_field(field)
         self._show_form_editor(field)
         return True
 
-    def _show_form_editor(self, field: dict[str, Any]) -> None:
+    def _enter_form_field(self, field: dict[str, Any]) -> None:
+        """The keyboard goes to a field -- by Tab, or by the Fill Form
+        command: a text field or a list opens its editor; a check box or a
+        radio button gets a frame, and Space ticks it. Going to one must
+        not tick it: Fill Form ticked a form's first check box by being
+        run, and unticked it when run again (7.9)."""
+        if field["type"] in (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+            self._show_form_button_focus(field)
+        else:
+            self._show_form_editor(field)
+
+    @staticmethod
+    def _form_colour(parts: list[float], default: str) -> str:
+        """A field's colour -- grey, RGB or CMYK, as a PDF writes one -- as
+        a style sheet names it."""
+        try:
+            values = [min(1.0, max(0.0, float(value))) for value in parts]
+            if len(values) == 1:
+                return QColor.fromRgbF(values[0], values[0], values[0]).name()
+            if len(values) == 3:
+                return QColor.fromRgbF(*values).name()
+            if len(values) == 4:
+                return QColor.fromCmykF(*values).name()
+        except (TypeError, ValueError):
+            pass
+        return default
+
+    def _dress_form_editor(self, editor: QWidget) -> None:
+        """A field's editor looks like the field filled in (7.9, the owner:
+        as other PDF programs show the field being typed in): the field's
+        own background, or the page's white; its own colour and size of
+        text; a border in the accent colour to say where the keyboard is.
+        Firefox's viewer does this -- no background of its own, a 2 px
+        border in the system's highlight colour -- and Acrobat takes its
+        blue tint off the field the cursor is in. The editor took the
+        window's theme: on the dark one, a black box with small white text
+        on a white form."""
+        look = getattr(self, "_active_form_look", None)
+        rect = getattr(self, "_active_form_rect", None)
+        if look is None or rect is None or isinstance(editor, FormButtonFocus):
+            return
+        size, text_colour, fill_colour, lines = look
+        on_screen = self._page_rect_to_screen(rect)
+        scale = on_screen.height() / max(rect.height, 0.1)
+        if size <= 0:
+            # "Auto": as tall as one line of the field allows; 12 pt in a
+            # field of several lines, as MuPDF writes it.
+            size = 12.0 if lines else max(4.0, min(rect.height * 0.7, 24.0))
+        font = QFont(editor.font())
+        font.setPixelSize(max(6, round(size * scale)))
+        editor.setFont(font)
+        kind = "QPlainTextEdit" if isinstance(editor, FormTextEditor) else type(editor).__name__
+        editor.setStyleSheet(
+            f"{kind} {{ background: {self._form_colour(fill_colour, '#FFFFFF')};"
+            f" color: {self._form_colour(text_colour, '#000000')};"
+            f" border: 2px solid {COLORS['accent']}; border-radius: 2px; padding: 0px 1px;"
+            f" selection-background-color: {COLORS['accent']}; selection-color: #FFFFFF; }}"
+        )
+
+    def _form_editor_geometry(self, editor: QWidget, rect: fitz.Rect) -> QRect:
+        """Over its field; the frame of a check box, a little around it.
+        From where the page is drawn on its surface: on a single page the
+        editor stood up and to the left of its field by the surface's
+        margin, 32 by 26 pixels (7.9; the continuous view has none)."""
+        on_screen = self._page_rect_to_screen(rect).translated(self._canvas_image_origin()).toRect()
+        if isinstance(editor, FormButtonFocus):
+            margin = FORM_BUTTON_FOCUS_MARGIN
+            return on_screen.adjusted(-margin, -margin, margin, margin)
+        return on_screen
+
+    def _show_form_button_focus(self, field: dict[str, Any]) -> None:
         if self._refuse_read_only_field(field):
             return
         self._close_form_editor()
+        frame = FormButtonFocus(self._canvas_widget())
+        frame.pressed.connect(self._press_focused_form_button)
+        frame.left.connect(lambda f=frame: self._close_form_editor() if f is self._active_form_editor else None)
+        frame.abandoned.connect(
+            lambda f=frame: self._close_form_editor() if f is self._active_form_editor else None
+        )
+        frame.setGeometry(self._form_editor_geometry(frame, fitz.Rect(field["rect"])))
+        frame.show()
+        frame.raise_()
+        frame.setFocus(Qt.TabFocusReason)
+        self._active_form_editor = frame
+        self._active_form_xref = field["xref"]
+        self._active_form_rect = fitz.Rect(field["rect"])
+        self._active_form_page_index = self.page_index
+
+    def _press_focused_form_button(self) -> None:
+        """Space on the framed check box or radio button: what a click on
+        it does, a signed PDF's question included."""
+        xref = self._active_form_xref
+        index = getattr(self, "_active_form_page_index", None)
+        if self.document is None or xref is None or index is None:
+            return
+        field = next(
+            (f for f in self._page_form_fields(self.document[index]) if f["xref"] == xref), None
+        )
+        if field is not None:
+            self.activate_form_field(field)
+
+    def _show_form_editor(self, field: dict[str, Any]) -> None:
+        if self._refuse_read_only_field(field):
+            return
+        if not self._signed_gate("form", self._again_on_form_field(field), field_name=str(field.get("name") or "")):  # 7.9: a signed PDF
+            return
+        self._close_form_editor()
         canvas = self._canvas_widget()
-        rect = self._page_rect_to_screen(field["rect"])
         xref = field["xref"]
         flags = int(field.get("flags") or 0)
         maximum = int(field.get("maxlen") or 0)
@@ -15091,14 +16906,19 @@ class FormFieldsMixin:
             elif current in choices:
                 editor.setCurrentText(current)
             editor.activated.connect(lambda _index: self._commit_form_editor())
-        editor.setGeometry(rect.toRect().adjusted(0, 0, 0, 0))
+        editor.setGeometry(self._form_editor_geometry(editor, fitz.Rect(field["rect"])))
         editor.setMinimumHeight(20)
-        editor.show()
-        editor.setFocus()
         self._active_form_editor = editor
         self._active_form_xref = xref
         self._active_form_rect = fitz.Rect(field["rect"])
         self._active_form_page_index = self.page_index
+        self._active_form_look = (
+            float(field.get("fontsize") or 0), list(field.get("text_color") or []),
+            list(field.get("fill_color") or []), bool(flags & fitz.PDF_TX_FIELD_IS_MULTILINE),
+        )
+        self._dress_form_editor(editor)
+        editor.show()
+        editor.setFocus()
 
     def _commit_form_editor(self) -> bool:
         """Write the open field editor back. False when that failed: the
@@ -15139,8 +16959,12 @@ class FormFieldsMixin:
         self._active_form_editor = None
         self._active_form_xref = None
         self._active_form_rect = None
+        self._active_form_look = None
         if editor is not None:
             try:
+                # With the keyboard in it, back to the page first: the row
+                # of document tabs took it, where the arrows changed tabs.
+                self._keyboard_back_to_the_page_from(editor)
                 editor.hide()
                 editor.deleteLater()
             except RuntimeError:
@@ -15156,46 +16980,63 @@ class FormFieldsMixin:
             return
         if getattr(self, "_active_form_page_index", -1) != self.page_index:
             return
-        editor.setGeometry(self._page_rect_to_screen(rect).toRect())
+        editor.setGeometry(self._form_editor_geometry(editor, rect))
+        # Its text as large as the page now draws the field's.
+        self._dress_form_editor(editor)
+
+    def _form_tab_order(self) -> list[tuple[int, dict[str, Any]]]:
+        """The fields the keyboard goes through, page by page in reading
+        order: every one that can be filled in, check boxes and radio
+        buttons too (7.9: they were left out, as going to one ticked
+        it)."""
+        order: list[tuple[int, dict[str, Any]]] = []
+        if self.document is None:
+            return order
+        for index in range(len(self.document)):
+            fields = [
+                field for field in self._page_form_fields(self.document[index])
+                if not self._form_field_read_only(field)
+            ]
+            fields.sort(key=lambda field: (round(field["rect"].y0, 1), field["rect"].x0))
+            order.extend((index, field) for field in fields)
+        return order
+
+    def _go_to_form_field(self, page_index: int, field: dict[str, Any]) -> None:
+        if page_index != self.page_index:
+            self.go_to_page(page_index)
+            # Continuous scrolling gives every page its own canvas: without
+            # this the editor is placed on the page that was in front.
+            if self.continuous:
+                self._continuous_page_clicked(page_index)
+            else:
+                self.render_current_page()
+        self._enter_form_field(field)
 
     def _move_to_adjacent_form_field(self, step: int) -> bool:
-        """Tab / Shift+Tab: finish this field and open the next one in
+        """Tab / Shift+Tab: finish this field and go to the next one in
         reading order, the way a form is filled in anywhere else."""
         if self.document is None:
             return False
         current = self._active_form_xref
         self._commit_form_editor()
-        order: list[tuple[int, dict[str, Any]]] = []
-        for index in range(len(self.document)):
-            fields = [
-                field for field in self._page_form_fields(self.document[index])
-                # Buttons toggle when activated; tabbing onto one must not.
-                if field["type"] not in (
-                    fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
-                )
-                and not self._form_field_read_only(field)
-            ]
-            fields.sort(key=lambda field: (round(field["rect"].y0, 1), field["rect"].x0))
-            order.extend((index, field) for field in fields)
+        order = self._form_tab_order()
         if not order:
             return False
         position = next(
             (i for i, (_page, field) in enumerate(order) if field["xref"] == current), -1
         )
-        target_page, target = order[(position + step) % len(order)]
-        if target_page != self.page_index:
-            self.go_to_page(target_page)
-            if self.continuous:
-                self._continuous_page_clicked(target_page)
-            else:
-                self.render_current_page()
-        self.activate_form_field(target)
+        self._go_to_form_field(*order[(position + step) % len(order)])
         return True
 
     def focus_first_form_field(self) -> bool:
         """Menu entry point: jump to the first fillable field in the file."""
         if self.document is None:
             return False
+        order = self._form_tab_order()
+        if order:
+            self._go_to_form_field(*order[0])
+            return True
+        # Only fields that cannot be filled in, or none: said below.
         for index in range(len(self.document)):
             page = self.document[index]
             fields = self._page_form_fields(page)
@@ -15217,6 +17058,8 @@ class FormFieldsMixin:
 
     def clear_all_form_fields(self) -> bool:
         """Empty every fillable field in the document."""
+        if not self._signed_gate("form", lambda: self.clear_all_form_fields(), field_name=""):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         targets: list[tuple[int, int]] = []
@@ -15333,12 +17176,13 @@ class RedactionMixin:
                 continue
         return marks
 
-    def _image_stamps_into_content(self, page: fitz.Page, marks: list[fitz.Rect]) -> int:
+    def _image_stamps_into_content(self, page: fitz.Page, marks: list[fitz.Rect]) -> tuple[int, int]:
         """A picture under a redaction mark goes back into the page's
         content first, so the redaction blanks the part of it under the
         mark, as when every picture was page content -- the annotations
         over a mark are taken away whole, and a picture with them (6.19)."""
         moved = 0
+        failed = 0
         for xref, kind, _name in list(page.annot_xrefs()):
             if kind != fitz.PDF_ANNOT_STAMP:
                 continue
@@ -15352,12 +17196,45 @@ class RedactionMixin:
                 image_xref = self._stamp_image_xref(stamp)
                 if image_xref <= 0:
                     continue
-                page.delete_annot(stamp)
-                page.insert_image(rect, xref=image_xref, keep_proportion=False, overlay=True)
+                angle, upright = self._stamp_turn(stamp)
+                if angle:
+                    # Turned (7.9): drawn turned into a picture as large as
+                    # the box around it, clear at its corners, since the
+                    # page's content takes a picture upright here.
+                    image = self._image_with_alpha(image_xref)
+                    scale = max(image.width() / max(upright.width, 0.1), 0.1)
+                    canvas = QImage(
+                        max(1, round(rect.width * scale)), max(1, round(rect.height * scale)),
+                        QImage.Format_ARGB32,
+                    )
+                    canvas.fill(Qt.transparent)
+                    painter = QPainter(canvas)
+                    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                    painter.translate(canvas.width() / 2, canvas.height() / 2)
+                    painter.rotate(angle)
+                    painter.drawImage(
+                        QRectF(
+                            -upright.width * scale / 2, -upright.height * scale / 2,
+                            upright.width * scale, upright.height * scale,
+                        ),
+                        image,
+                    )
+                    painter.end()
+                    data = self._qimage_png_bytes(canvas)
+                    if not data:
+                        raise ValueError("the turned picture could not be drawn")
+                    page.delete_annot(stamp)
+                    page.insert_image(rect, stream=data, keep_proportion=False, overlay=True)
+                else:
+                    page.delete_annot(stamp)
+                    page.insert_image(rect, xref=image_xref, keep_proportion=False, overlay=True)
                 moved += 1
             except Exception:
-                continue
-        return moved
+                # Counted with what could not be taken out: a picture that
+                # did not reach the page was gone from it, and the redaction
+                # said nothing of it (7.9's review).
+                failed += 1
+        return moved, failed
 
     @staticmethod
     def _remove_content_over_marks(page: fitz.Page, marks: list[fitz.Rect]) -> tuple[int, int]:
@@ -15413,6 +17290,8 @@ class RedactionMixin:
         """Mark the current text selection for redaction. Premium; applying
         or clearing marks already made is not, so nothing marked is left
         unapplied for want of a purchase."""
+        if not self._signed_gate("content", self._again_on_text_selection(self.redact_selection)):  # 7.9: a signed PDF
+            return False
         if self.document is None or self._premium_blocked("墨消し〔名詞〕"):
             return False
         target = self._current_markup_target()
@@ -15432,6 +17311,8 @@ class RedactionMixin:
 
     def redact_page_region(self, page_rect: fitz.Rect) -> bool:
         """Mark an arbitrary rectangle (images included) for redaction."""
+        if not self._signed_gate("content", lambda: self.redact_page_region(page_rect)):  # 7.9: a signed PDF
+            return False
         if self.document is None or self._premium_blocked("墨消し〔名詞〕"):
             return False
         page = self.document[self.page_index]
@@ -15447,6 +17328,8 @@ class RedactionMixin:
     def apply_pending_redactions(self, confirm: bool = True) -> bool:
         """Burn the marked areas out of the document. Irreversible in the
         saved file, so it always asks first."""
+        if not self._signed_gate("content", lambda: self.apply_pending_redactions(confirm)):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         pending = self._pending_redaction_count()
@@ -15481,7 +17364,7 @@ class RedactionMixin:
             for page in self.document:
                 marks = self._redaction_marks(page)
                 if marks:
-                    self._image_stamps_into_content(page, marks)
+                    failed += self._image_stamps_into_content(page, marks)[1]
                     failed += self._remove_content_over_marks(page, marks)[1]
                     page.apply_redactions()
         except Exception as exc:
@@ -15528,9 +17411,11 @@ class RedactionMixin:
             # Nothing to drop: taking a snapshot anyway left an undo step
             # that did nothing.
             return False
+        if not self._signed_gate("annotation", lambda: self.clear_pending_redactions()):  # 7.9's review
+            return False
         removed = 0
         failed = 0
-        self._snapshot_for_edit()
+        checkpoint = self._begin_edit()
         for page in self.document:
             for xref, kind, _name in list(page.annot_xrefs()):
                 if kind != fitz.PDF_ANNOT_REDACT:
@@ -15541,6 +17426,9 @@ class RedactionMixin:
                 except Exception:
                     failed += 1
         if not removed:
+            # Nothing taken: the step of Undo taken for it goes too (7.9's
+            # review) -- it undid nothing.
+            self._rollback_edit(checkpoint)
             if failed:
                 self.status_label.setText(tr("墨消しのマークを削除できませんでした"))
             return False
@@ -15562,6 +17450,50 @@ class RedactionMixin:
                 continue
         return False
 
+    def _open_pdf_paths(self) -> set[str]:
+        """The PDFs open in any pdfNote window, as Windows compares paths."""
+        paths: set[str] = set()
+        for window in list(OPEN_WINDOWS):
+            try:
+                sessions = list(getattr(window, "sessions", []))
+            except RuntimeError:
+                continue
+            for session in sessions:
+                if session.file_path:
+                    paths.add(os.path.normcase(str(Path(session.file_path).resolve())))
+        return paths
+
+    def _refuse_open_pdf(self, *targets: str | Path) -> bool:
+        """A file written from the document -- a sanitized copy, exported
+        pages, the pieces of a split, a print to PDF -- is not put over a PDF
+        open in pdfNote (7.3): Windows refuses to replace a file pdfNote
+        holds open ("Access is denied"), and the open document would no
+        longer be what is on the disk. Print to PDF already refused it; the
+        others went on and failed. True, after saying so, when one is."""
+        open_paths = self._open_pdf_paths()
+        if any(os.path.normcase(str(Path(target).resolve())) in open_paths for target in targets):
+            QMessageBox.warning(
+                self, APP_NAME, tr("開いているPDFには上書きできません。別の名前を指定してください。")
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _write_failure_detail(exc: BaseException) -> str:
+        """The error as a person reads it (7.5): what to do when Windows
+        refused the file -- held open by another app, or by a cloud folder's
+        sync past the retries -- then Windows' own words and the files as
+        they are written. It was Python's text: "[WinError 5] ...", each
+        path in quotes with every backslash doubled."""
+        if isinstance(exc, OSError) and exc.strerror:
+            names = [str(name) for name in (exc.filename, exc.filename2) if name]
+            detail = "\n".join([exc.strerror.strip(), *names])
+        else:
+            detail = str(exc)
+        if isinstance(exc, PermissionError):
+            return tr("ほかのアプリでこのファイルを開いている場合は、閉じてからもう一度お試しください。") + f"\n\n{detail}"
+        return detail
+
     def sanitize_document_copy(
         self, target_path: str | None = None, remove_hidden_text: bool | None = None
     ) -> str | None:
@@ -15574,6 +17506,10 @@ class RedactionMixin:
         target decides with `remove_hidden_text` (default: remove).
         """
         if self.document is None:
+            return None
+        # What is being typed in a text box goes into the copy, as into a
+        # save, an export or the pages written out (7.5): it was left out.
+        if not self._commit_open_edits():
             return None
         if remove_hidden_text is None:
             remove_hidden_text = True
@@ -15593,8 +17529,8 @@ class RedactionMixin:
                     return None
                 remove_hidden_text = answer == QMessageBox.Yes
         if target_path is None:
-            base = Path(self.file_path) if self.file_path else Path.home() / tr("無題.pdf")
-            suggestion = str(base.with_name(tr("{name} (サニタイズ済み)").format(name=base.stem) + ".pdf"))
+            base = self._document_name_path()
+            suggestion = str(base.with_name(f"{base.stem} (sanitized).pdf"))
             selected, _filter = QFileDialog.getSaveFileName(
                 self, tr("サニタイズしたPDFを保存"), suggestion, tr("PDFファイル (*.pdf)")
             )
@@ -15603,6 +17539,8 @@ class RedactionMixin:
             if not selected.lower().endswith(".pdf"):
                 selected += ".pdf"
             target_path = selected
+        if self._refuse_open_pdf(target_path):
+            return None
         session = self._current_session()
         if session is None:
             return None
@@ -15619,7 +17557,6 @@ class RedactionMixin:
                 self, APP_NAME, tr("サニタイズできませんでした。\n\n{error}").format(error=exc)
             )
             return None
-        temp_path: Path | None = None
         try:
             copy.scrub(
                 metadata=True,
@@ -15637,26 +17574,16 @@ class RedactionMixin:
             # scrub() unlinked is really dropped) and keeps its encryption;
             # then swapped in atomically, as every save is.
             data = serialize_document(copy, full_rewrite=True)
-            target = Path(target_path)
-            file_descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
-            )
-            temp_path = Path(temp_name)
-            with os.fdopen(file_descriptor, "wb") as stream:
-                stream.write(data)
-            os.replace(temp_path, target)
-            temp_path = None
+            # Flushed to the disk before it is swapped in, as a save is: it
+            # was not, here alone (7.9's review).
+            write_file_atomically(target_path, data)
         except Exception as exc:
             QMessageBox.critical(
-                self, APP_NAME, tr("サニタイズできませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME,
+                tr("サニタイズできませんでした。\n\n{error}").format(error=self._write_failure_detail(exc)),
             )
             return None
         finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
             try:
                 copy.close()
             except Exception:
@@ -15664,10 +17591,225 @@ class RedactionMixin:
         return target_path
 
 
+    def _protections_to_lift(self) -> list[str]:
+        """What [PDFを復元] can take off the open PDF, as the UI names it:
+        the usage restrictions its author set -- printing, copying,
+        editing... -- and the password it was opened with (7.9, the owner:
+        typed, it may be taken off too). A PDF that cannot be opened is not
+        open, so nothing is ever taken off one the user cannot read."""
+        if self.document is None:
+            return []
+        found = [tr(key) for key in self._restricted_permissions()]
+        # Opened with a password: never needs_pass on the open document,
+        # which undoes its unlocking in PyMuPDF 1.28 (see show_properties).
+        if self.password:
+            found.append(tr("開くためのパスワード"))
+        return found
+
+    def _restrictions_to_lift(self) -> bool:
+        return bool(self._protections_to_lift())
+
+    def _build_restore_dialog(self) -> QDialog:
+        """The question before a restricted PDF is restored (7.9, the
+        owner's decisions of 2026-11-10): its usage restrictions, and the
+        password it was opened with, are lifted in the copy only when the
+        user states, with the check box, that they have the right to. A PDF
+        the user cannot open is not open, so it is never restored. The other
+        way keeps them. The user's own responsibility is said in the text."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("PDFを復元"))
+        layout = QVBoxLayout(dialog)
+        text = QLabel(tr(
+            "このPDFには、次の制限があります：{restrictions}\n\n"
+            "制限を外して復元すると、復元したPDFでは、これらの制限がなくなります。"
+            "開いている元のPDFは変わりません。\n\n"
+            "制限を外せるのは、その権限がある場合だけです。制限を外すことと、"
+            "外したファイルの保存・利用は、利用者ご自身の責任で行ってください。"
+        ).format(restrictions=tr("、").join(self._protections_to_lift())))
+        text.setWordWrap(True)
+        text.setMinimumWidth(460)
+        layout.addWidget(text)
+        attest = QCheckBox(tr(
+            "私は、このPDFの制限を解除し、解除後のファイルを保存・利用する正当な権限を有しています"
+        ), dialog)
+        layout.addWidget(attest)
+        buttons = QDialogButtonBox(dialog)
+        lift = buttons.addButton(tr("制限を外して復元"), QDialogButtonBox.AcceptRole)
+        keep = buttons.addButton(tr("制限を残して復元"), QDialogButtonBox.AcceptRole)
+        cancel = buttons.addButton(tr("キャンセル"), QDialogButtonBox.RejectRole)
+        lift.setEnabled(False)
+        attest.toggled.connect(lift.setEnabled)
+        # Nothing is lifted by a stray Enter.
+        for button in (lift, keep, cancel):
+            button.setAutoDefault(False)
+        dialog.choice = None  # type: ignore[attr-defined]
+
+        def chosen(button: QAbstractButton) -> None:
+            if button is lift and attest.isChecked():
+                dialog.choice = "lift"  # type: ignore[attr-defined]
+                dialog.accept()
+            elif button is keep:
+                dialog.choice = "keep"  # type: ignore[attr-defined]
+                dialog.accept()
+
+        buttons.clicked.connect(chosen)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog._restore_parts = (attest, lift, keep, cancel)  # type: ignore[attr-defined]  # for the tests
+        return dialog
+
+    def restore_document_copy(
+        self, target_path: str | None = None, lift_restrictions: bool | None = None
+    ) -> str | None:
+        """File > PDFを復元 (7.9, the owner's ask): a copy of the document
+        rebuilt from what pdfNote could read of it, for a PDF that is broken
+        -- a damaged table of objects, which MuPDF reads round when it
+        opens the file, a page whose drawing has errors in it, objects
+        nothing uses. The file is rebuilt object by object, every page's
+        drawing read and written out again, and the copy is opened again
+        and every page drawn before it is kept. The open document is left
+        as it is.
+
+        A PDF with usage restrictions or a password asks first
+        (_build_restore_dialog): lifted in the copy only when the user
+        states they have the right to. A caller that names the target says
+        with `lift_restrictions` (default: kept)."""
+        if self.document is None:
+            return None
+        if not self._commit_open_edits():
+            return None
+        if lift_restrictions is None:
+            lift_restrictions = False
+            if target_path is None and self._restrictions_to_lift():
+                dialog = self._build_restore_dialog()
+                try:
+                    if dialog.exec() != QDialog.Accepted or dialog.choice is None:
+                        return None
+                    lift_restrictions = dialog.choice == "lift"
+                finally:
+                    dialog.deleteLater()
+        if target_path is None:
+            base = self._document_name_path()
+            # A name offered for a new file is English in every language
+            # (the owner, 2026-11-10): not a string to translate.
+            suggestion = str(base.with_name(f"{base.stem} (restored).pdf"))
+            selected, _filter = QFileDialog.getSaveFileName(
+                self, tr("復元したPDFを保存"), suggestion, tr("PDFファイル (*.pdf)")
+            )
+            if not selected:
+                return None
+            if not selected.lower().endswith(".pdf"):
+                selected += ".pdf"
+            target_path = selected
+        if self._refuse_open_pdf(target_path):
+            return None
+        session = self._current_session()
+        if session is None:
+            return None
+        copy = None
+        try:
+            copy = fitz.open(stream=serialize_session(session), filetype="pdf")
+            if copy.needs_pass and self.password:
+                copy.authenticate(self.password)
+            # Rebuilt object by object, every page's drawing parsed and
+            # written again (clean), what nothing uses left out -- MuPDF's
+            # "mutool clean -gggg -s"; the marks pdfNote keeps are made
+            # ready for the new numbers, as for a save after redaction.
+            data = serialize_document(copy, full_rewrite=True, password=self.password)
+            if lift_restrictions:
+                data = self._without_restrictions(data)
+            check = fitz.open(stream=data, filetype="pdf")
+            try:
+                if check.needs_pass and self.password:
+                    check.authenticate(self.password)
+                if len(check) != len(copy):
+                    raise RuntimeError(f"{len(check)} of {len(copy)} pages")
+                for page in check:
+                    page.get_pixmap(matrix=fitz.Matrix(0.2, 0.2), alpha=False)
+            finally:
+                check.close()
+            # Flushed to the disk before it is swapped in, as a save is: it
+            # was not, here alone (7.9's review).
+            write_file_atomically(target_path, data)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, APP_NAME,
+                tr("PDFを復元できませんでした。\n\n{error}").format(error=self._write_failure_detail(exc)),
+            )
+            return None
+        finally:
+            if copy is not None:
+                try:
+                    copy.close()
+                except Exception:
+                    pass
+        return target_path
+
+    def _without_restrictions(self, data: bytes) -> bytes:
+        """`data` with its usage restrictions and the password it was opened
+        with taken off (7.9): written without encryption. Only a document
+        the user has opened -- with its password, if it has one -- gets
+        here."""
+        document = fitz.open(stream=data, filetype="pdf")
+        try:
+            if document.needs_pass and not (self.password and document.authenticate(self.password)):
+                raise RuntimeError("the document could not be unlocked")
+            return document.tobytes(garbage=1, deflate=True, encryption=fitz.PDF_ENCRYPT_NONE)
+        finally:
+            document.close()
+
+
 TEXT_MARKUP_ANNOT_TYPES = (
     fitz.PDF_ANNOT_HIGHLIGHT, fitz.PDF_ANNOT_UNDERLINE,
     fitz.PDF_ANNOT_STRIKE_OUT, fitz.PDF_ANNOT_SQUIGGLY,
 )
+
+
+# The angle a text box is turned by (7.0), in degrees clockwise, kept on
+# its mark beside its HTML. The mark's rectangle stays the box's own,
+# unturned, which is what the box opens at again.
+TEXT_BOX_ANGLE_KEY = "SumiAngle"
+
+
+def text_box_angle(annot: Any) -> float:
+    """How far a text box is turned (7.0); 0 for one that is not, and for
+    anything that is not a text box."""
+    try:
+        if annot.type[0] != fitz.PDF_ANNOT_FREE_TEXT:
+            return 0.0
+        kind, value = annot.parent.parent.xref_get_key(annot.xref, TEXT_BOX_ANGLE_KEY)
+    except Exception:
+        return 0.0
+    if kind not in ("float", "real", "int"):
+        return 0.0
+    try:
+        angle = float(value) % 360.0
+    except ValueError:
+        return 0.0
+    return 0.0 if abs(angle) < 0.05 or abs(angle - 360.0) < 0.05 else angle
+
+
+def rotated_bounds(rect: fitz.Rect, angle: float) -> fitz.Rect:
+    """The rectangle that holds `rect` turned by `angle` about its middle."""
+    rect = fitz.Rect(rect)
+    if abs(angle) < 0.05:
+        return rect
+    radians = math.radians(angle)
+    cos, sin = abs(math.cos(radians)), abs(math.sin(radians))
+    width = rect.width * cos + rect.height * sin
+    height = rect.width * sin + rect.height * cos
+    middle_x, middle_y = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
+    return fitz.Rect(
+        middle_x - width / 2, middle_y - height / 2, middle_x + width / 2, middle_y + height / 2
+    )
+
+
+def annotation_frame_rect(annot: fitz.Annot) -> fitz.Rect:
+    """What an annotation covers on the page: its rectangle, or for a
+    turned text box the rectangle round the turned box (7.0)."""
+    angle = text_box_angle(annot)
+    rect = fitz.Rect(annot.rect)
+    return rotated_bounds(rect, angle) if angle else rect
 
 
 def annotation_hit_rect(annot: fitz.Annot) -> fitz.Rect:
@@ -15681,7 +17823,7 @@ def annotation_hit_rect(annot: fitz.Annot) -> fitz.Rect:
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
             return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
-    return fitz.Rect(annot.rect)
+    return annotation_frame_rect(annot)
 
 
 def lines_overlap(a: fitz.Rect, b: fitz.Rect) -> bool:
@@ -15903,6 +18045,7 @@ def mirror_action(menu: QMenu, action: QAction) -> QAction:
 # Icons that point back or forward: flipped when the UI reads right to left.
 DIRECTIONAL_ICON_KINDS = frozenset({
     "page_prev", "page_next", "page_first", "page_last", "undo", "redo", "tab_prev", "tab_next",
+    "level_up", "level_down",
 })
 
 
@@ -16024,13 +18167,14 @@ class ChromeMixin:
         text = self._tooltip_with_keys(short if short is not None else description, action)
         for mode, tool in getattr(self, "edit_actions", {}).items():
             if action is tool and mode in TOOL_COLOR_KINDS:
-                keys = self._marked_shortcuts(action)
-                letter = keys.split(" / ")[0].replace("Alt+", "") if keys else ""
-                if letter:
+                # The first key, from the list itself: it was cut out of the
+                # joined text at " / " (7.9's review).
+                keys = self._marked_shortcut_list(action)
+                if keys:
                     text += "\n" + tr("{description}：{shortcut}").format(
                         description=tr("色の変更"),
                         shortcut=tr("{first}、{then}").format(
-                            first=keys.split(" / ")[0], then=key_text(self.TOOL_COLOUR_KEY)
+                            first=keys[0], then=key_text(self.TOOL_COLOUR_KEY)
                         ),
                     )
                 # What Shift does while drawing (6.12), written where the
@@ -16062,7 +18206,12 @@ class ChromeMixin:
                     description=colour, shortcut=keys
                 )
         if action in self._premium_feature_actions() and self._premium_marks_visible():
-            text += "\n" + tr("{badge} — プレミアム機能").format(badge=PREMIUM_BADGE_TEXT)
+            license_state = getattr(self, "license", None)
+            if license_state is not None and license_state.mode == LicenseState.TRIAL:
+                # Marked, and still working for now (7.5).
+                text += "\n" + tr("{badge} — プレミアム機能（プレミアム無料体験期間中はお使いいただけます）").format(badge=PREMIUM_BADGE_TEXT)
+            else:
+                text += "\n" + tr("{badge} — プレミアム機能").format(badge=PREMIUM_BADGE_TEXT)
         return text
 
     def _shortcut_texts(self, action: QAction) -> list[str]:
@@ -16096,9 +18245,11 @@ class ChromeMixin:
 
     # The one-line form is the only form now; the other name is kept
     # for the places that ask for it.
-    _short_tooltip = _tooltip_with_keys
 
     def _marked_shortcuts(self, action: QAction) -> str:
+        return keys_or(self._marked_shortcut_list(action))
+
+    def _marked_shortcut_list(self, action: QAction) -> list[str]:
         """The action's keys as a tooltip writes them, each Alt key with the
         premium mark until a purchase."""
         portable = [
@@ -16116,7 +18267,7 @@ class ChromeMixin:
             if marks and self._is_premium_key(value):
                 text = f"{text} [{PREMIUM_BADGE_COMPACT_TEXT}]"
             shown.append(text)
-        return " / ".join(shown)
+        return shown
 
     def _create_actions(self) -> None:
         self.act_new = self._action("新規PDF", self.new_blank_document, "Ctrl+N", "新しい空白PDFを作成")
@@ -16135,6 +18286,14 @@ class ChromeMixin:
             "xlsx": self._action("Excel ブック...", lambda: self.export_document("xlsx")),
         }
         self.act_print = self._action("印刷...", self.print_document, "Ctrl+P")
+        # The slide show (7.0), from the page in view: Shift+F5 is
+        # PowerPoint's From Current Slide. Its From Beginning, F5, stays
+        # pdfNote's Refresh (the owner's decision); Home in the show goes
+        # to the first page.
+        self.act_present_current = self._action(
+            "現在のページから発表", lambda _checked=False: self.start_presentation(from_start=False),
+            "Shift+F5",
+        )
         # Alt+Enter, as everywhere in Windows. To Qt the main Enter key is
         # "Return" and only the keypad one "Enter", so bind both.
         self.act_properties = self._action(
@@ -16151,6 +18310,11 @@ class ChromeMixin:
         )
         self.act_shortcuts = self._action("キーボード ショートカット", self.show_shortcuts, "F1")
         self.act_license = self._action("ライセンス情報...", self.show_license_info)
+        # The way to buy premium at any time, the trial included (7.0): the
+        # status bar's button only explained the trial.
+        self.act_buy_premium = self._action(
+            "プレミアムを購入...", lambda _checked=False: self.buy_premium()
+        )
         self.act_about = self._action(
             "{app} について".format(app=APP_NAME), self.show_about
         )
@@ -16200,8 +18364,9 @@ class ChromeMixin:
         self.act_refresh = self._action("更新", self.refresh_view, "F5")
         self.act_first_page = self._action("最初のページ", lambda: self.go_to_page(0), "Ctrl+Home")
         self.act_last_page = self._action("最後のページ", self.go_to_last_page, "Ctrl+End")
-        self.act_next_match = self._action("次の検索結果", self.next_match, "F3")
-        self.act_prev_match = self._action("前の検索結果", self.previous_match, "Shift+F3")
+        # No keys (7.9, the owner): the results list's arrows and its menu.
+        self.act_next_match = self._action("次の検索結果", self.next_match)
+        self.act_prev_match = self._action("前の検索結果", self.previous_match)
         # Ctrl+F6 / Ctrl+Shift+F6: Word's next and previous document window.
         self.act_next_tab = self._action("次のタブ", self.next_tab, ("Ctrl+Tab", "Ctrl+F6"))
         self.act_prev_tab = self._action(
@@ -16274,6 +18439,10 @@ class ChromeMixin:
         self.act_sanitize = self._action(
             "サニタイズしたコピーを保存", lambda: self.sanitize_document_copy()
         )
+        # A copy rebuilt from what could be read (7.9).
+        self.act_restore = self._action(
+            "PDFを復元...", lambda: self.restore_document_copy()
+        )
         # One colour per markup (v5.20), each with its own menu and key.
         # The colour keys match the keys that apply the markup: Alt+H, Alt+U
         # and Alt+K beside Ctrl+H, Ctrl+U and Ctrl+K. The highlight colour
@@ -16310,6 +18479,14 @@ class ChromeMixin:
         # PowerPoint shortcut pages: Ctrl+D duplicates, Ctrl+Shift+] / [
         # move one layer, Ctrl+L / E / R align, Ctrl+Shift+F goes to the font.
         self.act_duplicate = self._action("複製", self.duplicate_selection, "Ctrl+D")
+        # Crop, on the row while a picture is held (2026-11-21, the owner:
+        # "トリミングボタンつけましょう"), as PowerPoint's Picture Format has
+        # it: down while cropping. F2 is its key, handled with the other
+        # keys of what is held (eventFilter): shown, not bound.
+        self.act_crop_image = self._action(
+            "トリミング", lambda _checked=False: self._crop_held_image(toggle=True), keys=("F2",)
+        )
+        self.act_crop_image.setCheckable(True)
         self.act_bring_forward = self._action(
             "前面へ移動", lambda: self._arrange_selected_annotations("forward"), "Ctrl+Shift+]"
         )
@@ -16344,6 +18521,36 @@ class ChromeMixin:
         )
         self.act_focus_font = self._action(
             "フォントを選択", self._focus_text_font, "Ctrl+Shift+F"
+        )
+        # PowerPoint's Align for several objects selected (7.0): their
+        # edges or middles in line with the outermost. The labels are
+        # PowerPoint's; 左揃え and 右揃え are the paragraph's too, so the
+        # objects' carry their role.
+        self.object_align_actions: dict[str, QAction] = {}
+        for edge, label, icon in (
+            ("left", "左揃え〔オブジェクト〕", "obj_align_left"),
+            ("hcenter", "左右中央揃え", "obj_align_hcenter"),
+            ("right", "右揃え〔オブジェクト〕", "obj_align_right"),
+            ("top", "上揃え", "obj_align_top"),
+            ("vcenter", "上下中央揃え", "obj_align_vcenter"),
+            ("bottom", "下揃え", "obj_align_bottom"),
+        ):
+            action = self._action(
+                label, lambda _checked=False, e=edge: self.align_selected_annotations(e)
+            )
+            action.setProperty("pdfnoteIcon", icon)
+            self.object_align_actions[edge] = action
+        # The width, height and angle boxes had no key (7.0); Alt+S and
+        # Alt+Z go to the font size and the zoom the same way. Shift for
+        # W, H and R, which Alt alone already has.
+        self.act_focus_width = self._action(
+            "幅を入力", lambda _checked=False: self._focus_held_size("width"), "Alt+Shift+W"
+        )
+        self.act_focus_height = self._action(
+            "高さを入力", lambda _checked=False: self._focus_held_size("height"), "Alt+Shift+H"
+        )
+        self.act_focus_angle = self._action(
+            "回転角度を入力", lambda _checked=False: self._focus_held_size("angle"), "Alt+Shift+R"
         )
 
         self.edit_action_group = QActionGroup(self)
@@ -16406,6 +18613,21 @@ class ChromeMixin:
             tip="種類と色で絞り込む",
         )
         self.act_object_filter.setCheckable(True)
+        # Excel's key for its filter (7.0): the two filter buttons had none.
+        self.act_writing_filter = self._action(
+            "種類と色で絞り込む", lambda _checked=False: self._toggle_writing_filter(), "Ctrl+Shift+L"
+        )
+        # Beside ＋: the entry's level, up and down, its entries under it
+        # going with it (7.9). Alt+Shift+Left and Right in the outline, as
+        # in Word's outline view; eventFilter reads them there.
+        self.act_outline_promote = self._action(
+            "目次のレベル上げ", lambda _checked=False: self.change_current_outline_level(-1),
+            keys=("Alt+Shift+Left",),
+        )
+        self.act_outline_demote = self._action(
+            "目次のレベル下げ", lambda _checked=False: self.change_current_outline_level(1),
+            keys=("Alt+Shift+Right",),
+        )
         # ＋ under the 目次 tab (6.9).
         self.act_outline_add = self._action(
             "このページを目次に追加",
@@ -16538,6 +18760,7 @@ class ChromeMixin:
         protect_menu.addAction(self.act_apply_redactions)
         protect_menu.addSeparator()
         protect_menu.addAction(self.act_sanitize)
+        menu.addAction(self.act_restore)
         menu.addSeparator()
         menu.addAction(self.act_print)
         menu.addAction(self.act_properties)
@@ -16548,6 +18771,7 @@ class ChromeMixin:
         menu.addAction(self.act_options)
         menu.addSeparator()
         menu.addAction(self.act_shortcuts)
+        menu.addAction(self.act_buy_premium)
         menu.addAction(self.act_license)
         menu.addAction(self.act_about)
         self.file_button.setMenu(menu)
@@ -16759,11 +18983,34 @@ class ChromeMixin:
         else:
             self.status_label.setText(self._document_summary())
 
+    def _document_name_path(self) -> Path:
+        """The document's file -- or, for one not saved yet, the name its tab
+        and title show (an unsigned copy "X (unsigned).pdf", a restored
+        one), else Untitled.pdf at home: what the status bar shows and the
+        names offered for its exports and copies build on. They said
+        "Untitled" for a copy whose tab said "X (unsigned).pdf"
+        (2026-11-21's walk)."""
+        if self.file_path:
+            return Path(self.file_path)
+        session = self._current_session()
+        if session is not None and session.suggested_name:
+            return Path(session.suggested_name)
+        return Path.home() / UNTITLED_FILE_NAME
+
+    def _document_has_name(self) -> bool:
+        """A file, or a name its tab shows: not "Untitled"."""
+        session = self._current_session()
+        return bool(self.file_path or (session is not None and session.suggested_name))
+
+    def _document_display_name(self) -> str:
+        """The document's name as its tab shows it, without the "*"."""
+        return self._document_name_path().name if self._document_has_name() else tr("無題.pdf")
+
     def _document_summary(self) -> str:
         """The status bar's line about the open document: its name, the
         continuous view when it is on, and how many pages it has."""
         count = len(self.document) if self.document is not None else 0
-        name = Path(self.file_path).name if self.file_path else tr("無題.pdf")
+        name = self._document_display_name()
         key = (
             "{name}  •  連続スクロール  •  {count}ページ"
             if getattr(self, "continuous", False)
@@ -16797,13 +19044,8 @@ class ChromeMixin:
         )
         self.zoom_percent_spin.setKeyboardTracking(False)
         select_all_on_first_click(self.zoom_percent_spin.lineEdit())
+        # Its tooltip, with the keys, is _refresh_zoom_box_tooltip's.
         self.zoom_percent_spin.setToolTip(tr("ズーム率を数値で入力"))
-        # Their tooltips followed no language switch: English in every
-        # language, as they were built before the saved language applied.
-        self._i18n_refresh_callbacks.append(
-            # Rebuilt by _refresh_zoom_box_tooltip, which keeps the keys.
-            lambda: None
-        )
         self.zoom_percent_spin.editingFinished.connect(self._zoom_entry_submitted)
         self.zoom_slider = QSlider(Qt.Horizontal)
         self.zoom_slider.setRange(10, 300)
@@ -16898,6 +19140,8 @@ class ChromeMixin:
             self.act_rotate_pdf_page: "page_edit_rotate",
             self.act_extract_page: "page_edit_extract",
             self.act_outline_add: "outline_add",
+            self.act_outline_promote: "level_up",
+            self.act_outline_demote: "level_down",
             self.act_mark_filter: "filter",
             self.act_object_filter: "filter",
             self.act_delete_page: "page_edit_delete",
@@ -16915,7 +19159,9 @@ class ChromeMixin:
             self.act_redact_selection: "redact",
             self.act_apply_redactions: "redact_apply",
             self.act_sanitize: "sanitize",
+            self.act_restore: "repair",
             self.act_duplicate: "duplicate",
+            self.act_crop_image: "crop",
             self.act_bring_to_front: "bring_front",
             self.act_bring_forward: "bring_forward",
             self.act_send_backward: "send_backward",
@@ -16924,6 +19170,8 @@ class ChromeMixin:
             self.act_align_left: "align_left",
             self.act_align_center: "align_center",
             self.act_align_right: "align_right",
+            self.act_present_current: "presentation",
+            **{action: action.property("pdfnoteIcon") for action in self.object_align_actions.values()},
         }
         for action, kind in icons.items():
             action.setIcon(self._ribbon_icon(kind))
@@ -17020,13 +19268,14 @@ class ChromeMixin:
         )
         self.act_finish_text.setEnabled(False)
         self._install_home_icons()
-        self._add_toolbar_widget(toolbar, self._build_file_menu())
+        self._file_toolbar_action = self._add_toolbar_widget(toolbar, self._build_file_menu())
         self._build_toolbar_history_group(toolbar)
         self._build_toolbar_page_group(toolbar)
         self._build_toolbar_clipboard_group(toolbar)
         self._build_toolbar_markup_group(toolbar)
         self._build_toolbar_text_group(toolbar)
         self._build_toolbar_drawing_group(toolbar)
+        self._build_toolbar_situational_group(toolbar)
         self._build_toolbar_view_group(toolbar)
 
     def _build_toolbar_history_group(self, toolbar: QToolBar) -> None:
@@ -17057,8 +19306,14 @@ class ChromeMixin:
         Each is a split button, as Word presents Underline and PowerPoint
         Highlight: pressing it applies the markup, its arrow chooses the
         colour. Each keeps its own colour (v5.20).
+
+        On the row only when there is text for them (7.0), as the font
+        controls are only with a text box: text selected on the page, or a
+        text box or note being typed in. Reading, nobody marks anything up.
         """
-        self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
+        self._markup_actions: list[QAction] = [
+            self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
+        ]
         self.underline_color_button = self._markup_split_button(
             "underline", self.act_unified_underline, LINE_MARKUP_COLORS
         )
@@ -17071,7 +19326,10 @@ class ChromeMixin:
         for button in (
             self.underline_color_button, self.strikeout_color_button, self.markup_color_button,
         ):
-            self._add_toolbar_widget(toolbar, button)
+            self._markup_actions.append(self._add_toolbar_widget(toolbar, button))
+            # A colour chosen with Alt+H, Alt+U or Alt+K and no text to mark:
+            # the buttons go again once their menu closes.
+            button.menu().aboutToHide.connect(self._unpin_markup_controls)
 
     def _build_toolbar_text_group(self, toolbar: QToolBar) -> None:
         """The text box, and the font controls that belong to one.
@@ -17081,8 +19339,14 @@ class ChromeMixin:
         -- the row is shorter the rest of the time.
         """
         self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
-        toolbar.addAction(self.edit_actions["text"])
-        self._set_toolbar_action_width(toolbar, self.edit_actions["text"], 26)
+        # A button of its own, as the drawing tools' are: the dynamic
+        # toolbar hides it while it is not wanted (7.9), and hiding the
+        # action itself would take its keys away too.
+        self.text_tool_button = QToolButton()
+        self.text_tool_button.setDefaultAction(self.edit_actions["text"])
+        self.text_tool_button.setIconSize(QSize(18, 18))
+        self.text_tool_button.setFixedWidth(26)
+        self._text_tool_toolbar_action = self._add_toolbar_widget(toolbar, self.text_tool_button)
         self._text_format_actions: list[QAction] = []
         self.text_font_combo = QComboBox()
         self._fill_font_combo()
@@ -17100,6 +19364,11 @@ class ChromeMixin:
         self.text_font_size.setRange(4, 144)
         self.text_font_size.setDecimals(1)
         self.text_font_size.setValue(12)
+        # A size typed applies when it is entered -- Enter, or leaving the
+        # box -- as the zoom, width, height and angle boxes do (7.9): it
+        # applied at each digit, so Esc could not drop what was typed. The
+        # arrows still apply each step at once.
+        self.text_font_size.setKeyboardTracking(False)
         # As wide as its own text needs (FontSizeSpinBox), not a fixed
         # width: the toolbar puts back a width it noted at the start.
         self.text_font_size.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -17218,12 +19487,13 @@ class ChromeMixin:
         """
         self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
         self._tool_color_buttons: dict[str, QToolButton] = {}
+        self._tool_toolbar_actions: dict[str, QAction] = {}
         for mode in TOOL_COLOR_KINDS:
             button = self._tool_split_button(
                 mode, MARKUP_COLORS if mode == "note" else DRAWING_COLORS
             )
             self._tool_color_buttons[mode] = button
-            self._add_toolbar_widget(toolbar, button)
+            self._tool_toolbar_actions[mode] = self._add_toolbar_widget(toolbar, button)
         self.shape_format_widget = QWidget()
         shape_format_layout = QHBoxLayout(self.shape_format_widget)
         shape_format_layout.setContentsMargins(3, 0, 3, 0)
@@ -17243,9 +19513,15 @@ class ChromeMixin:
             self._i18n_refresh_callbacks.append(lambda w=label, key=label_key: w.setText(tr(key)))
             spin = QDoubleSpinBox()
             spin.setDecimals(1)
-            spin.setToolTip(tr(tooltip_key))
+            # With the key that goes to it (7.0).
+            focus_action = {
+                "幅": "act_focus_width", "高さ": "act_focus_height", "回転": "act_focus_angle",
+            }[label_key]
+            spin.setToolTip(self._tooltip_with_keys(tr(tooltip_key), getattr(self, focus_action)))
             self._i18n_refresh_callbacks.append(
-                lambda w=spin, key=tooltip_key: w.setToolTip(tr(key))
+                lambda w=spin, key=tooltip_key, name=focus_action: w.setToolTip(
+                    self._tooltip_with_keys(tr(key), getattr(self, name))
+                )
             )
             # Applied at each step of the arrows and at Enter, not at each
             # keystroke (6.21); the first click selects the whole value.
@@ -17281,7 +19557,8 @@ class ChromeMixin:
         arrange_layout.addWidget(self._toolbar_separator_widget())
         self._arrange_buttons: dict[QAction, QToolButton] = {}
         for action in (
-            self.act_duplicate, self.act_bring_forward, self.act_send_backward, self.act_delete_selection,
+            self.act_crop_image, self.act_duplicate, self.act_bring_forward, self.act_send_backward,
+            self.act_delete_selection,
         ):
             button = QToolButton()
             button.setDefaultAction(action)
@@ -17291,7 +19568,257 @@ class ChromeMixin:
             arrange_layout.addWidget(button)
             self._arrange_buttons[action] = button
         self.arrange_action = self._add_toolbar_widget(toolbar, self.arrange_widget)
+        # Align, with several selected (7.0): one button, its menu the six.
+        self.align_button = QToolButton()
+        self.align_button.setAutoRaise(True)
+        self.align_button.setIcon(self._ribbon_icon("obj_align_left"))
+        self.align_button.setIconSize(toolbar.iconSize())
+        self.align_button.setPopupMode(QToolButton.InstantPopup)
+        self.align_button.setToolTip(tr("配置〔オブジェクト〕"))
+        self._i18n_refresh_callbacks.append(
+            lambda w=self.align_button: w.setToolTip(tr("配置〔オブジェクト〕"))
+        )
+        align_menu = QMenu(self.align_button)
+        for edge in ("left", "hcenter", "right", None, "top", "vcenter", "bottom"):
+            if edge is None:
+                align_menu.addSeparator()
+            else:
+                align_menu.addAction(self.object_align_actions[edge])
+        self.align_button.setMenu(align_menu)
+        self.align_action = self._add_toolbar_widget(toolbar, self.align_button)
         self._update_shape_format_controls()
+
+    def _build_toolbar_situational_group(self, toolbar: QToolBar) -> None:
+        """Buttons for what the document in view calls for (7.0, the
+        dynamic toolbar): OCR on a page that is only a picture, Fill Form
+        in a document with a form, Apply Redactions while marks wait. They
+        were only in the File menu; they stay there, and keep their keys."""
+        self._situational_separator = self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
+        self._situational_actions: dict[str, QAction] = {}
+        for name, action in (
+            ("ocr", self.act_ocr_page), ("form", self.act_fill_form),
+            ("redact", self.act_apply_redactions),
+        ):
+            toolbar.addAction(action)
+            self._situational_actions[name] = self._compact_toolbar_action(
+                toolbar, action, action.text(), 26
+            )
+        self._ocr_check_key: Any = None
+        self._ocr_check_answer = False
+
+    def _has_form_to_fill(self) -> bool:
+        """Fill Form's button only where a field can be filled in. A
+        signature field alone makes a PDF a form (is_form_pdf), and the
+        button was there on every signed PDF only to say "This PDF has no
+        form fields" (2026-11-21's walk). Asked once per state of the
+        document, and only of one that has fields at all."""
+        if self.document is None or not getattr(self.document, "is_form_pdf", 0):
+            return False
+        session = self._current_session()
+        if session is None:
+            return False
+        # Kept on the tab: a document's id is used again once it is closed.
+        state = getattr(session, "state_id", None)
+        known = getattr(session, "_form_to_fill", None)
+        if known is None or known[0] != state:
+            known = (state, any(
+                self._page_form_fields(self.document[index]) for index in range(len(self.document))
+            ))
+            session._form_to_fill = known
+        return known[1]
+
+    def _current_page_needs_ocr(self) -> bool:
+        """The page in view has (almost) no text: scanned, so OCR is what
+        it wants -- the rule of the notice bar's OCR offer
+        (_page_needs_ocr). Asked once per page and state of the document."""
+        try:
+            if self.document is None or not 0 <= self.page_index < len(self.document):
+                return False
+        except ValueError:
+            return False  # closed
+        session = self._current_session()
+        key = (document_key(self.document), self.page_index, getattr(session, "state_id", None))
+        if key != self._ocr_check_key:
+            self._ocr_check_key = key
+            try:
+                self._ocr_check_answer = self._page_needs_ocr(self.document[self.page_index])
+            except Exception:
+                self._ocr_check_answer = False
+        return self._ocr_check_answer
+
+    def _has_clipboard_selection(self) -> bool:
+        """Is there something Copy and Cut would take: text selected on
+        the page or in a box being typed in, or marks selected or held?"""
+        if self.document is None:
+            return False
+        if self._selected_annotation_xrefs or self._holds_object():
+            box = self._editing_text_box()
+            return box is None or box.editor.textCursor().hasSelection()
+        try:
+            widget = self._text_selection_widget()
+        except Exception:
+            return False
+        return getattr(widget, "text_selection_range", None) is not None
+
+    def _has_something_to_paste(self) -> bool:
+        if self.document is None:
+            return False
+        mime = clipboard_mime()
+        if mime is not None and mime.hasImage():
+            return True
+        try:
+            if self.can_paste_marks():
+                return True
+        except Exception:
+            pass
+        return bool(
+            mime is not None and mime.hasText() and self._editing_text_box() is not None
+        )
+
+    def _update_situational_toolbar(self) -> bool:
+        """The dynamic toolbar's rules for the whole row (7.0): with no
+        document, File alone; Copy and Cut while something is selected,
+        Paste while there is something to paste; and the buttons the
+        document calls for. True when anything came or went."""
+        rows = getattr(self, "_toolbar_row_actions", None)
+        if not rows or not hasattr(self, "_situational_actions"):
+            return False
+        changed = False
+
+        def show(action: QAction | None, wanted: bool) -> None:
+            nonlocal changed
+            if action is not None and action.isVisible() != wanted:
+                action.setVisible(wanted)
+                changed = True
+
+        has_document = self.document is not None
+        hidden: set[QAction] = getattr(self, "_hidden_without_document", set())
+        self._hidden_without_document = hidden
+        own = set(self._situational_actions.values()) | {self._situational_separator}
+        clipboard = {
+            self._compact_actions.get(action) for action in (self.act_copy, self.act_cut, self.act_paste_image)
+        }
+        if not has_document:
+            skip = {getattr(self, "_file_toolbar_action", None)} | self._contextual_toolbar_actions() | own | clipboard
+            for action in rows:
+                if action not in skip and action.isVisible():
+                    action.setVisible(False)
+                    hidden.add(action)
+                    changed = True
+        elif hidden:
+            for action in hidden:
+                action.setVisible(True)
+            hidden.clear()
+            changed = True
+        # A note's window open: Copy and Cut would take the note, not the
+        # words in its window (Ctrl+C does those there) (7.9).
+        selected = self._has_clipboard_selection() and not self._note_editor_open()
+        show(self._compact_actions.get(self.act_copy), selected)
+        show(self._compact_actions.get(self.act_cut), selected)
+        show(self._compact_actions.get(self.act_paste_image), self._has_something_to_paste())
+        try:
+            wanted = {
+                "ocr": has_document and self._current_page_needs_ocr(),
+                "form": has_document and self._has_form_to_fill(),
+                "redact": has_document and self._pending_redaction_count_for_notice() > 0,
+            }
+        except (ValueError, RuntimeError):
+            # A document closed under a tab being put away: nothing to offer.
+            wanted = {"ocr": False, "form": False, "redact": False}
+        for name, action in self._situational_actions.items():
+            show(action, wanted[name])
+        show(self._situational_separator, any(wanted.values()))
+        if has_document:
+            tools = self._insertion_tools_in_play()
+            for name, action in self._insertion_toolbar_actions().items():
+                show(action, tools is None or name in tools)
+            # The sticky note's button: with text selected it puts a note on
+            # the words, so it stays (an empty set); with something held, it
+            # is on the row only for a note. It was left on beside a held
+            # text box, picture or shape, against the same rule (7.9).
+            show(
+                getattr(self, "_tool_toolbar_actions", {}).get("note"),
+                not tools or "note" in tools,
+            )
+        return changed
+
+    def _insertion_toolbar_actions(self) -> dict[str, QAction]:
+        """The toolbar's buttons that put something new on the page -- a
+        picture, a text box, a drawing, a shape -- by the tool's name."""
+        actions = {
+            "image": self._compact_actions.get(self.act_insert_image),
+            "text": getattr(self, "_text_tool_toolbar_action", None),
+            **{
+                mode: getattr(self, "_tool_toolbar_actions", {}).get(mode)
+                for mode in SHAPE_TOOL_KINDS
+            },
+        }
+        return {name: action for name, action in actions.items() if action is not None}
+
+    def _insertion_tools_in_play(self) -> set[str] | None:
+        """Which of the insertion buttons the dynamic toolbar shows (7.9,
+        the owner): with text selected on the page, none -- it is marked
+        up, copied or noted, not drawn on; with objects held or selected,
+        only their own tools (a held rectangle, the rectangle's, whose
+        arrow sets its colour); otherwise -- None -- all of them. The key
+        tips show them all, as they name every one."""
+        if getattr(self, "_keytips_showing_text_format", False) or self.document is None:
+            return None
+        held = self._held_tool_kinds()
+        if held is not None:
+            return held
+        try:
+            widget = self._text_selection_widget()
+        except Exception:
+            return None
+        if getattr(widget, "text_selection_range", None) is not None:
+            return set()
+        return None
+
+    def _held_tool_kinds(self) -> set[str] | None:
+        """The tools that make what is held or selected -- "text", "image",
+        "ink", "rectangle", "arrow", "line", or another word for marks no
+        tool here makes -- or None with nothing held or selected."""
+        kinds: set[str] = set()
+        if self._active_text_box is not None or self._active_text_xref is not None:
+            kinds.add("text")
+        if self._active_image_box is not None:
+            kinds.add("image")
+        if self._note_editor_open():
+            kinds.add("note")
+        xrefs = list(self._selected_annotation_xrefs)
+        if self._active_object_box is not None and self._active_object_xref is not None:
+            xrefs.append(self._active_object_xref)
+        if xrefs:
+            try:
+                page = self.document[self.page_index]
+            except Exception:
+                page = None
+            for xref in xrefs:
+                try:
+                    annotation = page.load_annot(xref) if page is not None else None
+                except Exception:
+                    annotation = None
+                kinds.add(self._tool_kind_of(annotation) if annotation is not None else "other")
+        return kinds or None
+
+    def _tool_kind_of(self, annotation: fitz.Annot) -> str:
+        """The tool that makes an annotation, as _held_tool_kinds names it."""
+        kind = annotation.type[0]
+        subject = str(annotation.info.get("subject") or "")
+        if kind == fitz.PDF_ANNOT_FREE_TEXT:
+            return "text"
+        if kind == fitz.PDF_ANNOT_TEXT:
+            return "note"
+        if self._image_xref_from_annotation(annotation) is not None:
+            return "image"
+        if kind == fitz.PDF_ANNOT_INK:
+            return "ink"
+        if kind == fitz.PDF_ANNOT_LINE:
+            return "arrow" if subject.startswith("SumiArrow") else "line"
+        if kind == fitz.PDF_ANNOT_SQUARE or subject.startswith("SumiShape"):
+            return "rectangle"
+        return "other"
 
     def _build_toolbar_clipboard_group(self, toolbar: QToolBar) -> None:
         """Inserting a picture, and the clipboard: copy, paste, cut."""
@@ -17315,6 +19842,11 @@ class ChromeMixin:
         refresh.
         """
         self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
+        # The slide show (7.0): one button, from the page in view.
+        toolbar.addAction(self.act_present_current)
+        self._compact_toolbar_action(
+            toolbar, self.act_present_current, self.act_present_current.text(), 26
+        )
         toolbar.addAction(self.act_sidebar)
         self._compact_toolbar_action(toolbar, self.act_sidebar, self.act_sidebar.text(), 24)
         for action in (self.act_fit_width, self.act_fit_page):
@@ -17351,7 +19883,16 @@ class ChromeMixin:
             )
         )
         self.facing_cover_checkbox.toggled.connect(self._set_facing_cover_separate)
-        self._facing_cover_checkbox_action = self._add_toolbar_widget(toolbar, self.facing_cover_checkbox)
+        # A line and a space between the two check boxes (7.1): side by
+        # side, the box of 表紙を分ける sat right after the words ページを
+        # 固定 and read as theirs.
+        cover = QWidget()
+        cover_layout = QHBoxLayout(cover)
+        cover_layout.setContentsMargins(6, 0, 0, 0)
+        cover_layout.setSpacing(6)
+        cover_layout.addWidget(self._toolbar_separator_widget())
+        cover_layout.addWidget(self.facing_cover_checkbox)
+        self._facing_cover_checkbox_action = self._add_toolbar_widget(toolbar, cover)
         self._add_toolbar_widget(toolbar, self._toolbar_separator_widget())
         toolbar.addAction(self.act_find)
         self._compact_toolbar_action(toolbar, self.act_find, self.act_find.text(), 24)
@@ -17430,8 +19971,8 @@ class ChromeMixin:
                 if widget is not None:
                     widget_of[action] = widget
 
-        def item_width(action: QAction) -> int:
-            if not action.isVisible():
+        def item_width(action: QAction, resting: bool = False) -> int:
+            if not action.isVisible() and not resting:
                 return 0
             fixed = self._toolbar_action_fixed_widths.get(action)
             if fixed is not None:
@@ -17502,7 +20043,26 @@ class ChromeMixin:
         # pushed the page down each time an object was taken up, under a
         # pointer about to drag it, and up again when it was let go.
         coming_and_going = self._contextual_toolbar_actions()
-        resting = deal(lambda action: 0 if action in coming_and_going else item_width(action))
+        # And the other way round: the buttons that go while something is
+        # held or text is selected -- those that put something new on the
+        # page, the sticky note's -- count as they are with nothing in
+        # hand. Counted as gone, taking up a picture in a narrow window
+        # docked a row fewer and the page jumped up under the pointer, by
+        # the height of a row (7.9; the check of 6.22 found it).
+        stepping_aside = set(self._insertion_toolbar_actions().values())
+        note_button = getattr(self, "_tool_toolbar_actions", {}).get("note")
+        if note_button is not None:
+            stepping_aside.add(note_button)
+        has_document = self.document is not None
+
+        def resting_width(action: QAction) -> int:
+            if action in coming_and_going:
+                return 0
+            if has_document and action in stepping_aside:
+                return item_width(action, resting=True)
+            return item_width(action)
+
+        resting = deal(resting_width)
         docked_rows = max(1, len([bucket for bucket in resting if bucket]))
 
         # Deliberately avoid QToolBar.clear(): it doesn't just detach actions
@@ -17594,7 +20154,8 @@ class ChromeMixin:
         object (6.22), and the arrange group with that or a selection
         (6.24)."""
         actions = set(getattr(self, "_text_format_actions", ()))
-        for name in ("shape_format_action", "arrange_action"):
+        actions.update(getattr(self, "_markup_actions", ()))
+        for name in ("shape_format_action", "arrange_action", "align_action"):
             action = getattr(self, name, None)
             if action is not None:
                 actions.add(action)
@@ -17907,6 +20468,12 @@ class ChromeMixin:
                 continue
         if not editable:
             return
+        # The colour chosen is the tool's from now on either way; what is
+        # selected takes it only where the signers allow (7.9's review).
+        if not self._signed_gate("annotation", self._again_on_marks(
+            lambda: self._recolor_selected_annotations(color, drawing, markup_kind, drawing_kind), editable
+        )):
+            return
         self._snapshot_for_edit()
         page = self.document[self.page_index]
         for xref in editable:
@@ -17946,7 +20513,7 @@ class ChromeMixin:
         menu = self.text_color_button.menu()
         if menu is not None:
             QTimer.singleShot(
-                0,
+                0, self,
                 lambda: menu.popup(
                     self.text_color_button.mapToGlobal(
                         QPoint(0, self.text_color_button.height())
@@ -18005,12 +20572,25 @@ class ChromeMixin:
             self.edit_mode == "text"
             or self._active_text_box is not None
             or self._active_text_xref is not None
-            # A sticky note's editor is open: its text is formatted with
-            # these same buttons (5.36).
+            # A sticky note's editor is open: its words and its replies are
+            # formatted with these same buttons (5.36, 7.9).
             or self._note_editor_open()
             # A font key was pressed: the controls are what was asked for.
             or getattr(self, "_text_format_pinned", False)
             # Or the key tips are up, and one of them names the font size.
+            or getattr(self, "_keytips_showing_text_format", False)
+        )
+
+    def _font_boxes_in_play(self) -> bool:
+        """The font name and size boxes act on a text box only: a note's
+        words take bold, the markup and a colour from the toolbar, not a
+        font or a size (7.9: they were shown with a note's window open,
+        and did nothing)."""
+        return (
+            self.edit_mode == "text"
+            or self._active_text_box is not None
+            or self._active_text_xref is not None
+            or getattr(self, "_text_format_pinned", False)
             or getattr(self, "_keytips_showing_text_format", False)
         )
 
@@ -18023,20 +20603,64 @@ class ChromeMixin:
         except RuntimeError:
             return False
 
+    def _markup_is_in_play(self) -> bool:
+        """Is there text for underline, strikethrough and highlight (7.0)?
+        Text selected on the page, a text box or a note being typed in --
+        or a markup key pressed, or the key tips up, which name them."""
+        if self._rich_text_target() is not None:
+            return True
+        if getattr(self, "_markup_pinned", False) or getattr(self, "_keytips_showing_text_format", False):
+            return True
+        if self.document is None:
+            return False
+        try:
+            widget = self._text_selection_widget()
+        except Exception:
+            return False
+        return getattr(widget, "text_selection_range", None) is not None
+
+    def _unpin_markup_controls(self) -> None:
+        if not getattr(self, "_markup_pinned", False):
+            return
+        self._markup_pinned = False
+        # After the menu has gone: rebuilding the rows under an open menu
+        # closes it.
+        QTimer.singleShot(0, self, self._update_text_format_visibility)
+
     def _update_text_format_visibility(self) -> None:
         """The font controls are there when a text box is.
 
         They do nothing without one, and they are the widest part of the
-        row: the family box alone is 118px.
+        row: the family box alone is 118px. The markup buttons are there
+        when there is text to mark (7.0).
         """
         if self._laying_out_text_format:
             return
         wanted = self._text_box_is_in_play()
+        fonts = wanted and self._font_boxes_in_play()
         changed = False
+        font_boxes = set(getattr(self, "_text_format_actions", ())[:2])
+        # Bold has something to work on only with a box open or a note's
+        # window: with the text tool in hand and no box yet it was on the
+        # row greyed out (7.9, the owner).
+        bold = wanted and (
+            self._rich_text_target() is not None
+            or self._active_text_box is not None
+            # The key tips name every button, Bold's too.
+            or getattr(self, "_keytips_showing_text_format", False)
+        )
         for action in getattr(self, "_text_format_actions", ()):
-            if action.isVisible() != wanted:
-                action.setVisible(wanted)
+            shown = fonts if action in font_boxes else bold if action is self.act_text_bold else wanted
+            if action.isVisible() != shown:
+                action.setVisible(shown)
                 changed = True
+        markup = self._markup_is_in_play()
+        for action in getattr(self, "_markup_actions", ()):
+            if action.isVisible() != markup:
+                action.setVisible(markup)
+                changed = True
+        if self._update_situational_toolbar():
+            changed = True
         if not changed or not getattr(self, "_toolbar_rows", None):
             return
         # Posted, not done here. This runs from _sync_format_action_states,
@@ -18081,6 +20705,12 @@ class ChromeMixin:
         else:
             target = self._current_markup_target()
             states = {"bold": False, "underline": False, "strikeout": False, "highlight": False}
+            if self._active_text_box is not None:
+                # Held as an object: bold when all of its words are.
+                try:
+                    states["bold"] = self._active_text_box.all_bold()
+                except RuntimeError:
+                    pass
             if target is not None:
                 page, line_rects, _count = target
                 for kind, xrefs in self._markup_xrefs_by_kind(page, line_rects).items():
@@ -18119,11 +20749,17 @@ class ChromeMixin:
     def _open_markup_color_menu(self, kind: str = "highlight") -> None:
         button = self._markup_color_buttons()[kind]
         self._select_ribbon_group("H")
+        # The buttons are on the row only with text to mark (7.0): out, for
+        # their menu, until it closes.
+        self._markup_pinned = True
+        self._update_text_format_visibility()
+        if self._text_format_relayout_pending:
+            self._relayout_for_text_format()
         button.setFocus()
         menu = button.menu()
         if menu is not None:
             QTimer.singleShot(
-                0, lambda: menu.popup(button.mapToGlobal(QPoint(0, button.height())))
+                0, self, lambda: menu.popup(button.mapToGlobal(QPoint(0, button.height())))
             )
 
     def _open_drawing_color_menu(self) -> None:
@@ -18137,7 +20773,7 @@ class ChromeMixin:
         menu = button.menu()
         if menu is not None:
             QTimer.singleShot(
-                0,
+                0, self,
                 lambda: menu.popup(button.mapToGlobal(QPoint(0, button.height()))),
             )
 
@@ -18211,8 +20847,15 @@ class CentralUiMixin:
     def _build_navigation_sidebar(self) -> None:
         """The left-hand navigation: pages, contents, results, notes."""
         self.sidebar = QFrame()
+        self.sidebar.setObjectName("navigationSidebar")
         self.sidebar.setMinimumWidth(190)
-        self._themed(self.sidebar, lambda: f"background: {COLORS['sidebar']};")
+        # The frame's own background only: a bare "background:" reached every
+        # widget in it, and a push button there lost its face and looked
+        # like a label (7.9, the owner: 「すべて表示」はボタンには見えない).
+        self._themed(
+            self.sidebar,
+            lambda: f"QFrame#navigationSidebar {{ background: {COLORS['sidebar']}; }}",
+        )
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(0)
@@ -18225,21 +20868,21 @@ class CentralUiMixin:
         title_layout = QHBoxLayout(title_row)
         title_layout.setContentsMargins(10, 4, 5, 1)
         title_layout.setSpacing(4)
-        title = QLabel(tr("ナビゲーション"))
+        title = QLabel(tr("サイド バー"))
         title.setStyleSheet("font-weight: 600; font-size: 13px;")
         title_layout.addWidget(title, 1)
-        self._i18n_refresh_callbacks.append(lambda w=title: w.setText(tr("ナビゲーション")))
+        self._i18n_refresh_callbacks.append(lambda w=title: w.setText(tr("サイド バー")))
         self.sidebar_close_button = QToolButton()
         self.sidebar_close_button.setText("×")
         self.sidebar_close_button.setFixedSize(24, 24)
-        self.sidebar_close_button.setToolTip(tr("ナビゲーションを閉じる ({key}で再表示)").format(
+        self.sidebar_close_button.setToolTip(tr("サイド バーを閉じる ({key}で再表示)").format(
                     key=key_text(self._action_shortcut(self.act_sidebar) or "Alt+B")
                 ))
         self.sidebar_close_button.clicked.connect(self.toggle_sidebar)
         title_layout.addWidget(self.sidebar_close_button)
         self._i18n_refresh_callbacks.append(
             lambda w=self.sidebar_close_button: w.setToolTip(
-                tr("ナビゲーションを閉じる ({key}で再表示)").format(
+                tr("サイド バーを閉じる ({key}で再表示)").format(
                     key=key_text(self._action_shortcut(self.act_sidebar) or "Alt+B")
                 )
             )
@@ -18264,28 +20907,8 @@ class CentralUiMixin:
         self.match_label.setMinimumWidth(40)
         self._themed(self.match_label, lambda: f"color: {COLORS['muted']};")
         search_layout.addWidget(self.match_label)
-        self.nav_prev_match_button = QToolButton()
-        self.nav_prev_match_button.setText("▲")
-        self.nav_prev_match_button.setFixedSize(22, 24)
-        self.nav_prev_match_button.setToolTip(self._tooltip_with_keys(tr("前の検索結果"), self.act_prev_match))
-        self.nav_prev_match_button.clicked.connect(self.previous_match)
-        search_layout.addWidget(self.nav_prev_match_button)
-        self._i18n_refresh_callbacks.append(
-            lambda w=self.nav_prev_match_button: w.setToolTip(
-                self._tooltip_with_keys(tr("前の検索結果"), self.act_prev_match)
-            )
-        )
-        self.nav_next_match_button = QToolButton()
-        self.nav_next_match_button.setText("▼")
-        self.nav_next_match_button.setFixedSize(22, 24)
-        self.nav_next_match_button.setToolTip(self._tooltip_with_keys(tr("次の検索結果"), self.act_next_match))
-        self.nav_next_match_button.clicked.connect(self.next_match)
-        search_layout.addWidget(self.nav_next_match_button)
-        self._i18n_refresh_callbacks.append(
-            lambda w=self.nav_next_match_button: w.setToolTip(
-                self._tooltip_with_keys(tr("次の検索結果"), self.act_next_match)
-            )
-        )
+        # No ▲▼ beside it (7.9, the owner): the results list's arrows and
+        # its right-click menu go from one result to the next.
         sidebar_layout.addWidget(search_row)
         self.tabs = QTabWidget()
         # Its tabs a little closer together than other tab bars': five of
@@ -18356,6 +20979,15 @@ class CentralUiMixin:
         self.outline_add_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.outline_add_button.setAutoRaise(True)
         bar.addWidget(self.outline_add_button)
+        self.outline_level_buttons = []
+        for action in (self.act_outline_promote, self.act_outline_demote):
+            button = QToolButton()
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            button.setAutoRaise(True)
+            bar.addWidget(button)
+            self.outline_level_buttons.append(button)
+        self.outline_tree.currentItemChanged.connect(lambda *_args: self._update_outline_level_actions())
         bar.addStretch(1)
         pane_layout.addLayout(bar)
         pane_layout.addWidget(self.outline_tree, 1)
@@ -18404,13 +21036,9 @@ class CentralUiMixin:
         listing.itemActivated.connect(self._annotation_item_entered)
         # A section's header (6.9) folds; an annotation is selected.
         listing.itemClicked.connect(self._note_item_clicked)
-        # Arrowing through the list selects each annotation on its page, so
-        # Delete, recolouring and Enter act on it without the mouse.
-        listing.currentItemChanged.connect(
-            lambda current, _previous, listing=listing: self._note_item_activated(current)
-            if current is not None and listing.hasFocus()
-            else None
-        )
+        # The arrows only move through the list; Enter goes to the row's
+        # page, as in the outline (7.9, the owner: arrowing jumped to each
+        # annotation in turn). Delete removes the row's annotation.
         listing.setContextMenuPolicy(Qt.CustomContextMenu)
         listing.customContextMenuRequested.connect(
             lambda position, listing=listing: self._show_sidebar_menu(listing, position, "notes")
@@ -18629,7 +21257,14 @@ class CentralUiMixin:
             self.notice_action_button.clicked.disconnect(self._notice_action_slot)
             self._notice_action_slot = None
         if action_label and action is not None:
-            self.notice_action_button.setText(action_label)
+            # A premium action carries the mark as the toolbar's buttons do
+            # (7.2): a button draws no menu badge, so the label's invisible
+            # marker showed nothing and OCR read as free.
+            premium = PREMIUM_MENU_MARK in action_label
+            self.notice_action_button.setText(action_label.replace(PREMIUM_MENU_MARK, ""))
+            self.notice_action_button.setIcon(
+                premium_marked_icon(QIcon(self._ribbon_icon(icon_kind).pixmap(QSize(16, 16)))) if premium else QIcon()
+            )
             self._notice_action_slot = lambda _checked=False: action()
             self.notice_action_button.clicked.connect(self._notice_action_slot)
             self.notice_action_button.show()
@@ -18678,6 +21313,28 @@ class CentralUiMixin:
             )
             return
 
+        current_signed = self._current_session()
+        if current_signed is not None and current_signed.signed_end is not None:
+            key = f"signed:{current_signed.recovery_id}"
+            if key not in self._dismissed_notices:
+                parts = [
+                    tr("このPDFには電子署名があります（{names}）。").format(
+                        names=tr("、").join(current_signed.signed_names)
+                    ) if current_signed.signed_names else tr("このPDFには電子署名があります。")
+                ]
+                if (current_signed.signature_rules or {}).get("docmdp") == 1:
+                    parts.append(tr("変更を許可しない設定で証明されています。"))
+                if current_signed.signed_changed or current_signed.dirty:
+                    parts.append(tr("署名のあとに変更があります。"))
+                self._show_notice(
+                    key,
+                    "lock",
+                    "".join(parts),
+                    tr("署名を外したコピーを作成"),
+                    lambda: self._make_unsigned_copy(),
+                )
+                return
+
         if self._restricted_permissions():
             session = (
                 self.sessions[self.current_session_index]
@@ -18686,7 +21343,7 @@ class CentralUiMixin:
             )
             # Dismissed per document: closing it for one restricted PDF must
             # not hide it for the next one opened in this window.
-            key = f"permissions:{session.recovery_id if session else id(self.document)}"
+            key = f"permissions:{session.recovery_id if session else document_key(self.document)}"
             if key not in self._dismissed_notices:
                 self._show_notice(
                     key,
@@ -18995,6 +21652,33 @@ class CentralUiMixin:
         return container
 
 
+def keys_or(keys: Iterable[str]) -> str:
+    """Key names shown side by side, as each language puts them (6.25: no
+    separator added in the code): "Ctrl+Z / Ctrl+Y". The " / " was added in
+    the code in three places (7.9's review)."""
+    shown = ""
+    for key in keys:
+        shown = key if not shown else tr("{first} / {second}").format(first=shown, second=key)
+    return shown
+
+
+# The boxes the keyboard types into, as the window's own keys see them. A
+# form field of several lines is a QPlainTextEdit, which was not among them
+# (7.9's review): Ctrl+Z typed there undid the document instead of what was
+# typed, Ctrl+Y redid it, Ctrl+X cut the page's selection.
+TEXT_INPUT_TYPES = (QLineEdit, QTextEdit, QPlainTextEdit)
+
+
+def text_input_can(box: Any, step: str) -> bool:
+    """Has the box something of its own to undo ("undo") or redo ("redo")?
+    QLineEdit says so itself; the others through their document (QTextEdit
+    has no isUndoAvailable: asked, it raised)."""
+    if isinstance(box, QLineEdit):
+        return box.isUndoAvailable() if step == "undo" else box.isRedoAvailable()
+    document = box.document()
+    return document.isUndoAvailable() if step == "undo" else document.isRedoAvailable()
+
+
 class KeyboardMixin:
     """Key handling groups and Office-style Alt key tips."""
 
@@ -19032,19 +21716,19 @@ class KeyboardMixin:
             and event.modifiers() == Qt.ControlModifier
             and event.key() in (Qt.Key_Left, Qt.Key_Right)
             and not is_text_input
-            and not self._page_caret_is_showing()
             and self._navigation_tabs_reachable()
         ):
-            # From the page as well as from the pane, and without taking
-            # the focus: the page stays the active pane (5.34; was
-            # Shift+arrow, and only while the pane itself was active).
+            # From the page as well as from the pane; and the sidebar takes
+            # the keyboard, its list ready for the arrows (7.9, the owner:
+            # the page stayed active, 5.34, and the arrows went on turning
+            # its pages).
             #
-            # The one thing these keys already did is the page's
-            # word-by-word text cursor, which is only reachable while
-            # that cursor is showing -- F7, or a click into the text --
-            # and that case is left to it. In a text field or a text box
-            # they stay what they are in any text field.
+            # With the page's text cursor showing (F7) too: they moved it
+            # word by word and kept the sidebar out of reach (7.9, the
+            # owner). In a text field or a text box they stay what they are
+            # in any text field.
             self._switch_navigation_tab(-1 if event.key() == Qt.Key_Left else 1)
+            self._focus_navigation_pane()
             event.accept()
             return True
         if not text_box_editing and event.modifiers() == Qt.ShiftModifier and event.key() in (
@@ -19080,7 +21764,8 @@ class KeyboardMixin:
 
     def _key_press_caret(self, event: QEvent) -> bool:
         """Arrows, Home and End move the text cursor on the page; with
-        Shift they extend the selection, with Ctrl they go word by word."""
+        Shift they extend the selection, with Ctrl+Shift word by word (Ctrl
+        alone, Left and Right, is the sidebar's since 7.9)."""
         key = event.key()
         if key not in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End):
             return False
@@ -19090,6 +21775,12 @@ class KeyboardMixin:
         by_word = bool(modifiers & Qt.ControlModifier)
         # Ctrl+Up/Down stay zoom, Ctrl+Home/End the first and last page.
         if by_word and key not in (Qt.Key_Left, Qt.Key_Right):
+            return False
+        # Ctrl+Left/Right switch the sidebar's tabs, with the text cursor
+        # showing too (7.9, the owner: they went word by word after F7 and
+        # the sidebar could not be reached); Ctrl+Shift+Left/Right still
+        # select word by word.
+        if by_word and not modifiers & Qt.ShiftModifier:
             return False
         if self.document is None or not self._main_view_has_focus():
             return False
@@ -19149,6 +21840,9 @@ class KeyboardMixin:
         ):
             event.accept()
             return True
+        if self._sidebar_controls_key(event, focus):
+            event.accept()
+            return True
         if self._notice_bar_key(event, focus):
             event.accept()
             return True
@@ -19175,14 +21869,26 @@ class KeyboardMixin:
             event.accept()
             return True
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            in_list = isinstance(focus, (QListWidget, QTreeWidget))
-            if event.modifiers() == Qt.ShiftModifier and self.search_hits and not in_list:
-                self.previous_match()
-                event.accept()
-                return True
+            # The results are walked in their list, by its arrows, and from
+            # its right-click menu only (7.9, the owner): Enter and
+            # Shift+Enter no longer step through them, nor F3.
             if event.modifiers() == Qt.NoModifier:
                 if focus is self.search_edit:
                     self._search_entered()
+                    event.accept()
+                    return True
+                if (
+                    isinstance(focus, QAbstractSpinBox)
+                    and self.document is not None
+                    and self._focus_in_chrome(focus)
+                ):
+                    # A number box of the toolbar -- zoom, width, height,
+                    # angle, font size: Enter applies what was typed and
+                    # goes back to the page, or to the words being typed,
+                    # as Enter in the page number box does (7.9, the
+                    # owner). The keyboard stayed in the box.
+                    focus.interpretText()
+                    self._focus_main_view()
                     event.accept()
                     return True
                 if (
@@ -19192,20 +21898,14 @@ class KeyboardMixin:
                 ):
                     event.accept()
                     return True
-                # In a list, Enter opens the item (see the itemActivated
-                # handlers) rather than jumping to the next search result.
-                if self.search_hits and not is_text_input and not in_list:
-                    self.next_match()
-                    event.accept()
-                    return True
         if event.modifiers() == Qt.ControlModifier and event.key() in (
             Qt.Key_Z,
             Qt.Key_Y,
             Qt.Key_X,
         ):
             if is_text_input:
-                target = focus if isinstance(focus, (QLineEdit, QTextEdit)) else watched
-                if isinstance(target, (QLineEdit, QTextEdit)):
+                target = focus if isinstance(focus, TEXT_INPUT_TYPES) else watched
+                if isinstance(target, TEXT_INPUT_TYPES):
                     # A box with nothing of its own to undo hands the key
                     # on to the document. The page number box, the zoom
                     # box and the search box all keep the keyboard after
@@ -19214,8 +21914,8 @@ class KeyboardMixin:
                     passes_on = (
                         self._active_text_box is None
                         and (
-                            (event.key() == Qt.Key_Z and not target.isUndoAvailable())
-                            or (event.key() == Qt.Key_Y and not target.isRedoAvailable())
+                            (event.key() == Qt.Key_Z and not text_input_can(target, "undo"))
+                            or (event.key() == Qt.Key_Y and not text_input_can(target, "redo"))
                         )
                     )
                     if not passes_on:
@@ -19276,6 +21976,9 @@ class KeyboardMixin:
                 self._keyboard_menu_opened_at = time.monotonic()
                 event.accept()
                 return True
+        if self._list_widens_selection(focus, event):
+            # The page list's own: see eventFilter (2026-11-21).
+            return False
         if event.modifiers() != Qt.NoModifier or event.key() in self.FUNCTION_KEYS:
             combination = event.keyCombination()
             if combination.key() == Qt.Key_Backtab:
@@ -19308,9 +22011,25 @@ class KeyboardMixin:
                 event.accept()
                 return True
             if self.document is not None and self._focus_in_chrome(focus):
-                # Leaving a toolbar box: back to the page, and Esc then does
-                # what it does there -- it has always cancelled the tool.
+                # Leaving a toolbar box: back to the page -- to the words
+                # being typed, in a text box -- and nothing else (7.9, the
+                # owner). Esc went on to do what it does on the page: from
+                # the width box it let go of the shape that was held, and
+                # from the font size box it ended the typing. What was
+                # typed in the box and not entered is dropped, not applied
+                # as the keyboard leaves it.
+                if isinstance(focus, QAbstractSpinBox):
+                    focus.setValue(focus.value())
+                in_a_box = isinstance(focus, (QAbstractSpinBox, QLineEdit, QComboBox)) or isinstance(
+                    focus.parent(), (QAbstractSpinBox, QComboBox)
+                )
                 self._focus_main_view()
+                if in_a_box:
+                    event.accept()
+                    return True
+                # From a button of the toolbar -- the tool's own, say, just
+                # clicked -- Esc still does what it does on the page: it
+                # cancels the tool at once, as it always has.
             if self._active_image_box is not None and self._active_image_box.crop_mode:
                 # PowerPoint-style: Esc ends cropping and keeps it. A second
                 # Esc falls through and puts the picture back.
@@ -19338,6 +22057,14 @@ class KeyboardMixin:
             event.accept()
             return True
         if event.key() == Qt.Key_F2 and not event.modifiers():
+            if self._active_image_box is not None and not is_text_input:
+                # F2 crops the held picture and F2 again ends the crop, as
+                # the picture's box has said since 6.16 ("Cropping is a
+                # command -- the right-click menu, or F2 on the selected
+                # picture"); F2 did nothing to it (2026-11-21's walk).
+                self._crop_held_image(toggle=True)
+                event.accept()
+                return True
             if self._active_text_box is not None:
                 self._set_text_box_mode(
                     "object" if self._active_text_box_mode == "editing" else "editing"
@@ -19348,11 +22075,83 @@ class KeyboardMixin:
                 event.accept()
                 return True
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not event.modifiers():
+            pane = self._writing_pane_of(focus)
+            if pane is not None:
+                # The row the list is on, not whatever the page holds: the
+                # arrows no longer select on the page (7.9).
+                self._delete_listed_annotation()
+                event.accept()
+                return True
             if not is_text_input and self._has_edit_selection():
                 self.delete_selected_annotations()
                 event.accept()
                 return True
         return False
+
+    def _list_widens_selection(self, widget: Any, event: QEvent) -> bool:
+        """Shift and a moving key in the page list: the list's own, to widen
+        the selection (2026-11-21)."""
+        return (
+            widget is getattr(self, "thumbnail_list", None)
+            and event.modifiers() == Qt.ShiftModifier
+            and event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown)
+        )
+
+    def _welcome_entries(self) -> list[QWidget]:
+        """The start screen's buttons, in the order the keys go through
+        them: Open, New, then the recent files from the top (2026-11-21,
+        the owner)."""
+        if self.document is not None:
+            return []
+        entries = [getattr(self, "welcome_open_button", None), getattr(self, "welcome_new_button", None)]
+        entries += list(getattr(self, "_recent_buttons", []))
+        return [entry for entry in entries if entry is not None and entry.isVisible()]
+
+    def _key_press_welcome(
+        self, watched: Any, event: QEvent, focus: Any, is_text_input: bool
+    ) -> bool | None:
+        """The start screen with the keys (2026-11-21, the owner: "フォルダ
+        開くボタン→新規pdf→最近使ったファイルの順に選択していけるようにして
+        enterを押せばそれが開けるようにしてください"): the arrows go from one
+        to the next, Tab too, and Enter opens the one chosen. Space already
+        pressed it; Enter did nothing, and the recent files came after the
+        status bar's buttons."""
+        if event.modifiers() not in (Qt.NoModifier, Qt.KeypadModifier):
+            return False
+        entries = self._welcome_entries()
+        if focus not in entries:
+            return False
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            focus.click()
+            event.accept()
+            return True
+        step = {Qt.Key_Down: 1, Qt.Key_Right: 1, Qt.Key_Up: -1, Qt.Key_Left: -1}.get(key)
+        if step is None:
+            return False
+        index = entries.index(focus) + step
+        if 0 <= index < len(entries):
+            entries[index].setFocus(Qt.TabFocusReason)
+            self._reveal_welcome_entry(entries[index])
+        event.accept()
+        return True
+
+    def _reveal_welcome_entry(self, entry: QWidget) -> None:
+        """Scrolled to, on a short window."""
+        area = entry.parentWidget()
+        while area is not None and not isinstance(area, QScrollArea):
+            area = area.parentWidget()
+        if isinstance(area, QScrollArea):
+            area.ensureWidgetVisible(entry)
+
+    def _focus_welcome(self) -> None:
+        """Open chosen as the start screen comes up -- at the start and once
+        every tab is closed -- so Enter opens a file straight away
+        (2026-11-21, the owner: "開いた直後はフォルダ開くボタンが選択されていて
+        いきなりenterを押せばフォルダが開くようにしてください")."""
+        button = getattr(self, "welcome_open_button", None)
+        if self.document is None and button is not None and button.isVisible():
+            button.setFocus(Qt.OtherFocusReason)
 
     def _key_press_keytips(
         self, watched: Any, event: QEvent, focus: Any, is_text_input: bool
@@ -19396,17 +22195,6 @@ class KeyboardMixin:
             and widget is not None
             and (widget is container or container.isAncestorOf(widget))
         )
-
-    def _page_caret_is_showing(self) -> bool:
-        """Is the page's own text cursor in play?
-
-        Ctrl+Left/Right walks it word by word, and that only happens
-        while it is showing and the keyboard is talking to the page.
-        """
-        if self.document is None or not self._main_view_has_focus():
-            return False
-        widget = self._canvas_widget()
-        return getattr(widget, "caret_position", None) is not None
 
     def _navigation_tabs_reachable(self) -> bool:
         """No point switching a tab nobody can see."""
@@ -19460,6 +22248,97 @@ class KeyboardMixin:
         self._focus_navigation_pane()
         return True
 
+    def _sidebar_control_rows(self) -> list[list[QWidget]]:
+        """The buttons and boxes over the list of the sidebar's tab shown,
+        row by row as they stand: the filter button, and with the filter
+        open its kinds, its colours and すべて選択・すべてクリア, over
+        文字装飾 and オブジェクト; ［＋］ and the level buttons over the
+        outline."""
+        target = self.tabs.currentWidget()
+        if isinstance(target, WritingPane):
+            rows = [[target.filter_button]]
+            if target.filter_panel.isVisible():
+                for boxes, columns in ((list(target.kind_boxes.values()), 2), (list(target.color_boxes.values()), 3)):
+                    rows.extend(boxes[index:index + columns] for index in range(0, len(boxes), columns))
+                rows.append([target.select_all_button, target.clear_all_button])
+        elif target is getattr(self, "outline_pane", None):
+            rows = [[self.outline_add_button, *self.outline_level_buttons]]
+        else:
+            return []
+        rows = [
+            [widget for widget in row if widget.isVisibleTo(target) and widget.isEnabled()]
+            for row in rows
+        ]
+        return [row for row in rows if row]
+
+    def _list_at_its_top(self, listing: QWidget) -> bool:
+        """Is the list on its first row, or on none?"""
+        if isinstance(listing, QTreeWidget):
+            item = listing.currentItem()
+            return item is None or listing.itemAbove(item) is None
+        if isinstance(listing, QListWidget):
+            row = listing.currentRow()
+            return row < 0 or not any(
+                not listing.item(above).isHidden() for above in range(row)
+            )
+        return False
+
+    def _sidebar_controls_key(self, event: QEvent, focus: QWidget | None) -> bool:
+        """The arrows and Enter over the list of a sidebar tab (7.9, the
+        owner): Up from the list's first row reaches the filter button (or
+        ［＋］ over the outline); Enter there opens the filter, whose boxes
+        and buttons the four arrows walk as they stand and Enter ticks or
+        presses; Down from the last row of them goes back into the list,
+        Up from the first to the search box. Tab still goes to the page."""
+        if event.modifiers() & ~Qt.KeypadModifier or self.document is None:
+            return False
+        key = event.key()
+        if key not in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right, Qt.Key_Return, Qt.Key_Enter):
+            return False
+        if not self._widget_in(getattr(self, "sidebar", None), focus):
+            return False
+        rows = self._sidebar_control_rows()
+        if not rows:
+            return False
+        listing = self._navigation_listing()
+        if focus is listing:
+            if key == Qt.Key_Up and self._list_at_its_top(listing):
+                rows[-1][0].setFocus(Qt.ShortcutFocusReason)
+                return True
+            return False
+        place = next(
+            ((row, column) for row, widgets in enumerate(rows)
+             for column, widget in enumerate(widgets) if widget is focus),
+            None,
+        )
+        if place is None:
+            return False
+        row, column = place
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if isinstance(focus, QToolButton) and focus.defaultAction() is not None:
+                focus.defaultAction().trigger()
+            else:
+                focus.click()
+            if focus.isVisible():
+                focus.setFocus(Qt.ShortcutFocusReason)
+            return True
+        if key in (Qt.Key_Left, Qt.Key_Right):
+            step = 1 if key == Qt.Key_Right else -1
+            if self.layoutDirection() == Qt.RightToLeft:
+                step = -step
+            widgets = rows[row]
+            widgets[max(0, min(len(widgets) - 1, column + step))].setFocus(Qt.ShortcutFocusReason)
+            return True
+        row += 1 if key == Qt.Key_Down else -1
+        if row < 0:
+            self.search_edit.setFocus(Qt.ShortcutFocusReason)
+            self.search_edit.selectAll()
+        elif row >= len(rows):
+            self._focus_navigation_list()
+        else:
+            rows[row][min(column, len(rows[row]) - 1)].setFocus(Qt.ShortcutFocusReason)
+        return True
+
     def _focus_in_chrome(self, focus: QWidget | None) -> bool:
         """Is the keyboard on the toolbar, status bar or document tabs --
         not on the page, the navigation pane or the notice bar?"""
@@ -19470,16 +22349,30 @@ class KeyboardMixin:
             for name in ("viewer_stack", "sidebar", "notice_bar")
         )
 
+    def _navigation_listing(self) -> QWidget | None:
+        """The list of the sidebar's tab shown. The 目次 tab is the ＋
+        button over the outline (6.9), and 文字装飾 and オブジェクト have a
+        filter bar over theirs (6.14): the tab itself is no list, and the
+        keys that went into it -- Down from the search box, Tab, and Ctrl+Left
+        and Ctrl+Right -- reached no list there (7.9, the owner's report)."""
+        target = self.tabs.currentWidget()
+        if target is getattr(self, "outline_pane", None):
+            return self.outline_tree
+        if isinstance(target, WritingPane):
+            return target.listing
+        return target
+
     def _focus_navigation_pane(self) -> None:
         if not self.sidebar.isVisible():
             self.toggle_sidebar()
-        target = self.tabs.currentWidget()
-        if target is not None:
-            target.setFocus(Qt.TabFocusReason)
+        if not self._focus_navigation_list():
+            target = self.tabs.currentWidget()
+            if target is not None:
+                target.setFocus(Qt.TabFocusReason)
 
     def _focus_navigation_list(self) -> bool:
         """Down from the search box moves into the list below it."""
-        target = self.tabs.currentWidget()
+        target = self._navigation_listing()
         if not isinstance(target, (QListWidget, QTreeWidget)):
             return False
         target.setFocus(Qt.TabFocusReason)
@@ -19491,6 +22384,11 @@ class KeyboardMixin:
         return True
 
     def _focus_main_view(self) -> None:
+        show = getattr(self, "_presentation", None)
+        if show is not None and show.sidebar_shown():
+            # Back from the sidebar the show has borrowed: to the show (7.9).
+            show.back_to_the_page()
+            return
         box = self._editing_text_box()
         if box is not None:
             box.editor.setFocus(Qt.TabFocusReason)
@@ -19498,6 +22396,20 @@ class KeyboardMixin:
         target = self.viewer_stack.currentWidget() if hasattr(self, "viewer_stack") else None
         if target is not None:
             target.setFocus(Qt.TabFocusReason)
+
+    def _keyboard_back_to_the_page_from(self, widget: QWidget) -> None:
+        """Before something on the page is hidden: with the keyboard in it,
+        the keyboard goes back to the page. Hiding the widget that has the
+        focus lets Qt pass it to the next in line -- the row of document
+        tabs after a form's field, a toolbar button after a text box
+        finished with Ctrl+Enter -- where the arrows then did something
+        else, until Esc or a click (7.9's walk through the app)."""
+        focus = QApplication.focusWidget()
+        if focus is not widget and (focus is None or not widget.isAncestorOf(focus)):
+            return
+        target = self.viewer_stack.currentWidget() if hasattr(self, "viewer_stack") else None
+        if target is not None:
+            target.setFocus(Qt.OtherFocusReason)
 
     def _notice_buttons(self) -> list[QWidget]:
         return [
@@ -19709,11 +22621,6 @@ class KeyboardMixin:
         scale = self._render_scale
         if isinstance(widget, ClickablePageLabel):
             scale = self._continuous_labels.get(widget, (0, scale))[1]
-        pages = set(self._spread_indices()) | {self.page_index}
-        before = {
-            index: {xref for xref, _kind, _name in self.document[index].annot_xrefs()}
-            for index in pages
-        }
         if mode == "rectangle":
             widget._emit_gesture(mode, QRectF(point.x(), point.y(), 120 * scale, 72 * scale))
         else:
@@ -19721,13 +22628,7 @@ class KeyboardMixin:
             widget._emit_gesture(
                 mode, (QPointF(point), QPointF(point.x() + 120 * scale, point.y()))
             )
-        page = self.document[self.page_index]
-        added = [
-            xref for xref, _kind, _name in page.annot_xrefs()
-            if xref not in before.get(self.page_index, set())
-        ]
-        if added:
-            self._open_canvas_object_box(page.load_annot(added[-1]))
+        # Held by the gesture itself, as one drawn with the mouse is (7.9).
         return True
 
     @staticmethod
@@ -19802,6 +22703,8 @@ class KeyboardMixin:
         """Move the current page to position `target`: the keyboard's way
         to do what dragging a thumbnail does. (No buttons: the separate
         page-move buttons were removed earlier, see _test_removed_controls.)"""
+        if not self._signed_gate("pages", lambda: self._reorder_current_page(target)):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         source = self.page_index
@@ -19899,7 +22802,7 @@ class KeyboardMixin:
             ("1", self.act_single_page, tr("単ページ表示")),
             ("2", self.act_facing_pages, tr("見開き表示")),
             ("3", self.act_fix_page, tr("ページを固定")),
-            ("B", self.act_sidebar, tr("ナビゲーション")),
+            ("B", self.act_sidebar, tr("サイド バー")),
             ("J", self.act_focus_page, tr("ページ番号へ移動")),
             ("Z", self.act_focus_zoom, tr("ズーム率を入力")),
         ]
@@ -19954,20 +22857,10 @@ class KeyboardMixin:
         # The zoom box is the same idea: it keeps its own description --
         # being given a key tip would otherwise replace it -- and names the
         # key that goes to it and the ones that zoom.
-        self.zoom_percent_spin.setToolTip(
-            "\n".join(
-                [self._tooltip_with_keys(tr("ズーム率を数値で入力"), self.act_focus_zoom)]
-                + [
-                    tr("{description}：{shortcut}").format(description=tr(label), shortcut=keys)
-                    for label, keys in (
-                        ("拡大", self._marked_shortcuts(self.act_zoom_in)),
-                        ("縮小", self._marked_shortcuts(self.act_zoom_out)),
-                    )
-                    if keys
-                ]
-            )
-        )
-        self._i18n_refresh_callbacks.append(self._refresh_zoom_box_tooltip)
+        # Made again here at every language change (_retranslate_ui): the
+        # same lines stood here a second time, and a call of them was added
+        # to the list of things to refresh at every change (7.9's review).
+        self._refresh_zoom_box_tooltip()
         self.text_font_size.setToolTip(
             "\n".join(
                 [self.act_focus_text_size.toolTip()]
@@ -19984,7 +22877,7 @@ class KeyboardMixin:
         self._rebuild_shortcut_action_map()
 
     def _refresh_zoom_box_tooltip(self) -> None:
-        """Rebuilt on a language change, like every other tooltip."""
+        """The zoom box's tooltip, with the keys that zoom (_setup_keytips)."""
         self.zoom_percent_spin.setToolTip(
             "\n".join(
                 [self._tooltip_with_keys(tr("ズーム率を数値で入力"), self.act_focus_zoom)]
@@ -20037,12 +22930,31 @@ class KeyboardMixin:
         label = QLabel(text, self)
         label.setToolTip(tooltip)
         label.setAlignment(Qt.AlignCenter)
+        # Every key tip is an Alt key shortcut, a premium feature: while the
+        # marks show, each carries the "P" badge (7.7, the owner's ask; 5.28
+        # had left it off). The badge is inside the tip, in room its padding
+        # keeps, so the two move, stack and stay inside the window as one.
+        badge_side = 0
+        if self._premium_marks_visible():
+            badge_side = max(9, QFontMetrics(label.font()).height() - 2)
         label.setStyleSheet(
             f"background:{COLORS['keytip']}; color:{COLORS['keytip_text']};"
             f" border:1px solid {COLORS['keytip_border']}; border-radius:3px;"
-            "font-weight:700; padding:2px 5px;"
+            f"font-weight:700; padding:2px {5 + (badge_side + 3 if badge_side else 0)}px 2px 5px;"
         )
         label.adjustSize()
+        if badge_side:
+            badge = QLabel(label)
+            badge.setObjectName("keytipPremiumBadge")
+            badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            badge.setStyleSheet("background: transparent; border: none; padding: 0;")
+            ratio = max(1.0, label.devicePixelRatioF())
+            picture = premium_compact_badge(badge_side * ratio)
+            picture.setDevicePixelRatio(ratio)
+            badge.setPixmap(picture)
+            badge.resize(badge_side, badge_side)
+            badge.move(label.width() - badge_side - 4, (label.height() - badge_side) // 2)
+            label.setToolTip(tooltip + "\n" + tr("{badge} — プレミアム機能").format(badge=PREMIUM_BADGE_TEXT))
         home = self._keytip_home(label.size(), position)
         label.setProperty("keytipHome", home)
         geometry = QRect(home, label.size())
@@ -20083,10 +22995,8 @@ class KeyboardMixin:
             self._relayout_for_text_format()
         QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
         hidden_index = 0
-        # No badge on the key tips (v5.28). *Every* Alt chord is premium in
-        # limited mode, so a mark on each of the twenty-odd tips separates
-        # nothing and buries the letters it is there to show. Pressing any of
-        # them gives the guidance, which is where the explanation belongs.
+        # Each tip carries the premium badge while the marks show
+        # (_new_keytip_label, 7.7).
         for key, action, description in self._direct_alt_shortcuts:
             position = self._action_anchor(action)
             if position is None:
@@ -20117,6 +23027,7 @@ class KeyboardMixin:
             self.act_focus_page: self.page_edit,
             self.act_focus_zoom: self.zoom_percent_spin,
             self.act_fix_page: self.fix_page_checkbox,
+            self.edit_actions["text"]: self.text_tool_button,
             **{
                 self.edit_actions[kind]: button
                 for kind, button in getattr(self, "_tool_color_buttons", {}).items()
@@ -20172,18 +23083,28 @@ class KeyboardMixin:
             # key tips.
             self._keytip_colour_kind = None
             self._hide_keytips()
-            if self._premium_blocked("Alt キーのショートカット"):
-                return
+            # The offer names the keys (7.2).
+            self._premium_alt_pressed = (letter, tr("色の変更"))
+            try:
+                if self._premium_blocked("Alt キーのショートカット"):
+                    return
+            finally:
+                self._premium_alt_pressed = None
             self._open_tool_color_menu(waiting)
             return
         self._keytip_colour_kind = None
         target = self._direct_alt_by_key.get(key)
         if target is None:
             return
-        action, _description = target
+        action, description = target
         self._hide_keytips()
-        if self._premium_blocked("Alt キーのショートカット"):
-            return
+        # The offer names the key and what it does (7.2).
+        self._premium_alt_pressed = (key_text(f"Alt+{key}"), description)
+        try:
+            if self._premium_blocked("Alt キーのショートカット"):
+                return
+        finally:
+            self._premium_alt_pressed = None
         if action.isEnabled():
             action.trigger()
         # A drawing tool leaves one tip behind: its colour.
@@ -20216,7 +23137,7 @@ class KeyboardMixin:
             return
         button.setFocus()
         QTimer.singleShot(
-            0, lambda: menu.popup(button.mapToGlobal(QPoint(0, button.height())))
+            0, self, lambda: menu.popup(button.mapToGlobal(QPoint(0, button.height())))
         )
 
 
@@ -20347,7 +23268,7 @@ class SessionsMixin:
         pending_page_scroll, self._pending_page_scroll = self._pending_page_scroll, None
         if pending_page_scroll is not None:
             QTimer.singleShot(
-                0,
+                0, self,
                 lambda offset=pending_page_scroll: self._apply_viewer_scroll(
                     self.scroll_area, offset
                 ),
@@ -20391,6 +23312,29 @@ class SessionsMixin:
             -1,
         )
 
+    def _show_tab_after_removal(self, index: int, front: DocumentSession | None) -> None:
+        """A tab has gone from `index` (and from self.sessions): which one is
+        in front now. `front` is the session the window still shows, None
+        when that is the one that went.
+
+        The tab in front stays in front, as in any browser: closing a tab
+        behind it -- its close button, the middle button, the tab's menu --
+        or dragging one out brought another document to the front, and the
+        one that had been there came back at the page it was last left on,
+        not the one being read (7.9's review)."""
+        self._switching_tabs = True
+        try:
+            if front is not None and front in self.sessions:
+                kept = self.sessions.index(front)
+                self.current_session_index = kept
+                self.document_tabs.setCurrentIndex(kept)
+                return
+            next_index = min(index, len(self.sessions) - 1)
+            self.document_tabs.setCurrentIndex(next_index)
+        finally:
+            self._switching_tabs = False
+        self._load_session(next_index)
+
     def _take_session(self, index: int) -> DocumentSession | None:
         """Remove a tab without closing its PDF so another window can adopt it."""
         if not (0 <= index < len(self.sessions)):
@@ -20398,6 +23342,7 @@ class SessionsMixin:
         if index == self.current_session_index:
             self._finish_active_overlays()
         self._capture_current_session()
+        front = self._current_session()
         self._cancel_view_jobs()
         session = self.sessions.pop(index)
         self._switching_tabs = True
@@ -20412,11 +23357,7 @@ class SessionsMixin:
             # leave an empty husk window behind.
             self.close()
         else:
-            next_index = min(index, len(self.sessions) - 1)
-            self._switching_tabs = True
-            self.document_tabs.setCurrentIndex(next_index)
-            self._switching_tabs = False
-            self._load_session(next_index)
+            self._show_tab_after_removal(index, front if front is not session else None)
         return session
 
     def _insert_transferred_session(
@@ -20506,11 +23447,13 @@ class SessionsMixin:
         if not 0 <= index < len(self.sessions):
             return 0
         keep = self.sessions[index]
+        front = self._current_session()
         closed = 0
         for position in range(len(self.sessions) - 1, index, -1):
             if self._close_session(position):
                 closed += 1
-        if keep in self.sessions:
+        # The tab in front stays there, unless it was one of those closed.
+        if front not in self.sessions and keep in self.sessions:
             self.document_tabs.setCurrentIndex(self.sessions.index(keep))
         return closed
 
@@ -20524,6 +23467,10 @@ class SessionsMixin:
             self.status_label.setText(tr("編集を確定できなかったためタブを閉じませんでした"))
             return False
         session = self.sessions[index]
+        # The session the window shows, to stay in front if it is not the
+        # one being closed (_show_tab_after_removal).
+        front = self._current_session()
+        back: DocumentSession | None = None
         if ask_save and session.dirty:
             answer = SaveChangesDialog(
                 self, session.title.replace(" *", "")
@@ -20532,9 +23479,19 @@ class SessionsMixin:
                 return False
             if answer == SaveChangesDialog.SAVE:
                 if index != self.current_session_index:
+                    # Saving works on the tab in front: this one comes
+                    # forward for it, and the one that was there comes back
+                    # afterwards, as it was left.
                     self._capture_current_session()
+                    self._switching_tabs = True
+                    self.document_tabs.setCurrentIndex(index)
+                    self._switching_tabs = False
                     self._load_session(index)
-                if not self.save_document():
+                    if not self.save_document():
+                        return False
+                    # Loaded again below, once this tab has gone.
+                    back, front = front, None
+                elif not self.save_document():
                     return False
         self._cancel_view_jobs()
         self._clear_recovery_snapshot(session)
@@ -20550,12 +23507,14 @@ class SessionsMixin:
             self.current_session_index = -1
             self._clear_active_document()
             self.document_tabs_toolbar.hide()
-        else:
-            next_index = min(index, len(self.sessions) - 1)
+        elif back is not None and back in self.sessions:
+            target = self.sessions.index(back)
             self._switching_tabs = True
-            self.document_tabs.setCurrentIndex(next_index)
+            self.document_tabs.setCurrentIndex(target)
             self._switching_tabs = False
-            self._load_session(next_index)
+            self._load_session(target)
+        else:
+            self._show_tab_after_removal(index, front if front is not session else None)
         return True
 
     def next_tab(self) -> None:
@@ -20589,10 +23548,24 @@ class SessionsMixin:
 
     def open_document(self, file_path: str, quiet: bool = False) -> bool:
         path = str(Path(file_path).resolve())
-        for index, session in enumerate(self.sessions):
-            if session.file_path and str(Path(session.file_path).resolve()) == path:
-                self.document_tabs.setCurrentIndex(index)
-                return True
+        # A file open already -- in this window or another, its name in any
+        # case, as Windows names files -- is shown where it is, as Word does
+        # (7.5). Opened twice, one copy held the file and the other's save
+        # was refused by Windows, or the later save silently won.
+        wanted = os.path.normcase(path)
+        for window in [self, *[other for other in list(OPEN_WINDOWS) if other is not self]]:
+            try:
+                sessions = list(window.sessions)
+            except (RuntimeError, AttributeError):
+                continue
+            for index, session in enumerate(sessions):
+                if session.file_path and os.path.normcase(str(Path(session.file_path).resolve())) == wanted:
+                    window.document_tabs.setCurrentIndex(index)
+                    if window is not self:
+                        window.showNormal() if window.isMinimized() else None
+                        window.raise_()
+                        window.activateWindow()
+                    return True
         if not Path(path).is_file():
             if not quiet:
                 # Windows stops at MAX_PATH here, and so does MuPDF: the file
@@ -20632,19 +23605,10 @@ class SessionsMixin:
             if quiet:
                 new_document.close()
                 return False
-            while True:
-                password, accepted = QInputDialog.getText(
-                    self,
-                    tr("パスワードが必要です"),
-                    tr("このPDFを開くためのパスワードを入力してください。"),
-                    QLineEdit.Password,
-                )
-                if not accepted:
-                    new_document.close()
-                    return False
-                if new_document.authenticate(password):
-                    break
-                QMessageBox.warning(self, APP_NAME, tr("パスワードが正しくありません。"))
+            password = self._unlock_document(new_document)
+            if password is None:
+                new_document.close()
+                return False
         if len(new_document) == 0:
             new_document.close()
             if not quiet:
@@ -20653,11 +23617,16 @@ class SessionsMixin:
 
         self.settings.add(path)
         self._rebuild_welcome()
-        shrink = self._shrink_on_open(new_document, path, password)
+        signature = read_signature_state(new_document, path, password)
+        # A signed document is not tidied on opening: that would change what
+        # was signed (7.9, D4).
+        shrink = None if signature else self._shrink_on_open(new_document, path, password)
         session = DocumentSession(
             document=new_document, file_path=path, password=password, dirty=shrink is not None
         )
         session.shrink_estimate = shrink
+        for key, value in signature.items():
+            setattr(session, key, value)
         self._append_session(session)
         self.status_label.setText(
             tr_n("{name}  •  {count}ページ", len(new_document)).format(
@@ -20690,16 +23659,18 @@ class SessionsMixin:
             return before, after
         return None
 
-    def _unlock_document(self, document: fitz.Document) -> str | None:
-        """Ask for the password of a locked document. None when it is not
-        locked or the user gave up."""
+    def _unlock_document(self, document: fitz.Document, prompt: str | None = None) -> str | None:
+        """Ask for the password of a locked document, until one opens it.
+        None when it is not locked or the user gave up. The one place that
+        asks (7.9's review: opening a file and restoring a recovery copy
+        each had this loop of their own)."""
         if not document.needs_pass:
             return None
         while True:
             password, accepted = QInputDialog.getText(
                 self,
                 tr("パスワードが必要です"),
-                tr("このPDFを開くためのパスワードを入力してください。"),
+                prompt or tr("このPDFを開くためのパスワードを入力してください。"),
                 QLineEdit.Password,
             )
             if not accepted:
@@ -20746,8 +23717,13 @@ class SessionsMixin:
         self.setWindowTitle(APP_NAME)
         self.status_label.setText(tr("PDFファイルを開いてください"))
         self._update_controls()
+        # The last document's notice ("This page has no text...", its OCR
+        # button) stayed over the start screen once every tab was closed
+        # (2026-11-21's walk).
+        self.update_document_notices()
         self._rebuild_welcome()
         self.viewer_stack.setCurrentWidget(self.welcome)
+        self._focus_welcome()
 
 
 class RenderingMixin:
@@ -20840,13 +23816,16 @@ class RenderingMixin:
         return max(0.08, min(8.0, self.zoom_percent / 100.0 * 96.0 / 72.0))
 
     def _invalidate_render_cache(self, page_index: int | None = None) -> None:
+        show = getattr(self, "_presentation", None)
+        if show is not None:
+            show.document_changed()
         if page_index is None or self.document is None:
             self._render_cache.clear()
             self._render_cache_bytes = 0
             self._page_characters_cache.clear()
             self._text_selection_boxes_cache.clear()
             return
-        document_id = id(self.document)
+        document_id = document_key(self.document)
         for key in list(self._render_cache):
             if key[0] == document_id and key[1] == page_index:
                 image = self._render_cache.pop(key)
@@ -20945,7 +23924,7 @@ class RenderingMixin:
         thumbnails draw the page as it is."""
         if self.document is None:
             return
-        key = (id(self.document), page_index)
+        key = (document_key(self.document), page_index)
         self._screen_hidden.setdefault(key, {})[xref] = (
             fitz.Rect(cover) if cover is not None else None,
             content,
@@ -20956,7 +23935,7 @@ class RenderingMixin:
     def _show_on_screen(self, page_index: int, xref: int) -> None:
         if self.document is None:
             return
-        key = (id(self.document), page_index)
+        key = (document_key(self.document), page_index)
         hidden = self._screen_hidden.get(key)
         if not hidden or xref not in hidden:
             return
@@ -21042,9 +24021,9 @@ class RenderingMixin:
         if self.document is None:
             return QImage()
         page = self.document[page_index]
-        hidden = self._screen_hidden.get((id(self.document), page_index)) or {}
+        hidden = self._screen_hidden.get((document_key(self.document), page_index)) or {}
         key = (
-            id(self.document), page_index, round(scale * 10_000), round(ratio * 1_000),
+            document_key(self.document), page_index, round(scale * 10_000), round(ratio * 1_000),
             self.extra_rotation,
             tuple(sorted(
                 (xref, tuple(cover or ()), content or 0)
@@ -21261,7 +24240,7 @@ class RenderingMixin:
         self._select_current_thumbnail()
         displayed_zoom = int(round(scale * 72 / 96 * 100))
         self._set_zoom_readout(displayed_zoom)
-        name = Path(self.file_path).name if self.file_path else tr("無題.pdf")
+        name = self._document_display_name()
         page_text = (
             tr("ページ {start}-{end}/{total}").format(
                 start=indices[0] + 1, end=indices[-1] + 1, total=len(self.document)
@@ -21315,7 +24294,7 @@ class RenderingMixin:
     def _continuous_signature(self) -> tuple[object, ...]:
         viewport = self.continuous_scroll_area.viewport().size()
         return (
-            id(self.document),
+            document_key(self.document),
             len(self.document) if self.document is not None else 0,
             self.page_layout,
             self.facing_cover_separate,
@@ -21398,6 +24377,12 @@ class RenderingMixin:
         )
         kept = [bar.value() for bar in bars]
         if was_visible:
+            # With the keyboard on one of its pages, hiding the column let Qt
+            # pass it on: to the File button when a PDF was opened, to the
+            # row of tabs when one was left or closed -- in the default view,
+            # where the arrows and Page Down then did not move the page
+            # (Windows, 1.1.1).
+            self._keyboard_back_to_the_page_from(container)
             container.hide()
         try:
             self._fill_continuous_layout(carried)
@@ -21409,7 +24394,7 @@ class RenderingMixin:
             self._unpark_canvas_boxes(parked)
         self._continuous_layout_signature = signature
         QTimer.singleShot(
-            0,
+            0, self,
             lambda offset=old_scroll, place=anchor: (
                 self._apply_continuous_anchor(offset[0], place)
                 if place is not None
@@ -21420,7 +24405,7 @@ class RenderingMixin:
         self._update_controls()
         self.status_label.setText(
             tr_n("{name}  •  連続スクロール  •  {count}ページ", len(self.document)).format(
-                name=Path(self.file_path).name if self.file_path else tr("無題.pdf"),
+                name=self._document_display_name(),
                 count=len(self.document),
             )
         )
@@ -21496,8 +24481,10 @@ class RenderingMixin:
                 self._layout_active_object_box()
 
             relayout()
-            # The column is laid out once it is shown again.
-            QTimer.singleShot(0, relayout)
+            # The column is laid out once it is shown again. Bound to the
+            # window, as every timer that calls back into it: one fired
+            # after the window had gone ended pdfNote (6.32).
+            QTimer.singleShot(0, self, relayout)
         if orphaned:
             self._finish_active_overlays()
 
@@ -21685,8 +24672,28 @@ class RenderingMixin:
             return
         timer.start(70)
 
+    def _continuous_column_is_current(self) -> bool:
+        """Was the column of pages built for the document shown, as many
+        pages as it has? Built for another document, or for this one before
+        pages came or went, its pages' numbers name pages that are not
+        there: the passes run by the timer after scrolling read them, and
+        ended in an error nothing handled (7.9's review -- a new document,
+        a page deleted, in the scrolling view). They wait for the column to
+        be built again."""
+        if self.document is None or not getattr(self, "_continuous_labels", None):
+            return True
+        # Unset when the pages have changed (_refresh_after_document_change)
+        # with the old column still there.
+        built = self._continuous_layout_signature
+        return built is not None and tuple(built[:2]) == (
+            document_key(self.document), len(self.document)
+        )
+
     def _render_visible_continuous_pages(self) -> None:
         if self.document is None or not self.continuous or not hasattr(self, "_continuous_labels"):
+            return
+        if not self._continuous_column_is_current():
+            self.schedule_render(immediate=True)
             return
         scrollbar = self.continuous_scroll_area.verticalScrollBar()
         top = scrollbar.value()
@@ -22130,12 +25137,106 @@ class RenderingMixin:
 
 
 class NavigationMixin:
+    def start_presentation(self, from_start: bool = False) -> "PresentationWindow | None":
+        """The document over the whole screen, page by page (7.0), from the
+        page shown (or the first). When it ends, the window shows the page
+        it ended on, as PowerPoint does, and asks whether to keep what was
+        drawn."""
+        if self.document is None:
+            return None
+        self._finish_active_overlays()
+        self._hide_keytips()
+        show = PresentationWindow(self, 0 if from_start else self.page_index)
+        self._presentation = show
+        show.ended.connect(self._presentation_ended)
+        show.start()
+        return show
+
+    def _presentation_ended(self, page_index: int, ink: Any = None) -> None:
+        self._presentation = None
+        try:
+            if self.document is not None and 0 <= page_index < len(self.document):
+                self.go_to_page(page_index)
+            self.activateWindow()
+        except RuntimeError:
+            return
+        if ink:
+            # After the show, as PowerPoint asks: keep what was drawn?
+            QTimer.singleShot(0, self, lambda drawn=ink: self._offer_to_keep_ink(drawn))
+
+    def _offer_to_keep_ink(self, ink: dict[int, list[tuple[str, list[QPointF]]]]) -> bool:
+        """PowerPoint's question at the end of a show with ink (7.0), in
+        its words: kept, the strokes become freehand drawings on their
+        pages -- one step of undo; discarded, they are gone."""
+        if self.document is None:
+            return False
+        box = QMessageBox(QMessageBox.Question, tr("発表"), tr("インクを保持しますか?"),
+                          QMessageBox.NoButton, self)
+        keep = box.addButton(tr("保持"), QMessageBox.AcceptRole)
+        discard = box.addButton(tr("破棄"), QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(discard)
+        self._last_ink_box = box  # for the tests: exec() never returns offscreen
+        box.exec()
+        if box.clickedButton() is not keep:
+            return False
+        return self._write_presentation_ink(ink)
+
+    def _write_presentation_ink(self, ink: dict[int, list[tuple[str, list[QPointF]]]]) -> bool:
+        """Each stroke as a freehand drawing on its page: the pen red and
+        thin, the highlighter yellow, wide and see-through. The points were
+        taken as fractions of the page as shown, turned as it is. A
+        signed PDF that does not allow it has them written into its
+        unsigned copy: the show is over, so there was no doing it again
+        there, and what was kept was lost (2026-11-21's walk)."""
+        if not self._signed_gate("annotation", lambda: self._write_presentation_ink(ink)):  # 7.9: a signed PDF
+            return False
+        if self.document is None:
+            return False
+        self._snapshot_for_edit()
+        written = 0
+        for page_index, strokes in ink.items():
+            if not 0 <= page_index < len(self.document):
+                continue
+            page = self.document[page_index]
+            shown = page.rect
+            to_page = page.derotation_matrix
+            for mode, points in strokes:
+                stroke = [
+                    tuple(fitz.Point(shown.x0 + point.x() * shown.width, shown.y0 + point.y() * shown.height) * to_page)
+                    for point in points
+                ]
+                if len(stroke) < 2:
+                    continue
+                annot = page.add_ink_annot([stroke])
+                if mode == "highlighter":
+                    colour = PRESENTATION_HIGHLIGHTER_COLOR
+                    annot.set_border(width=PRESENTATION_HIGHLIGHTER_WIDTH_PT)
+                    annot.set_opacity(PRESENTATION_HIGHLIGHTER_OPACITY)
+                else:
+                    colour = PRESENTATION_PEN_COLOR
+                    annot.set_border(width=PRESENTATION_PEN_WIDTH_PT)
+                annot.set_colors(stroke=(colour.redF(), colour.greenF(), colour.blueF()))
+                annot.update()
+                written += 1
+            self._invalidate_render_cache(page_index)
+        if not written:
+            return False
+        self._mark_dirty()
+        self._invalidate_notes()
+        self.schedule_render(immediate=True)
+        return True
+
     """Moving between pages, zoom, view modes, and the sidebar's lists."""
 
     def go_to_page(self, page_index: int) -> None:
         if self.document is None:
             return
         target = max(0, min(page_index, len(self.document) - 1))
+        show = getattr(self, "_presentation", None)
+        if show is not None:
+            # A page chosen in the sidebar the show has borrowed (7.9).
+            show.follow_window(target)
         if target != self.page_index:
             self._finish_active_overlays()
             self._clear_annotation_selection()
@@ -22403,6 +25504,11 @@ class NavigationMixin:
             self.zoom_percent_spin.selectAll()
 
     def toggle_sidebar(self) -> None:
+        show = getattr(self, "_presentation", None)
+        if show is not None and show.sidebar_shown():
+            # Its × while the show has it (7.9).
+            show.toggle_sidebar()
+            return
         if self.sidebar.isVisible():
             self._sidebar_size = max(190, self.sidebar.width())
             self.sidebar.hide()
@@ -22515,7 +25621,7 @@ class NavigationMixin:
         go with it. It stayed the page last clicked: Ctrl+V after
         scrolling put a picture on a page out of sight. Not while
         something is held or typed in on a page: that is its page."""
-        if not self.continuous or self.document is None:
+        if not self.continuous or self.document is None or not self._continuous_column_is_current():
             return
         if self._holds_object() or getattr(self, "_active_form_editor", None) is not None:
             return
@@ -22603,7 +25709,7 @@ class NavigationMixin:
         """Fill the 文字装飾 and オブジェクト tabs, both in one pass."""
         if self.document is None or not getattr(self, "writing_panes", None):
             return
-        document_id = id(self.document)
+        document_id = document_key(self.document)
         if self._notes_scan_document_id != document_id:
             for pane in self.writing_panes:
                 # Rebuilt after an edit: keep the keyboard's place in the list.
@@ -22628,7 +25734,7 @@ class NavigationMixin:
         could be reached with the mouse alone. Every annotation is here
         now, and choosing one selects it on its page.
         """
-        if self.document is None or self._notes_scan_document_id != id(self.document):
+        if self.document is None or self._notes_scan_document_id != document_key(self.document):
             return
         pages_per_tick = 4
         for _ in range(pages_per_tick):
@@ -22650,6 +25756,8 @@ class NavigationMixin:
                     annotation = page.load_annot(xref)
                     if str(annotation.info.get("subject") or "") == "SumiTextCover":
                         continue
+                    if note_reply_parent(self.document, xref) is not None:
+                        continue  # a reply or a state: shown with its note (7.9)
                     kind, label, text, colour = self._annotation_list_entry(page, annotation)
                 except Exception:
                     continue
@@ -22660,10 +25768,13 @@ class NavigationMixin:
                     self._add_note_section_headers(pane, page_index)
                     headed.add(pane.key)
                 summary = " ".join(text.split())[:70]
-                item = QListWidgetItem(
-                    tr("p.{page}").format(page=page_index + 1) + "  " + label
-                    + ("  " + summary if summary else "")
-                )
+                # One string a row, as each language writes it (6.25): the
+                # parts were strung together in the code with spaces
+                # (7.9's review).
+                row_text = tr("p.{page}  {label}").format(page=page_index + 1, label=label)
+                if summary:
+                    row_text = tr("{first}  {second}").format(first=row_text, second=summary)
+                item = QListWidgetItem(row_text)
                 item.setData(Qt.UserRole, (page_index, xref))
                 # What the filter goes by (6.10).
                 item.setData(NOTE_KIND_ROLE, kind)
@@ -22673,6 +25784,33 @@ class NavigationMixin:
                     item.setData(NOTE_COLOR_ROLE, basic_color_name(colour) or OTHER_COLOR)
                 item.setIcon(self._note_row_icon(page, annotation, kind, colour))
                 item.setToolTip(text.strip() or label)
+                if kind == "note":
+                    # The words it is on, before what it says (7.9, the
+                    # owner: the sidebar shows the selected text), and how
+                    # many replies it has.
+                    quote = " ".join(note_quote(self.document, xref).split())
+                    replies = len(note_replies(page, xref))
+                    parts = [tr("p.{page}  {label}").format(page=page_index + 1, label=label)]
+                    if note_is_resolved(page, xref):
+                        # Off the page; here, greyed, to open and re-open
+                        # (7.9), as Google Slides' comment history.
+                        parts.append(tr("（解決済み）"))
+                        item.setForeground(QColor(COLORS["muted"]))
+                    if quote:
+                        parts.append(tr("「{quote}」").format(quote=quote[:40] + ("…" if len(quote) > 40 else "")))
+                    if summary:
+                        parts.append(summary)
+                    if replies:
+                        parts.append(tr_n("（返信 {count}）", replies).format(count=replies))
+                    shown = parts[0]
+                    for part in parts[1:]:
+                        shown = tr("{first}  {second}").format(first=shown, second=part)
+                    item.setText(shown)
+                    item.setToolTip("\n".join(
+                        part for part in (
+                            tr("「{quote}」").format(quote=quote) if quote else "", text.strip() or label,
+                        ) if part
+                    ))
                 pane.listing.addItem(item)
         self._apply_note_rows()
         self.notes_timer.start(1)
@@ -22835,24 +25973,37 @@ class NavigationMixin:
         self._note_item_activated(item)
         self._focus_main_view()
 
-    def _note_item_activated(self, item: QListWidgetItem) -> None:
+    def _note_item_activated(self, item: QListWidgetItem, now: bool = False) -> bool:
+        """Go to a row's annotation and hold it -- after the page has been
+        drawn, or `now`, for Delete in the list. False for no annotation."""
         target = item.data(Qt.UserRole)
         if not (
             isinstance(target, tuple)
             and len(target) == 2
             and all(isinstance(value, int) for value in target)
         ):
-            return
+            return False
         page_index, xref = target
         self.go_to_page(page_index)
+        if not now:
+            page = self.document[page_index]
+            try:
+                resolved = note_is_resolved(page, xref)
+            except Exception:
+                resolved = False
+            if resolved:
+                # Off the page: its window opens, to read it or re-open it,
+                # as Google Slides' comment history does (7.9).
+                self._edit_note_annotation(page.load_annot(xref))
+                return True
 
-        def select_note() -> None:
+        def select_note() -> bool:
             if self.document is None or self.page_index != page_index:
-                return
+                return False
             try:
                 self.document[page_index].load_annot(xref)
             except Exception:
-                return
+                return False
             if self.continuous:
                 # The selection box is drawn on the active page label.
                 self._continuous_page_clicked(page_index)
@@ -22860,8 +26011,12 @@ class NavigationMixin:
             self._selected_annotation_xrefs = [xref]
             self._sync_annotation_selection()
             self._hold_single_selection(keep_focus=True)
+            return True
 
-        QTimer.singleShot(0, select_note)
+        if now:
+            return select_note()
+        QTimer.singleShot(0, self, select_note)
+        return True
 
     def _note_rich_html(self, annot: fitz.Annot) -> str | None:
         subject = str(annot.info.get("subject") or "")
@@ -22876,7 +26031,12 @@ class NavigationMixin:
         return raw.strip("()")
 
     def _open_note_editor(
-        self, title: str, text: str, html: str | None, on_accept: Any
+        self, title: str, text: str, html: str | None, on_accept: Any,
+        quote: str = "", replies: list[tuple[int, str, str, str]] | None = None,
+        on_reply: Any = None, note_xref: int | None = None,
+        author: tuple[str, str] | None = None, resolved: bool = False,
+        thread_actions: dict[str, Callable[..., Any]] | None = None,
+        on_resolve: Any = None,
     ) -> Any:
         """Open the sticky-note editor, and do `on_accept(text, html)` if
         it is accepted.
@@ -22891,8 +26051,14 @@ class NavigationMixin:
                 existing.close()
             except RuntimeError:
                 pass
-        dialog = StickyNoteEditDialog(self, title, text, html)
+        dialog = StickyNoteEditDialog(
+            self, title, text, html, quote, replies, author, resolved, thread_actions,
+        )
         self._active_note_dialog = dialog
+        dialog.formatTargetChanged.connect(self._sync_format_action_states)
+        # The note whose words the page lights while its window is open.
+        self._note_dialog_xref = note_xref
+        self._sync_annotation_selection()
         # Where the note belongs. The editor is not modal: by the time it is
         # accepted the window may show another tab or page, and the note was
         # written there -- a new one onto the page on screen, an edit onto
@@ -22905,13 +26071,22 @@ class NavigationMixin:
 
         def done(result: int) -> None:
             written, rich = dialog.plain_text(), dialog.rich_html()
+            reply = dialog.reply_text()
+            reply_html = dialog.reply_html()
+            resolve = dialog.resolve_choice
             self._active_note_dialog = None
+            self._note_dialog_xref = None
+            self._update_arrange_controls()
             self._update_text_format_visibility()
             self._sync_format_action_states()
             self._update_controls()
             if result == QDialog.Accepted:
                 if self._return_to_note_target(session, document, page_xref):
                     on_accept(written, rich)
+                    if reply and on_reply is not None:
+                        on_reply(reply, reply_html)
+                    if resolve is not None and on_resolve is not None:
+                        on_resolve(resolve)
                 elif written.strip():
                     QApplication.clipboard().setText(written)
                     QMessageBox.warning(
@@ -22920,11 +26095,13 @@ class NavigationMixin:
                            "入力した内容はクリップボードにコピーしました。"),
                     )
             dialog.deleteLater()
+            self._sync_annotation_selection()
 
         dialog.finished.connect(done)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+        self._update_arrange_controls()
         self._update_text_format_visibility()
         self._sync_format_action_states()
         # Bold is greyed out unless text is being edited, and this is where
@@ -22959,11 +26136,46 @@ class NavigationMixin:
         return self.document is current and self.page_index == index
 
     def _edit_note_annotation(self, annotation: fitz.Annot) -> None:
+        if not self._signed_gate("annotation", self._again_on_marks(
+            lambda: self._with_selected_mark(self._edit_note_annotation),
+            [annotation.xref],
+        )):  # 7.9: a signed PDF
+            return
         if self.document is None:
             return
         original = str(annotation.info.get("content") or "")
         original_html = self._note_rich_html(annotation)
         xref = annotation.xref
+        # The page the note is on, held here: an annotation holds its page
+        # only weakly.
+        page = self.document[self.page_index]
+        replies = self._note_thread_rows(page, xref)
+        document = self.document
+        page_xref = self._page_object_xref(document, self.page_index)
+
+        def page_now() -> int | None:
+            """The note's page, while the window shows its document."""
+            if self.document is not document or document.is_closed:
+                return None
+            return next(
+                (n for n in range(len(document)) if document.page_xref(n) == page_xref), None
+            )
+
+        def edit(reply_xref: int, text: str, rich: str | None = None) -> list[tuple[int, str, str, str, str | None]] | None:
+            index = page_now()
+            if index is None or not self._edit_note_reply(index, reply_xref, text, rich):
+                return None
+            return self._note_thread_rows(self.document[index], xref)
+
+        def delete(reply_xref: int) -> list[tuple[int, str, str, str]] | None:
+            index = page_now()
+            if index is None or not self._delete_note_reply(index, reply_xref):
+                return None
+            return self._note_thread_rows(self.document[index], xref)
+
+        def listed() -> list[tuple[int, str, str, str]]:
+            index = page_now()
+            return [] if index is None else self._note_thread_rows(self.document[index], xref)
         # The page is read when the edit is accepted: _open_note_editor has
         # gone back to the note's page by then, wherever it has moved to.
         self._open_note_editor(
@@ -22971,7 +26183,172 @@ class NavigationMixin:
             lambda text, html: self._apply_note_edit(
                 self.page_index, xref, text, html, original, original_html
             ),
+            quote=note_quote(self.document, xref),
+            replies=replies,
+            on_reply=lambda text, rich: self._add_note_reply(self.page_index, xref, text, rich),
+            note_xref=xref,
+            author=(
+                str(annotation.info.get("title") or ""),
+                pdf_date_text(str(annotation.info.get("modDate") or annotation.info.get("creationDate") or "")),
+            ),
+            resolved=note_is_resolved(page, xref),
+            thread_actions={"edit": edit, "delete": delete, "list": listed},
+            on_resolve=lambda resolve: self._set_note_resolved(self.page_index, xref, resolve),
         )
+
+    def _note_thread_rows(self, page: fitz.Page, xref: int) -> list[tuple[int, str, str, str, str | None]]:
+        """A note's replies as its window shows them: (xref, who, when,
+        what, its HTML when formatted), oldest first."""
+        return [
+            (
+                reply.xref,
+                str(reply.info.get("title") or ""),
+                pdf_date_text(str(reply.info.get("modDate") or reply.info.get("creationDate") or "")),
+                str(reply.info.get("content") or ""),
+                self._note_rich_html(reply),
+            )
+            for reply in note_replies(page, xref)
+        ]
+
+    def _edit_note_reply(
+        self, page_index: int, reply_xref: int, text: str, html: str | None = None,
+    ) -> bool:
+        """A reply's words changed, from its window's Edit (7.9); the time
+        is the change's, as Google Slides shows an edited comment's."""
+        if self.document is None or not text.strip():
+            return False
+        checkpoint = self._begin_edit()
+        try:
+            page = self.document[page_index]
+            reply = page.load_annot(reply_xref)
+            # Formatted, kept as a formatted note keeps it (SumiHTML).
+            reply.set_info(
+                content=text.strip(), modDate=fitz.get_pdf_now(),
+                subject="SumiRichNote" if html is not None else "",
+            )
+            reply.update()
+            if html is not None:
+                self.document.xref_set_key(reply.xref, "SumiHTML", fitz.get_pdf_str(html))
+            else:
+                self.document.xref_set_key(reply.xref, "SumiHTML", "null")
+        except Exception as exc:
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
+            QMessageBox.critical(
+                self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
+            )
+            return False
+        self._mark_dirty()
+        self._invalidate_notes()
+        self.schedule_render(immediate=True)
+        return True
+
+    def _delete_note_reply(self, page_index: int, reply_xref: int) -> bool:
+        """A reply taken out of its thread, from its window's Delete (7.9)."""
+        if self.document is None:
+            return False
+        checkpoint = self._begin_edit()
+        try:
+            page = self.document[page_index]
+            page.delete_annot(page.load_annot(reply_xref))
+        except Exception as exc:
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
+            QMessageBox.critical(
+                self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
+            )
+            return False
+        self._mark_dirty()
+        self._invalidate_notes()
+        self.schedule_render(immediate=True)
+        return True
+
+    def _set_note_resolved(self, page_index: int, xref: int, resolved: bool) -> bool:
+        """Resolve a note's thread, or re-open it (7.9, after Google
+        Slides): a resolved note leaves the page -- not drawn, not clicked
+        -- and stays in the sidebar, greyed, to be opened and re-opened.
+        Kept as Acrobat keeps Set Status: a state that answers the note
+        (/IRT), of the Review model, Completed or None, hidden."""
+        if self.document is None:
+            return False
+        checkpoint = self._begin_edit()
+        try:
+            page = self.document[page_index]
+            note = page.load_annot(xref)
+            state = page.add_text_annot(fitz.Point(note.rect.x0, note.rect.y0), "")
+            now = fitz.get_pdf_now()
+            author = os.environ.get("USERNAME", tr("ユーザー"))
+            # In Acrobat's words: what it shows in its comments list.
+            state.set_info(
+                title=author, creationDate=now, modDate=now,
+                content=acrobat_review_state_text(resolved, author),
+            )
+            state.set_flags(
+                fitz.PDF_ANNOT_IS_HIDDEN | fitz.PDF_ANNOT_IS_NO_ZOOM | fitz.PDF_ANNOT_IS_NO_ROTATE
+            )
+            state.update()
+            self.document.xref_set_key(state.xref, "IRT", f"{xref} 0 R")
+            # Text strings, as ISO 32000 has them (Table 172).
+            self.document.xref_set_key(state.xref, "StateModel", fitz.get_pdf_str("Review"))
+            self.document.xref_set_key(
+                state.xref, "State", fitz.get_pdf_str("Completed" if resolved else "None")
+            )
+            note = page.load_annot(xref)
+            flags = note.flags & ~fitz.PDF_ANNOT_IS_NO_VIEW
+            note.set_flags(flags | (fitz.PDF_ANNOT_IS_NO_VIEW if resolved else 0))
+            note.update()
+        except Exception as exc:
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
+            QMessageBox.critical(
+                self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
+            )
+            return False
+        if resolved and xref in self._selected_annotation_xrefs:
+            self._clear_annotation_selection()
+        self._mark_dirty()
+        self._invalidate_notes()
+        self.schedule_render(immediate=True)
+        self.status_label.setText(tr("スレッドを解決しました") if resolved else tr("スレッドを再開しました"))
+        return True
+
+    def _add_note_reply(
+        self, page_index: int, xref: int, text: str, html: str | None = None,
+    ) -> bool:
+        """A reply to a note, as PDF keeps one (7.9): a note of its own,
+        not drawn, that names the note it answers (/IRT) as a reply
+        (/RT /R), with who wrote it and when."""
+        if self.document is None or not text.strip():
+            return False
+        checkpoint = self._begin_edit()
+        try:
+            page = self.document[page_index]
+            parent = page.load_annot(xref)
+            reply = page.add_text_annot(fitz.Point(parent.rect.x0, parent.rect.y0), text.strip())
+            now = fitz.get_pdf_now()
+            reply.set_info(
+                title=os.environ.get("USERNAME", tr("ユーザー")), content=text.strip(),
+                creationDate=now, modDate=now,
+                subject="SumiRichNote" if html is not None else "",
+            )
+            reply.set_flags(fitz.PDF_ANNOT_IS_NO_VIEW)
+            reply.update()
+            if html is not None:
+                # Formatted, kept as a formatted note keeps it (7.9).
+                self.document.xref_set_key(reply.xref, "SumiHTML", fitz.get_pdf_str(html))
+            self.document.xref_set_key(reply.xref, "IRT", f"{xref} 0 R")
+            self.document.xref_set_key(reply.xref, "RT", "/R")
+        except Exception as exc:
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
+            QMessageBox.critical(
+                self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
+            )
+            return False
+        self._mark_dirty()
+        self._invalidate_notes()
+        self.schedule_render(immediate=True)
+        return True
 
     def _apply_note_edit(
         self, page_index: int, xref: int, text: str, html: str | None,
@@ -22981,7 +26358,7 @@ class NavigationMixin:
             return
         if text == original and html == original_html:
             return
-        self._snapshot_for_edit()
+        checkpoint = self._begin_edit()
         try:
             page = self.document[page_index]
             updated = page.load_annot(xref)
@@ -22997,6 +26374,8 @@ class NavigationMixin:
                 )
                 updated.update()
         except Exception as exc:
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
             QMessageBox.critical(
                 self, APP_NAME, tr("付箋を更新できませんでした。\n\n{error}").format(error=exc)
             )
@@ -23117,8 +26496,18 @@ class NavigationMixin:
                 icon="page_jump",
             )
             if kind == "notes":
+                # Edit, for what has words to edit -- a note, a text box --
+                # opens them; Delete is the row's Delete key. Edit used to
+                # be on every row and did what Go to This Page does, and
+                # Delete was a key only (7.9, the owner).
+                what = self._listed_annotation_kind()
+                if what in ("note", "text"):
+                    self._add_menu_action(
+                        menu, "編集", self._edit_listed_annotation,
+                        icon="note" if what == "note" else "text",
+                    )
                 self._add_menu_action(
-                    menu, "編集", lambda: self._activate_sidebar_item(kind), icon="note"
+                    menu, "削除", self._delete_listed_annotation, shortcut="Del", icon="delete",
                 )
             menu.addSeparator()
         if kind == "outline":
@@ -23126,19 +26515,65 @@ class NavigationMixin:
             self._menu_command(menu, self.act_outline_add)
             if has_item and self._current_outline_key() is not None:
                 self._add_menu_action(
-                    menu, "名前の変更", self.rename_current_outline_entry, shortcut="F2"
+                    menu, "名前の変更", self.rename_current_outline_entry, shortcut="F2", icon="text",
                 )
                 self._add_menu_action(
                     menu, "目次から削除", self.delete_current_outline_entry,
                     shortcut="Delete", icon="delete",
                 )
+                self._update_outline_level_actions()
+                self._menu_commands(menu, (None, self.act_outline_promote, self.act_outline_demote))
             menu.addSeparator()
         if kind == "results":
             self._menu_commands(menu, (self.act_prev_match, self.act_next_match, None))
-        self._add_menu_action(menu, "ページのテキストをコピー", self.copy_page_text, icon="copy")
-        menu.addSeparator()
+        if kind != "notes":
+            # Not in the lists of marks and objects: it copies the page's
+            # words, which a row there is not about (7.9, the owner).
+            self._add_menu_action(menu, "ページのテキストをコピー", self.copy_page_text, icon="copy")
+            menu.addSeparator()
         self._menu_command(menu, self.act_sidebar)
         return assign_access_keys(menu)
+
+    def _listed_item(self) -> QListWidgetItem | None:
+        """The row the 文字装飾 or オブジェクト list is on."""
+        pane = self.tabs.currentWidget()
+        return pane.listing.currentItem() if isinstance(pane, WritingPane) else None
+
+    def _listed_annotation_kind(self) -> str | None:
+        """What the row's annotation is, as _tool_kind_of names it."""
+        item = self._listed_item()
+        target = item.data(Qt.UserRole) if item is not None else None
+        if self.document is None or not (
+            isinstance(target, tuple) and len(target) == 2
+            and all(isinstance(value, int) for value in target)
+        ):
+            return None
+        try:
+            page = self.document[target[0]]
+            return self._tool_kind_of(page.load_annot(target[1]))
+        except Exception:
+            return None
+
+    def _edit_listed_annotation(self) -> None:
+        """Edit, in a list's menu: the note's window, or the text box
+        opened for typing, on its page."""
+        item = self._listed_item()
+        if item is None or not self._note_item_activated(item, now=True):
+            return
+        self._focus_main_view()
+        if self._active_text_box is not None:
+            # Held as an object by now: on to its words.
+            self._set_text_box_mode("editing")
+        else:
+            self._edit_selected_annotation()
+
+    def _delete_listed_annotation(self) -> None:
+        """Delete, in a list's menu: what the Delete key does there."""
+        pane = self.tabs.currentWidget()
+        item = self._listed_item()
+        if item is not None and self._note_item_activated(item, now=True):
+            self.delete_selected_annotations()
+            pane.listing.setFocus(Qt.OtherFocusReason)
 
     def _activate_sidebar_item(self, kind: str) -> None:
         if kind == "outline":
@@ -23156,8 +26591,6 @@ class NavigationMixin:
                 self._note_item_activated(item)
 
     def _show_sidebar_menu(self, widget: QWidget, position: QPoint, kind: str) -> None:
-        if self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
-            return
         item = widget.itemAt(position)
         if item is not None:
             if hasattr(widget, "setCurrentItem"):
@@ -23251,7 +26684,7 @@ class NavigationMixin:
             return
         if new_order == list(range(len(self.document))):
             return
-        if not self._commit_open_edits():
+        if not self._commit_open_edits() or not self._signed_gate("pages"):
             # The list has moved the thumbnail already: show the real order.
             self._start_thumbnails()
             return
@@ -23308,6 +26741,8 @@ class NavigationMixin:
                 piece.close()
 
     def _cut_current_page_to_clipboard(self, *, pages: list[int] | None = None) -> None:
+        if not self._signed_gate("pages", lambda: self._cut_current_page_to_clipboard(pages=pages)):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -23327,6 +26762,8 @@ class NavigationMixin:
     def _paste_page_from_clipboard(self, *, after: int | None = None) -> None:
         """The pages on the clipboard after the page being read -- or after
         page `after`, the last of those chosen in the Pages pane (6.21)."""
+        if not self._signed_gate("pages", lambda: self._paste_page_from_clipboard(after=after)):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None or self._page_clipboard is None:
@@ -23352,7 +26789,7 @@ class NavigationMixin:
             source.close()
 
     def _show_thumbnail_context_menu(self, position: QPoint) -> None:
-        if self.document is None or self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
+        if self.document is None:
             return
         band = self.thumbnail_list.section_at(position)
         if band is not None:
@@ -23377,7 +26814,7 @@ class NavigationMixin:
             return
         # Arriving at a page in a folded section opens the section (6.9);
         # folding the section of the page being read leaves it folded.
-        arrived = (id(self.document), self.page_index)
+        arrived = (document_key(self.document), self.page_index)
         if arrived != getattr(self, "_sections_revealed_for", None):
             self._sections_revealed_for = arrived
             self._reveal_page_sections(self.page_index)
@@ -23443,11 +26880,7 @@ class SearchMixin:
             self.tabs.setCurrentIndex((self.tabs.currentIndex() + delta) % count)
 
     def _search_entered(self) -> None:
-        query = self.search_edit.text().strip()
-        if query and query == self.search_query and self.search_hits:
-            self.next_match()
-        else:
-            self.start_search()
+        self.start_search()
 
     def _search_text_changed(self, text: str) -> None:
         if not text.strip() and (self.search_query or self.search_hits or self.search_by_page):
@@ -23465,16 +26898,9 @@ class SearchMixin:
         self.current_match_index = -1
         self.results_list.clear()
         self.match_label.clear()
-        self._update_search_navigation_buttons()
         self._invalidate_render_cache()
         self._invalidate_continuous_images()
         self.schedule_render(immediate=True)
-
-    def _update_search_navigation_buttons(self) -> None:
-        enabled = bool(self.document is not None and self.search_hits)
-        if hasattr(self, "nav_prev_match_button"):
-            self.nav_prev_match_button.setEnabled(enabled)
-            self.nav_next_match_button.setEnabled(enabled)
 
     def start_search(self) -> None:
         query = self.search_edit.text().strip()
@@ -23486,13 +26912,14 @@ class SearchMixin:
         self.search_by_page.clear()
         self.current_match_index = -1
         self.results_list.clear()
-        self._update_search_navigation_buttons()
         self.match_label.setText(tr("検索中…"))
         self.tabs.setCurrentWidget(self.results_list)
         self.search_timer.start(1)
         # Ctrl+Z after running a search must continue to mean document Undo,
-        # not undoing the text inside the search field.
-        self.setFocus(Qt.OtherFocusReason)
+        # not undoing the text inside the search field. To the page, not to
+        # the window itself: with the window holding the keyboard, Page
+        # Down, the arrows and Space did nothing after a search (7.9).
+        self._focus_main_view()
 
     def _search_next_page(self) -> None:
         if self.document is None:
@@ -23503,7 +26930,6 @@ class SearchMixin:
             self.match_label.setText(tr_n("{count}件", count).format(count=count))
             if count:
                 self.goto_match(0)
-            self._update_search_navigation_buttons()
             return
         page = self.document[page_index]
         try:
@@ -23518,13 +26944,14 @@ class SearchMixin:
                 self.search_hits.append((page_index, fitz.Rect(rect), context))
                 self.results_list.addItem(self._search_result_item(index))
         self.match_label.setText(tr_n("{count}件", len(self.search_hits)).format(count=len(self.search_hits)))
-        self._update_search_navigation_buttons()
         self._search_page_index += 1
         self.search_timer.start(1)
 
     def _search_result_text(self, index: int) -> str:
         page_index, _rect, context = self.search_hits[index]
-        return tr("p.{page}").format(page=page_index + 1) + "   " + context
+        # One string, as each language writes it (6.25); the page and the
+        # words were strung together in the code (7.9's review).
+        return tr("p.{page}   {context}").format(page=page_index + 1, context=context)
 
     def _search_result_item(self, index: int) -> QListWidgetItem:
         """A row of the search results: the page, as the UI language
@@ -23599,11 +27026,10 @@ class SearchMixin:
             self.page_index = page_index
             self._reveal_match_after_render = True
             self.schedule_render(immediate=True)
-        self._update_search_navigation_buttons()
 
     def _select_current_match_text(self) -> None:
         """Select the match itself, so Ctrl+H, Ctrl+U or Ctrl+K marks it up
-        straight from the search, and F3 moves on to the next one."""
+        straight from the search."""
         if self.document is None or not (0 <= self.current_match_index < len(self.search_hits)):
             return
         page_index, rect, _context = self.search_hits[self.current_match_index]
@@ -23675,11 +27101,11 @@ class SearchMixin:
 class HistoryMixin:
     """Undo and redo, crash-recovery snapshots and the unsaved-changes state."""
 
-    def _document_bytes(self, compact: bool = True) -> bytes:
+    def _document_bytes(self, compact: bool = True, strict: bool = False) -> bytes:
         session = self._current_session()
         if session is None or self.document is None:
             return b""
-        return serialize_session(session, compact=compact)
+        return serialize_session(session, compact=compact, strict=strict)
 
 
     @staticmethod
@@ -23757,16 +27183,14 @@ class HistoryMixin:
         # Only this window's tabs: the writer is shared, and a tab moved
         # away has its outcome taken by the window that holds it now.
         paths = [self._recovery_paths(session)[0] for session in self.sessions]
-        take_results = getattr(self._recovery_writer, "take_results", None)
-        if take_results is not None:
-            for pdf_path, revision, failure in take_results(paths):
-                for session in self.sessions:
-                    if self._recovery_paths(session)[0] != pdf_path:
-                        continue
-                    if session.autosave_pending_revision == revision:
-                        session.autosave_pending_revision = -1
-                    if failure is None and revision is not None:
-                        session.autosaved_revision = max(session.autosaved_revision, revision)
+        for pdf_path, revision, failure in self._recovery_writer.take_results(paths):
+            for session in self.sessions:
+                if self._recovery_paths(session)[0] != pdf_path:
+                    continue
+                if session.autosave_pending_revision == revision:
+                    session.autosave_pending_revision = -1
+                if failure is None and revision is not None:
+                    session.autosaved_revision = max(session.autosaved_revision, revision)
         failure = self._recovery_writer.take_failure(paths)
         if failure:
             self._report_recovery_failure(failure)
@@ -23859,26 +27283,27 @@ class HistoryMixin:
         original document was encrypted (the snapshot keeps that encryption)."""
         try:
             document = fitz.open(stream=pdf_path.read_bytes(), filetype="pdf")
-        except Exception:
+        except Exception as exc:
+            # Said, as for any file that does not open: after "Yes" nothing
+            # happened and nothing was said, at this start and every one
+            # after it (7.9's review). The copy stays, to be thrown away
+            # with "No".
+            QMessageBox.critical(
+                self, APP_NAME, tr("PDFを開けませんでした。\n\n{error}").format(error=exc)
+            )
             return False
         password: str | None = None
         if document.needs_pass:
             name = str(meta.get("title") or pdf_path.name)
-            while True:
-                password, accepted = QInputDialog.getText(
-                    self,
-                    tr("パスワードが必要です"),
-                    tr("「{name}」の復元にはパスワードが必要です。").format(name=name),
-                    QLineEdit.Password,
-                )
-                if not accepted:
-                    document.close()
-                    return False
-                if document.authenticate(password):
-                    break
-                QMessageBox.warning(self, APP_NAME, tr("パスワードが正しくありません。"))
+            password = self._unlock_document(
+                document, tr("「{name}」の復元にはパスワードが必要です。").format(name=name)
+            )
+            if password is None:
+                document.close()
+                return False
         if len(document) == 0:
             document.close()
+            QMessageBox.critical(self, APP_NAME, tr("このPDFにはページがありません。"))
             return False
         session = DocumentSession(
             document=document,
@@ -23888,6 +27313,23 @@ class HistoryMixin:
             # The snapshot's files become this tab's own (_recovery_paths).
             recovery_id=pdf_path.stem,
         )
+        # A signed document's snapshot is its signed revision and one update
+        # (7.9, N-9): it stays signed, and saving it over its file keeps the
+        # signature -- checked against that file as it is now.
+        for key, value in read_signature_state(document, str(pdf_path), password).items():
+            setattr(session, key, value)
+        if session.signed_end is not None:
+            session.disk_digest = ""
+            original = Path(session.file_path) if session.file_path else None
+            try:
+                if original is not None and original.is_file():
+                    data = original.read_bytes()
+                    if hashlib.sha256(data[: session.signed_end]).hexdigest() == session.signed_digest:
+                        session.disk_digest = hashlib.sha256(data).hexdigest()
+                    else:
+                        session.signed_refused = "the file is not the one this was recovered from"
+            except OSError:
+                pass
         # What is on disk is what is open: nothing to write until it changes.
         session.autosaved_revision = session.revision
         self._append_session(session)
@@ -24033,8 +27475,8 @@ class HistoryMixin:
             self.document = copy
             active = copy
             for capture in getattr(self, "_annotation_clipboard", None) or []:
-                if capture.get("document") == id(document):
-                    capture["document"] = id(copy)
+                if capture.get("document") == document_key(document):
+                    capture["document"] = document_key(copy)
             try:
                 document.close()
             except Exception:
@@ -24101,6 +27543,25 @@ class HistoryMixin:
         session = self._current_session()
         if session is None or self.document is None:
             return
+        self._snapshot_joined_the_marker = False
+        marker_step = getattr(self, "_image_marker_step", None)
+        self._image_marker_step = None
+        if (
+            marker_step is not None
+            and marker_step[0] is session
+            and session.undo_stack
+            and session.undo_stack[-1] is marker_step[1]
+        ):
+            # The first change to a picture that came with the PDF: the
+            # step that gave it its hidden marker is this change's step.
+            # They were two, so Ctrl+Z after moving or deleting such a
+            # picture put it back, and Ctrl+Z again did nothing to be seen
+            # -- it took the marker away (7.9, the owner: one step).
+            self._snapshot_joined_the_marker = True
+            if session.journal:
+                session.edit_open = True
+            session.redo_stack.clear()
+            return
         self._push_history(session.undo_stack)
         session.redo_stack.clear()
 
@@ -24115,6 +27576,9 @@ class HistoryMixin:
         redo = list(session.redo_stack)
         self._snapshot_for_edit()
         snapshot = session.undo_stack[-1] if session.undo_stack else None
+        if getattr(self, "_snapshot_joined_the_marker", False):
+            # Its step is the marker's (_snapshot_for_edit): back to there.
+            return session, snapshot, redo
         return session, (snapshot if snapshot is not top else None), redo
 
     def _rollback_edit(self, checkpoint: tuple | None) -> bool:
@@ -24323,10 +27787,6 @@ class CanvasEditingMixin:
     """Edit tools and the boxes placed on the page: text, image and shape."""
 
     def set_edit_mode(self, mode: str) -> None:
-        if mode == "text" and self._premium_blocked("テキスト ボックスの追加"):
-            # The text tool's button checked itself on the click.
-            self._sync_edit_tool_state(self.edit_mode if self.edit_mode != "text" else "select")
-            return
         if mode != "select":
             self._finish_active_overlays()
             self._clear_annotation_selection()
@@ -24347,6 +27807,26 @@ class CanvasEditingMixin:
         self._update_text_format_visibility()
 
     def _toggle_edit_mode(self, mode: str) -> None:
+        if mode != "select" and self.edit_mode != mode and not self._signed_gate(
+            # A text box writes its words into the page; the rest are
+            # annotations (7.9: a signed PDF). A note on selected words is
+            # put on the same words in the copy (2026-11-21).
+            "content" if mode == "text" else "annotation",
+            (mode == "note" and self._again_on_text_selection(lambda: self._toggle_edit_mode("note")))
+            or (lambda m=mode: self._toggle_edit_mode(m)),
+        ):
+            self._sync_edit_tool_state(self.edit_mode)
+            return
+        if (
+            mode == "note" and self.edit_mode != "note" and self.document is not None
+            and self._text_selection_target() is not None
+        ):
+            # With text selected, the note button puts a note on it, as
+            # Google Slides' comment button does (7.9); the tool stays --
+            # set back after, as setting it drops the selection.
+            self.add_note_at_selection()
+            self._sync_edit_tool_state(self.edit_mode)
+            return
         self.set_edit_mode("select" if mode != "select" and self.edit_mode == mode else mode)
 
     def cancel_current_tool(self) -> None:
@@ -24546,7 +28026,8 @@ class CanvasEditingMixin:
             self._layout_active_text_box()
             return True
         if self._active_image_box is not None and self._active_image_rect is not None:
-            self._take_up_active_image()
+            if not self._take_up_active_image():
+                return True
             # Off the page as far as KEEP_ON_PAGE leaves (6.16).
             self._active_image_rect = self._kept_on_page(
                 fitz.Rect(self._active_image_rect) + (dx, dy, dx, dy),
@@ -24576,6 +28057,10 @@ class CanvasEditingMixin:
             return False
         if annotation.type[0] != fitz.PDF_ANNOT_TEXT:
             return False
+        if not self._signed_gate("annotation", self._again_on_marks(
+            lambda: self._move_selected_note_by_key(self._selected_annotation_xrefs[0], dx, dy, bounds), [xref]
+        )):  # 7.9's review: a signed PDF
+            return True
         if self._moving_note_xref != xref:
             self._snapshot_for_edit()
             self._moving_note_xref = xref
@@ -24637,7 +28122,8 @@ class CanvasEditingMixin:
             # The picture comes off the page into its frame, as a drag
             # takes it: only the frame moved, the picture staying behind
             # at its old size until the frame was put down (6.13).
-            self._take_up_active_image()
+            if self._active_image_box is None or not self._take_up_active_image():
+                return True
             # A picture keeps its proportions, as in PowerPoint: Shift+Up
             # and Down squashed and stretched it (6.13).
             step = self.KEYBOARD_PICTURE_FINE_STEP if fine else self.KEYBOARD_PICTURE_STEP
@@ -24653,6 +28139,16 @@ class CanvasEditingMixin:
         """PowerPoint-style Alt+Left/Right rotation for editable canvas shapes."""
         if key not in (Qt.Key_Left, Qt.Key_Right):
             return False
+        if self._active_text_box is not None and self._active_text_box_mode == "object":
+            # A held text box turns too (7.0).
+            delta = KEYBOARD_ROTATE_STEP_DEGREES if key == Qt.Key_Right else -KEYBOARD_ROTATE_STEP_DEGREES
+            self._turn_active_text_box(float(getattr(self, "_active_text_angle", 0.0)) + delta)
+            return True
+        if self._active_image_box is not None and not self._active_image_box.crop_mode:
+            # And a held picture (7.9).
+            delta = KEYBOARD_ROTATE_STEP_DEGREES if key == Qt.Key_Right else -KEYBOARD_ROTATE_STEP_DEGREES
+            self._turn_active_image(float(getattr(self, "_active_image_angle", 0.0)) + delta)
+            return True
         if self._active_object_box is None:
             return False
         if self._active_line_points is None and not self._active_shape_points and not self._active_ink_strokes:
@@ -24689,13 +28185,19 @@ class CanvasEditingMixin:
         html: str | None = None,
         font_family: str | None = None,
         shrink: float = 1.0,
+        angle: float = 0.0,
     ) -> None:
         """`shrink`: how much smaller than its stored size the page draws
-        the box (see _baked_text_shrink); it opens at that size."""
+        the box (see _baked_text_shrink); it opens at that size. `angle`:
+        how far it is turned (7.0) -- held, the page goes on showing it
+        turned; typed in, it stands upright, as Word shows a turned box."""
         if self.document is None:
             return
         if self._active_text_box is not None:
             self._commit_active_text_box()
+        self._active_text_angle = float(angle) % 360.0
+        self._active_text_original_angle = self._active_text_angle
+        self._active_text_upright_pending = None
         self._active_text_page_index = self.page_index
         self._active_text_rect = fitz.Rect(rect)
         self._active_text_xref = xref
@@ -24718,11 +28220,14 @@ class CanvasEditingMixin:
                 # not recorded is still covered.
                 was_baked = str(hidden.info.get("subject") or "").startswith("SumiRichText")
                 content = self._rich_text_content_xref(hidden) if was_baked else None
-                self._hide_on_screen(
-                    self.page_index, xref,
-                    fitz.Rect(hidden.rect) if was_baked and content is None else None,
-                    content=content,
-                )
+                cover = annotation_frame_rect(hidden) if was_baked and content is None else None
+                if self._active_text_angle:
+                    # Turned: the page keeps showing it turned while it is
+                    # held; it is taken off the page once it is typed in
+                    # or moved (_stand_text_box_upright).
+                    self._active_text_upright_pending = (self.page_index, xref, cover, content)
+                else:
+                    self._hide_on_screen(self.page_index, xref, cover, content=content)
                 self._active_text_hidden_xref = xref
             except Exception:
                 self._active_text_hidden_xref = None
@@ -24768,6 +28273,13 @@ class CanvasEditingMixin:
         initial_mode = "editing" if xref is None else "object"
         self._active_text_box_mode = initial_mode
         box.set_mode(initial_mode)
+        if self._active_text_upright_pending is not None:
+            # Its words are the page's, turned; the box shows its frame.
+            effect = QGraphicsOpacityEffect(box.editor)
+            effect.setOpacity(0.0)
+            box.editor.setGraphicsEffect(effect)
+            if initial_mode == "editing":
+                self._stand_text_box_upright()
         box.geometryEdited.connect(self._active_text_geometry_changed)
         box.finishRequested.connect(self._commit_active_text_box)
         box.deleteRequested.connect(self._delete_active_text_box)
@@ -24796,8 +28308,7 @@ class CanvasEditingMixin:
             self._redraw_before_painting()
 
     def _begin_canvas_text_box(self, screen_span: tuple[QPointF, QPointF]) -> None:
-        # The text tool may still be chosen when the trial ends.
-        if self.document is None or self._premium_blocked("テキスト ボックスの追加"):
+        if self.document is None:
             self._sync_edit_tool_state("select")
             return
         start_screen, end_screen = screen_span
@@ -24846,6 +28357,8 @@ class CanvasEditingMixin:
         )
 
     def _open_canvas_text_box(self, screen_point: QPointF, quiet: bool = False) -> bool:
+        if not self._signed_gate("content", lambda: self._open_canvas_text_box(screen_point, quiet)):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         page = self.document[self.page_index]
@@ -24875,6 +28388,7 @@ class CanvasEditingMixin:
             html=html,
             font_family=font_family,
             shrink=shrink,
+            angle=text_box_angle(annotation),
         )
 
     def _edit_text_box_by_xref(self, xref: int) -> None:
@@ -24894,6 +28408,7 @@ class CanvasEditingMixin:
             self._reopen_freetext_annotation(annotation)
         box = self._active_text_box
         if box is not None:
+            self._stand_text_box_upright()
             self._active_text_box_mode = "editing"
             box.set_mode("editing")
             box.focus_editor(select_all=True)
@@ -25088,6 +28603,21 @@ class CanvasEditingMixin:
             return None
         return fitz.Point(vertices[0]), fitz.Point(vertices[1])
 
+    def _stand_text_box_upright(self) -> None:
+        """A turned text box typed in, moved or resized (7.0): the page
+        stops showing it turned and the box shows its words, upright, as
+        Word shows a turned box while it is edited. It is turned again on
+        the page when it is let go."""
+        pending = getattr(self, "_active_text_upright_pending", None)
+        if pending is None:
+            return
+        self._active_text_upright_pending = None
+        page_index, xref, cover, content = pending
+        box = self._active_text_box
+        if box is not None:
+            box.editor.setGraphicsEffect(None)
+        self._hide_on_screen(page_index, xref, cover, content=content)
+
     def _set_text_box_mode(self, mode: str) -> None:
         """PowerPoint-style toggle between "editing" (caret in the editor,
         Shift+arrow selects text) and "object" (defocused, resize handles
@@ -25095,6 +28625,8 @@ class CanvasEditingMixin:
         box = self._active_text_box
         if box is None or mode == self._active_text_box_mode:
             return
+        if mode == "editing":
+            self._stand_text_box_upright()
         self._active_text_box_mode = mode
         box.set_mode(mode)
         if mode == "editing":
@@ -25270,6 +28802,15 @@ class CanvasEditingMixin:
         page_rect &= self._unrotated_bounds(self.document[self.page_index])
         if page_rect.width >= 5 and page_rect.height >= 5:
             self._active_text_rect = page_rect
+            original = self._active_text_original
+            if (
+                getattr(self, "_active_text_upright_pending", None) is not None
+                and original is not None
+                and not self._rect_close(page_rect, original[3])
+            ):
+                # A turned box moved or resized: its words stand up in it
+                # until it is let go (7.0).
+                self._stand_text_box_upright()
 
     @staticmethod
     def _style_close(
@@ -25299,6 +28840,13 @@ class CanvasEditingMixin:
         xref = self._active_text_xref
         hidden_xref = self._active_text_hidden_xref
         original = self._active_text_original
+        angle = float(getattr(self, "_active_text_angle", 0.0)) % 360.0
+        original_angle = float(getattr(self, "_active_text_original_angle", 0.0)) % 360.0
+        self._active_text_angle = 0.0
+        self._active_text_original_angle = 0.0
+        self._active_text_upright_pending = None
+        # Ctrl+Enter left the keyboard on a toolbar button (7.9).
+        self._keyboard_back_to_the_page_from(box)
         box.hide()
         box.deleteLater()
         self._active_text_box = None
@@ -25322,6 +28870,7 @@ class CanvasEditingMixin:
                 and abs(font_size - original_size) < 0.05
                 and self._style_close(color, original_color)
                 and self._rect_close(rect, original_rect)
+                and abs(angle - original_angle) < 0.05
             )
         # What was hidden was hidden on screen only: nothing to put back in
         # the document, whether the box changed or not.
@@ -25341,14 +28890,14 @@ class CanvasEditingMixin:
             if xref is not None:
                 annotation = page.load_annot(xref)
                 was_baked = str(annotation.info.get("subject") or "").startswith("SumiRichText")
-                was_baked_rect = fitz.Rect(annotation.rect) if was_baked else None
+                was_baked_rect = annotation_frame_rect(annotation) if was_baked else None
                 baked_content_xref = self._rich_text_content_xref(annotation)
                 page.delete_annot(annotation)
                 if was_baked_rect is not None:
                     self._erase_rich_text_box(page, was_baked_rect, baked_content_xref)
             if text.strip():
                 baked_xref = self._bake_rich_text_box(
-                    page, rect, page_html, page_families, page_width, page_height
+                    page, rect, page_html, page_families, page_width, page_height, angle=angle
                 )
                 annotation = page.add_freetext_annot(
                     rect, "", fontsize=font_size, fontname="japan", text_color=color, border_width=0,
@@ -25361,7 +28910,10 @@ class CanvasEditingMixin:
                     )
                 )
                 self.document.xref_set_key(annotation.xref, "SumiHTML", fitz.get_pdf_str(html))
+                if abs(angle) >= 0.05:
+                    self.document.xref_set_key(annotation.xref, TEXT_BOX_ANGLE_KEY, f"{angle:.2f}")
                 annotation.update(fontsize=font_size, fontname="japan", text_color=color)
+                self._last_committed_text_xref = annotation.xref
         except Exception as exc:
             # The old box may already be off the page and the new one not on
             # it yet: go back to how the page was, not half of each.
@@ -25484,6 +29036,69 @@ class CanvasEditingMixin:
 
     _STAMP_SEED: bytes | None = None
 
+    # ---- pictures turned (7.9) ---------------------------------------
+    # A picture turns as a shape and a text box do (the owner, 2026-11-16:
+    # it was the one thing that could not, for no reason a user could see).
+    # The stamp's appearance draws the picture upright over a box of its
+    # width and height, and is turned by the appearance's own /Matrix; the
+    # stamp's /Rect is the box around the turned picture. An angle is in
+    # degrees, clockwise on the page as it is seen, as a shape's is.
+    @staticmethod
+    def _turned_bounds(rect: fitz.Rect, angle: float) -> fitz.Rect:
+        """The upright box around `rect` turned by `angle` about its middle."""
+        radians = math.radians(angle)
+        cosine, sine = abs(math.cos(radians)), abs(math.sin(radians))
+        width = rect.width * cosine + rect.height * sine
+        height = rect.width * sine + rect.height * cosine
+        middle = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+        return fitz.Rect(
+            middle.x - width / 2, middle.y - height / 2, middle.x + width / 2, middle.y + height / 2
+        )
+
+    def _stamp_turn(self, stamp: Any) -> tuple[float, fitz.Rect]:
+        """How far a picture's stamp is turned, and the picture's own box,
+        upright, about the same middle: (0.0, the stamp's rectangle) for one
+        that is not turned."""
+        bounds = fitz.Rect(stamp.rect)
+        try:
+            assert self.document is not None
+            appearance = int(self.document.xref_get_key(stamp.xref, "AP/N")[1].split()[0])
+            matrix = [float(v) for v in self.document.xref_get_key(appearance, "Matrix")[1].strip("[]").split()]
+            box = [float(v) for v in self.document.xref_get_key(appearance, "BBox")[1].strip("[]").split()]
+        except Exception:
+            return 0.0, bounds
+        if len(matrix) != 6 or len(box) != 4:
+            return 0.0, bounds
+        angle = round(math.degrees(math.atan2(-matrix[1], matrix[0])), 2) % 360.0
+        if min(angle, 360.0 - angle) < 0.05:
+            return 0.0, bounds
+        width, height = abs(box[2] - box[0]), abs(box[3] - box[1])
+        middle = fitz.Point((bounds.x0 + bounds.x1) / 2, (bounds.y0 + bounds.y1) / 2)
+        return angle, fitz.Rect(
+            middle.x - width / 2, middle.y - height / 2, middle.x + width / 2, middle.y + height / 2
+        )
+
+    def _turn_stamp(self, page: fitz.Page, stamp_xref: int, rect: fitz.Rect, angle: float) -> None:
+        """Make the stamp draw its picture over `rect` turned by `angle`.
+        Written key by key, and last: MuPDF makes a stamp's appearance anew
+        -- upright -- whenever its rectangle is set or it is updated."""
+        assert self.document is not None
+        document = self.document
+        appearance = int(document.xref_get_key(stamp_xref, "AP/N")[1].split()[0])
+        radians = math.radians(angle)
+        cosine, sine = math.cos(radians), math.sin(radians)
+        width, height = rect.width, rect.height
+        document.xref_set_key(appearance, "BBox", f"[0 0 {width:.4f} {height:.4f}]")
+        document.xref_set_key(
+            appearance, "Matrix", f"[{cosine:.6f} {-sine:.6f} {sine:.6f} {cosine:.6f} 0 0]"
+        )
+        document.update_stream(appearance, f"q {width:.4f} 0 0 {height:.4f} 0 0 cm /I Do Q".encode("ascii"))
+        bounds = self._turned_bounds(rect, angle) * page.rotation_matrix * ~page.transformation_matrix
+        bounds.normalize()
+        document.xref_set_key(
+            stamp_xref, "Rect", f"[{bounds.x0:.4f} {bounds.y0:.4f} {bounds.x1:.4f} {bounds.y1:.4f}]"
+        )
+
     def _add_image_stamp(
         self,
         page: fitz.Page,
@@ -25561,6 +29176,13 @@ class CanvasEditingMixin:
         except Exception:
             return False
         order = [xref for xref, _kind, _name in entries]
+        if 0 in order:
+            # An annotation written into the page's list itself, with no
+            # number: its order is left as it is (_write_annot_order). Asked
+            # for its /Subj by number 0, MuPDF raised, and making a
+            # highlight on such a page ended in an error nothing handled
+            # (7.9's review).
+            return False
 
         def is_markup(xref: int, kind: int) -> bool:
             if kind in self.TEXT_MARKUP_KINDS:
@@ -25859,6 +29481,10 @@ class CanvasEditingMixin:
     def _open_canvas_image_box(self, marker: fitz.Annot) -> bool:
         if self.document is None:
             return False
+        # A stamp is an annotation; a picture of the PDF's own is in the page
+        # (7.9: a signed PDF).
+        if not self._signed_gate("annotation" if self._is_image_stamp(marker) else "content"):
+            return False
         metadata = self._image_edit_metadata(marker)
         if metadata is None:
             return False
@@ -25885,8 +29511,11 @@ class CanvasEditingMixin:
         if image.isNull():
             return False
         pixmap = QPixmap.fromImage(image)
+        # Turned (7.9): held in its own upright box, about the same middle,
+        # the page showing it turned -- as a turned text box is held.
+        angle, upright = self._stamp_turn(marker) if self._is_image_stamp(marker) else (0.0, fitz.Rect(marker.rect))
         return self._open_image_box(
-            pixmap, image_xref, _content_xref, source_xref, crop, fitz.Rect(marker.rect), marker.xref
+            pixmap, image_xref, _content_xref, source_xref, crop, upright, marker.xref, angle=angle
         )
 
     def _open_image_box(
@@ -25898,12 +29527,16 @@ class CanvasEditingMixin:
         crop: QRectF,
         rect: fitz.Rect,
         marker_xref: int | None,
+        angle: float = 0.0,
     ) -> bool:
         """Open the box for a picture. `marker_xref` is None for a picture
         that has no marker yet (one that came with the PDF): it gets one
-        only once it is changed -- see _take_up_active_image."""
+        only once it is changed -- see _take_up_active_image. `angle`: how
+        far it is turned (7.9); `rect` is then its own box, upright."""
         self._finish_active_overlays()
         self._clear_annotation_selection()
+        self._active_image_angle = float(angle) % 360.0
+        self._active_image_original_angle = self._active_image_angle
         self._active_image_marker_xref = marker_xref
         self._active_image_xref = image_xref
         self._active_image_source_xref = source_xref
@@ -25922,6 +29555,7 @@ class CanvasEditingMixin:
         self._active_image_pending = (image_xref, content_xref)
         self._active_image_content_xref = content_xref
         box.preview.page_shows_it = True
+        box.preview.turn = self._active_image_angle
         box.geometryEdited.connect(self._active_image_geometry_changed)
         box.cropEdited.connect(self._active_image_geometry_changed)
         box.cropModeChanged.connect(self._image_crop_mode_changed)
@@ -25936,6 +29570,7 @@ class CanvasEditingMixin:
     def _image_crop_mode_changed(self, cropping: bool) -> None:
         """Entering says what the handles are for -- where the removed Crop
         button's tooltip used to. Leaving writes the crop to the page."""
+        self._update_arrange_controls()
         if cropping:
             return
         if self._committing_image_box or self.document is None:
@@ -25945,28 +29580,37 @@ class CanvasEditingMixin:
         # take the picture up again: PowerPoint leaves it selected too.
         marker_xref = self._active_image_marker_xref
         page_index = self._active_image_page_index
+        held_at = fitz.Rect(self._active_image_rect or fitz.Rect())
         self._last_committed_image_marker = None
         self._commit_active_image_box()
         # Put down, a picture can be another stamp (6.19).
         marker_xref = self._last_committed_image_marker or marker_xref
-        if marker_xref is None or page_index != self.page_index:
+        if page_index != self.page_index:
             return
 
         def reselect() -> None:
             if self.document is None or self._active_image_box is not None:
                 return
-            try:
-                # Bind the page to a name: an Annot holds only a weak
-                # reference to it, and reading the rect of one whose page
-                # has been collected is an access violation, not an
-                # exception.
-                page = self.document[self.page_index]
-                marker = page.load_annot(marker_xref)
-            except Exception:
-                return
-            self._open_canvas_image_box(marker)
+            # Bind the page to a name: an Annot holds only a weak reference
+            # to it, and reading the rect of one whose page has been
+            # collected is an access violation, not an exception.
+            page = self.document[self.page_index]
+            marker = None
+            if marker_xref is not None:
+                try:
+                    marker = page.load_annot(marker_xref)
+                except Exception:
+                    marker = None
+            if marker is not None:
+                self._open_canvas_image_box(marker)
+            elif not held_at.is_empty:
+                # A picture of the PDF's own left uncropped: its provisional
+                # marker was taken back, so it is held where it is, as the
+                # crop of one put in with pdfNote leaves it held
+                # (2026-11-21's walk: it was put down).
+                self._hold_page_picture_at(page, (held_at.tl + held_at.br) / 2)
 
-        QTimer.singleShot(0, reselect)
+        QTimer.singleShot(0, self, reselect)
 
     def _give_active_image_a_marker(self) -> int | None:
         """The hidden marker a picture that came with the PDF needs before
@@ -25986,7 +29630,11 @@ class CanvasEditingMixin:
             if session is not None
             else None
         )
+        depth = len(session.undo_stack) if session is not None else 0
         self._snapshot_for_edit()
+        if session is not None and len(session.undo_stack) > depth:
+            # The change that follows joins this step (_snapshot_for_edit).
+            self._image_marker_step = (session, session.undo_stack[-1])
         page = self.document[page_index]
         content_xref = self._active_image_content_xref
         marker = page.add_rect_annot(fitz.Rect(rect))
@@ -26005,14 +29653,39 @@ class CanvasEditingMixin:
             self._provisional_image_marker = (session, marker.xref, page_index, before)
         return marker.xref
 
-    def _take_up_active_image(self) -> None:
+    def _active_image_edit_kind(self) -> str:
+        """What changing the picture in the box is (7.9: a signed PDF): a
+        stamp is an annotation; a picture of the PDF's own is in the page."""
+        try:
+            page = self.document[self._active_image_page_index]
+            return "annotation" if self._active_image_stamp(page) is not None else "content"
+        except Exception:
+            return "content"
+
+    def _take_up_active_image(self) -> bool:
         """The picture in the box is being changed: give it a marker if it
-        has none, and lift it off the page so the box alone shows it."""
+        has none, and lift it off the page so the box alone shows it.
+
+        False when the change is not to be made: a signed PDF whose signers
+        do not allow it (7.9's review). Holding the picture changed nothing
+        and asked nothing; its first change is here, so here it is that the
+        box is let go of, the picture where it was, and the question asked
+        -- once the key or the drag that brought it is over. This was not
+        asked at all: a picture of the signed PDF's own was moved in place,
+        written into the signed document without a word."""
+        if (
+            self._active_image_pending is not None
+            and self.document is not None
+            and not self._signed_edit_allowed(self._active_image_edit_kind())
+        ):
+            self._close_active_image_box()
+            QTimer.singleShot(0, self, lambda: self._offer_unsigned_copy(""))
+            return False
         pending, self._active_image_pending = self._active_image_pending, None
         if pending is None or self.document is None:
-            return
+            return True
         if self._give_active_image_a_marker() is None:
-            return
+            return True
         image_xref, content_xref = pending
         page_index = self._active_image_page_index
         if 0 <= page_index < len(self.document):
@@ -26032,6 +29705,8 @@ class CanvasEditingMixin:
             # The box shows the picture from now on, wherever it goes.
             box.preview.page_shows_it = False
             box.preview.update()
+            box.sync_turned()
+        return True
 
     def _lift_image_off_the_page(
         self, page: fitz.Page, image_xref: int, content_xref: int | None
@@ -26135,7 +29810,8 @@ class CanvasEditingMixin:
         if self._active_image_pending is not None and not self._committing_image_box:
             # The first real change: now the picture needs its marker, and
             # the page must stop drawing it where it was.
-            self._take_up_active_image()
+            if not self._take_up_active_image():
+                return
         top_left = box.mapTo(self._box_host(), box.preview.pos())
         image_origin = self._box_origin()
         screen_rect = QRectF(
@@ -26252,9 +29928,18 @@ class CanvasEditingMixin:
         image_xref = self._active_image_xref
         source_xref = self._active_image_source_xref or image_xref
         original_crop = QRectF(self._active_image_original_crop)
-        changed = not self._rect_close(rect, original_rect) or not self._crop_close(
+        angle = float(getattr(self, "_active_image_angle", 0.0)) % 360.0
+        original_angle = float(getattr(self, "_active_image_original_angle", 0.0)) % 360.0
+        turned = abs((angle - original_angle + 180.0) % 360.0 - 180.0) > 0.05
+        changed = turned or not self._rect_close(rect, original_rect) or not self._crop_close(
             crop, original_crop
         )
+        if changed and not self._signed_edit_allowed(self._active_image_edit_kind()):
+            # Not reached by any way known: the first change asks
+            # (_take_up_active_image). Whatever comes here all the same is
+            # not written into a signed PDF (7.9's review).
+            self._close_active_image_box()
+            return
         if changed and marker_xref is None:
             marker_xref = self._give_active_image_a_marker()
         provisional = self._provisional_image_marker
@@ -26314,6 +29999,10 @@ class CanvasEditingMixin:
                 stamp.set_info(subject=self._image_subject(drawn_xref, None, source_xref, crop))
                 stamp.update()
                 self._keep_image_source(marker_xref, source_xref, drawn_xref)
+            if min(angle, 360.0 - angle) > 0.05:
+                # Turned (7.9): last, after everything that makes the
+                # stamp's appearance anew (_turn_stamp).
+                self._turn_stamp(page, stamp.xref, rect, angle)
             # The box opened again afterwards goes by this.
             self._last_committed_image_marker = stamp.xref
         except Exception as exc:
@@ -26329,7 +30018,53 @@ class CanvasEditingMixin:
         self._mark_dirty()
         self._redraw_before_painting()
 
+    @staticmethod
+    def _shape_keepsakes(annotation: fitz.Annot) -> dict[str, Any]:
+        """What a shape has that its box does not change, to be given to
+        the shape made again when the box is put down (7.9): a fill, its
+        opacity, a dashed line, who made it and what they wrote on it --
+        and, of a line that is not pdfNote's, its ends and its subject. A
+        shape of another program's would have lost them by being moved."""
+        kept: dict[str, Any] = {}
+        try:
+            fill = (annotation.colors or {}).get("fill")
+            if fill:
+                kept["fill"] = tuple(float(value) for value in fill[:3])
+            opacity = float(annotation.opacity)
+            if 0.0 <= opacity < 0.999:
+                kept["opacity"] = opacity
+            dashes = (annotation.border or {}).get("dashes")
+            if dashes:
+                kept["dashes"] = [int(value) for value in dashes]
+            info = annotation.info or {}
+            for name in ("title", "content"):
+                if info.get(name):
+                    kept[name] = str(info[name])
+            subject = str(info.get("subject") or "")
+            if annotation.type[0] == fitz.PDF_ANNOT_LINE and not subject.startswith(("SumiArrow", "SumiLine")):
+                kept["line_ends"] = tuple(annotation.line_ends)
+                kept["subject"] = subject
+        except Exception:
+            pass  # what could be read is kept
+        return kept
+
+    @staticmethod
+    def _give_shape_its_keepsakes(made: fitz.Annot, kept: dict[str, Any], width: float) -> None:
+        """Before the new shape is updated."""
+        if kept.get("dashes"):
+            made.set_border(width=width, dashes=kept["dashes"])
+        if "opacity" in kept:
+            made.set_opacity(kept["opacity"])
+        details = {name: kept[name] for name in ("title", "content") if name in kept}
+        if details:
+            made.set_info(**details)
+
     def _open_canvas_object_box(self, annotation: fitz.Annot) -> bool:
+        if not self._signed_gate("annotation", self._again_on_marks(
+            lambda: self._with_selected_mark(self._open_canvas_object_box),
+            [annotation.xref],
+        )):  # 7.9: a signed PDF
+            return False
         subject = str(annotation.info.get("subject") or "")
         if subject.startswith("SumiArrow"):
             kind, title = "arrow", tr("⋮⋮  矢印")
@@ -26339,10 +30074,27 @@ class CanvasEditingMixin:
             kind, title = "rectangle", tr("⋮⋮  四角形")
         elif annotation.type[0] == fitz.PDF_ANNOT_INK:
             kind, title = "ink", tr("⋮⋮  手書き")
+        elif annotation.type[0] == fitz.PDF_ANNOT_SQUARE:
+            # Another program's rectangle (7.9, the owner): held in a box
+            # as pdfNote's own is. It was only selected, with a dotted
+            # rectangle and no size boxes.
+            kind, title = "rectangle", tr("⋮⋮  四角形")
+        elif annotation.type[0] == fitz.PDF_ANNOT_LINE:
+            # And another program's line; an arrow, with a head at an end.
+            try:
+                ends = tuple(annotation.line_ends)
+            except Exception:
+                ends = (fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_NONE)
+            if any(end != fitz.PDF_ANNOT_LE_NONE for end in ends):
+                kind, title = "arrow", tr("⋮⋮  矢印")
+            else:
+                kind, title = "line", tr("⋮⋮  直線")
         else:
             return False
+        keepsakes = self._shape_keepsakes(annotation)
         self._finish_active_overlays()
         self._clear_annotation_selection()
+        self._active_object_keepsakes = keepsakes
         line_points = (
             self._annotation_line_points(annotation)
             if kind in ("arrow", "line")
@@ -26631,6 +30383,7 @@ class CanvasEditingMixin:
             action.setVisible(wanted)
             self._post_toolbar_relayout()
         self._update_arrange_controls()
+        self._update_text_format_visibility()
         if held is None:
             return
         self._show_held_dimensions(
@@ -26653,27 +30406,52 @@ class CanvasEditingMixin:
         action = getattr(self, "arrange_action", None)
         if action is None:
             return
-        wanted = self.document is not None and (
+        # Not while a note's window is open: the toolbar is then for the
+        # note's words (7.9).
+        wanted = self.document is not None and not self._note_editor_open() and (
             self._held_dimensions() is not None or bool(self._selected_annotation_xrefs)
         )
         if action.isVisible() != wanted:
             action.setVisible(wanted)
             self._post_toolbar_relayout()
+        # Crop with a picture held only, down while it crops.
+        crop = getattr(self, "act_crop_image", None)
+        box = getattr(self, "_active_image_box", None)
+        if crop is not None:
+            picture = wanted and box is not None
+            button = self._arrange_buttons.get(crop)
+            if button is not None and button.isVisibleTo(self.arrange_widget) != picture:
+                button.setVisible(picture)
+                self._post_toolbar_relayout()
+            crop.setEnabled(picture)
+            crop.blockSignals(True)
+            crop.setChecked(bool(picture and box.crop_mode))
+            crop.blockSignals(False)
+        align = getattr(self, "align_action", None)
+        several = (
+            self.document is not None and len(self._selected_annotation_xrefs) > 1
+            and not self._note_editor_open()
+        )
+        if align is not None and align.isVisible() != several:
+            align.setVisible(several)
+            self._post_toolbar_relayout()
 
-    def _held_dimensions(self) -> tuple[float, float, float | None] | None:
-        """The width and height of what is held, in points, and its angle:
-        None for a picture or a text box, which do not turn."""
+    def _held_dimensions(self) -> tuple[float, float, float] | None:
+        """The width and height of what is held, in points, and its angle
+        -- a shape's, a text box's (7.0) or a picture's (7.9)."""
         if (
             getattr(self, "_active_object_box", None) is not None
             and getattr(self, "_active_object_rect", None) is not None
         ):
             return self._held_shape_dimensions()
-        for box, rect in (
-            ("_active_image_box", "_active_image_rect"), ("_active_text_box", "_active_text_rect")
-        ):
-            if getattr(self, box, None) is not None and getattr(self, rect, None) is not None:
-                held = fitz.Rect(getattr(self, rect))
-                return held.width, held.height, None
+        if getattr(self, "_active_image_box", None) is not None and getattr(self, "_active_image_rect", None) is not None:
+            held = fitz.Rect(self._active_image_rect)
+            # A picture turns (7.9).
+            return held.width, held.height, float(getattr(self, "_active_image_angle", 0.0))
+        if getattr(self, "_active_text_box", None) is not None and getattr(self, "_active_text_rect", None) is not None:
+            # A text box turns (7.0).
+            held = fitz.Rect(self._active_text_rect)
+            return held.width, held.height, float(getattr(self, "_active_text_angle", 0.0))
         return None
 
     def _held_shape_dimensions(self) -> tuple[float, float, float]:
@@ -26710,11 +30488,14 @@ class CanvasEditingMixin:
         bounds = self.document[self.page_index].rect
         if self._active_image_box is not None and self._active_image_rect is not None:
             self._active_image_geometry_changed()
+            if self._active_image_box is None:
+                return
             rect = fitz.Rect(self._active_image_rect)
             change = value - (rect.width if side == "width" else rect.height)
             if abs(change) < 1e-6:
                 return
-            self._take_up_active_image()
+            if not self._take_up_active_image():
+                return
             self._active_image_rect = self._resize_rect_keeping_proportions(
                 rect, change if side == "width" else 0.0, change if side == "height" else 0.0,
                 bounds, inside=False, centre=True,
@@ -26843,11 +30624,76 @@ class CanvasEditingMixin:
         self._layout_active_object_box()
 
     def _apply_shape_rotation_from_toolbar(self) -> None:
+        if self._active_text_box is not None:
+            self._turn_active_text_box(self.shape_rotation_spin.value())
+            return
+        if self._active_image_box is not None:
+            self._turn_active_image(self.shape_rotation_spin.value())
+            return
         if self._active_object_box is None:
             return
         current = self._held_shape_dimensions()[2]
         delta = (self.shape_rotation_spin.value() - current + 180.0) % 360.0 - 180.0
         self._rotate_active_object_by(delta)
+
+    def _turn_active_image(self, angle: float) -> bool:
+        """Turn the picture in hand to `angle` degrees (7.9), as a text box
+        is turned: written onto the page turned -- one step of undo -- and
+        held again, so the page shows it turned and the next turn or move
+        goes on from there. The keyboard stays where it was."""
+        if self.document is None or self._active_image_box is None:
+            return False
+        angle = float(angle) % 360.0
+        current = float(getattr(self, "_active_image_angle", 0.0))
+        if abs((angle - current + 180.0) % 360.0 - 180.0) < 0.05:
+            return False
+        if not self._take_up_active_image():
+            # A signed PDF that does not allow it: asked, not turned.
+            return False
+        focus = QApplication.focusWidget()
+        self._active_image_angle = angle
+        self._last_committed_image_marker = None
+        self._commit_active_image_box()
+        made = getattr(self, "_last_committed_image_marker", None)
+        if made is None:
+            return False
+        self._clear_annotation_selection()
+        self._selected_annotation_xrefs = [made]
+        self._hold_single_selection()
+        if focus is not None and focus in (
+            self.shape_rotation_spin, self.shape_rotation_spin.lineEdit(),
+        ):
+            self.shape_rotation_spin.setFocus()
+        self._update_shape_format_controls()
+        return True
+
+    def _turn_active_text_box(self, angle: float) -> bool:
+        """Turn the text box in hand to `angle` degrees (7.0): it is written
+        onto the page turned -- one step of undo -- and held again, so the
+        page shows it turned and the next turn or move goes on from there.
+        The keyboard stays where it was: stepping the angle box with the
+        arrow keys went on stepping it."""
+        if self.document is None or self._active_text_box is None:
+            return False
+        angle = float(angle) % 360.0
+        if abs(angle - float(getattr(self, "_active_text_angle", 0.0))) < 0.05:
+            return False
+        focus = QApplication.focusWidget()
+        self._active_text_angle = angle
+        self._last_committed_text_xref = None
+        self._commit_active_text_box()
+        made = getattr(self, "_last_committed_text_xref", None)
+        if made is None:
+            return False
+        self._clear_annotation_selection()
+        self._selected_annotation_xrefs = [made]
+        self._hold_single_selection()
+        if focus is not None and focus in (
+            self.shape_rotation_spin, self.shape_rotation_spin.lineEdit(),
+        ):
+            self.shape_rotation_spin.setFocus()
+        self._update_shape_format_controls()
+        return True
 
     def _rotate_active_object_by(self, degrees: float) -> None:
         if self._active_object_box is None or abs(degrees) < 0.001:
@@ -27108,12 +30954,17 @@ class CanvasEditingMixin:
         try:
             page = self.document[page_index]
             annotation = page.load_annot(xref)
+            kept = dict(getattr(self, "_active_object_keepsakes", None) or {})
             if kind == "rectangle":
                 page.delete_annot(annotation)
                 polygon = page.add_polygon_annot(shape_points)
-                polygon.set_colors(stroke=color)
+                if "fill" in kept:
+                    polygon.set_colors(stroke=color, fill=kept["fill"])
+                else:
+                    polygon.set_colors(stroke=color)
                 polygon.set_border(width=width or 2)
                 polygon.set_info(subject="SumiShape|rectangle")
+                self._give_shape_its_keepsakes(polygon, kept, width or 2)
                 polygon.update()
             elif kind == "ink":
                 # MuPDF will not give an ink annotation a new rectangle
@@ -27126,11 +30977,22 @@ class CanvasEditingMixin:
                 )
                 ink.set_colors(stroke=color)
                 ink.set_border(width=width or NEW_MARK_WIDTHS["ink"])
+                self._give_shape_its_keepsakes(ink, kept, width or NEW_MARK_WIDTHS["ink"])
                 ink.update()
             else:
                 page.delete_annot(annotation)
                 line = page.add_line_annot(line_points[0], line_points[1])
-                if kind == "arrow":
+                line_width = width or (ARROW_STROKE_WIDTH if kind == "arrow" else 2)
+                if "line_ends" in kept:
+                    # Another program's line: its own ends and subject,
+                    # so it is known for the same line the next time.
+                    line.set_line_ends(*kept["line_ends"])
+                    if "fill" in kept:
+                        line.set_colors(stroke=color, fill=kept["fill"])
+                    else:
+                        line.set_colors(stroke=color)
+                    line.set_info(subject=kept.get("subject") or "")
+                elif kind == "arrow":
                     line.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
                     line.set_colors(stroke=color, fill=color)
                     line.set_info(subject="SumiArrow")
@@ -27138,9 +31000,8 @@ class CanvasEditingMixin:
                     line.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_NONE)
                     line.set_colors(stroke=color)
                     line.set_info(subject="SumiLine")
-                line.set_border(
-                    width=width or (ARROW_STROKE_WIDTH if kind == "arrow" else 2)
-                )
+                line.set_border(width=line_width)
+                self._give_shape_its_keepsakes(line, kept, line_width)
                 line.update()
         except Exception as exc:
             self._rollback_edit(checkpoint)
@@ -27162,9 +31023,11 @@ class AnnotationsMixin:
         self._moving_note_xref = None
         if hasattr(self, "page_surface"):
             self.page_surface.selected_annotation_boxes.clear()
+            self.page_surface.note_anchor_boxes.clear()
             self.page_surface.update()
         for label in getattr(self, "_continuous_labels", {}):
             label.selected_annotation_boxes.clear()
+            label.note_anchor_boxes.clear()
             label.update()
 
     def _sync_annotation_selection(self) -> None:
@@ -27176,20 +31039,40 @@ class AnnotationsMixin:
         for xref in self._selected_annotation_xrefs:
             try:
                 annotation = page.load_annot(xref)
-                boxes.append(self._page_rect_to_screen(annotation.rect))
+                boxes.append(self._page_rect_to_screen(annotation_frame_rect(annotation)))
                 valid.append(xref)
             except Exception:
                 continue
         self._selected_annotation_xrefs = valid
+        # The words of the notes in hand -- selected, or open in their
+        # window -- lit on the page, and only then (7.9, the owner).
+        anchors: list[QRectF] = []
+        lit = [*valid]
+        open_note = getattr(self, "_note_dialog_xref", None)
+        if open_note is not None and open_note not in lit:
+            lit.append(open_note)
+        for xref in lit:
+            try:
+                if page.load_annot(xref).type[0] != fitz.PDF_ANNOT_TEXT:
+                    continue
+            except Exception:
+                continue
+            anchors.extend(self._page_rect_to_screen(rect) for rect in note_anchor_rects(self.document, xref))
         self._update_arrange_controls()
+        # Copy and Cut come and go with the selection (7.0).
+        self._update_text_format_visibility()
         canvas = self._canvas_widget()
         if canvas is self.page_surface:
             self.page_surface.selected_annotation_boxes = [
                 box.translated(self._active_canvas_page_origin) for box in boxes
             ]
+            self.page_surface.note_anchor_boxes = [
+                box.translated(self._active_canvas_page_origin) for box in anchors
+            ]
             self.page_surface.update()
         elif isinstance(canvas, ClickablePageLabel):
             canvas.selected_annotation_boxes = boxes
+            canvas.note_anchor_boxes = anchors
             canvas.update()
 
     def _screen_point_to_page(self, point: QPointF) -> fitz.Point:
@@ -27243,7 +31126,7 @@ class AnnotationsMixin:
         # edited, so cache it keyed by (document, page number) and reuse it
         # across renders/zoom changes; _invalidate_render_cache() evicts it
         # alongside the pixmap cache whenever a page is actually edited.
-        cache_key = (id(self.document), page.number) if self.document is not None else None
+        cache_key = (document_key(self.document), page.number) if self.document is not None else None
         if cache_key is not None:
             cached = self._page_characters_cache.get(cache_key)
             if cached is not None:
@@ -27275,7 +31158,7 @@ class AnnotationsMixin:
     def _text_selection_boxes(self, page: fitz.Page, scale: float) -> list[QRectF]:
         if self.document is None:
             return []
-        cache_key = (id(self.document), page.number, round(scale * 10_000), self.extra_rotation)
+        cache_key = (document_key(self.document), page.number, round(scale * 10_000), self.extra_rotation)
         cached = self._text_selection_boxes_cache.get(cache_key)
         if cached is not None:
             self._text_selection_boxes_cache.move_to_end(cache_key)
@@ -27334,6 +31217,116 @@ class AnnotationsMixin:
             text_lines.append("".join(character for _rect, character in items))
             count += len(items)
         return line_rects, "\n".join(text_lines), count
+
+    def _again_on_text_selection(self, action: Callable[[], Any]) -> Callable[[], Any] | None:
+        """For a command on the selected words of a signed PDF that goes on
+        in an unsigned copy: the same words selected again in the copy --
+        the same page, the same text -- and then the command. The copy
+        opened with nothing selected, and said to do it again, so the words
+        had to be found and selected a second time (2026-11-21's walk).
+        None when no words are selected."""
+        widget = self._text_selection_widget()
+        if getattr(widget, "text_selection_range", None) is None:
+            return None
+        position, anchor = widget.caret_position, widget.selection_anchor
+        segment, after = getattr(widget, "_caret_segment", None), getattr(widget, "_caret_after", False)
+        page_index = self.page_index
+
+        def again() -> None:
+            if self.document is None or not 0 <= page_index < len(self.document):
+                return
+            if self.page_index != page_index:
+                self.go_to_page(page_index)
+            target = self._canvas_widget()
+            # A continuous page reads its words as it scrolls near, and the
+            # copy's page was just built: without them the caret had nothing
+            # to select, and the command did not run (Windows, 1.1.1).
+            if isinstance(target, ClickablePageLabel):
+                self._ensure_label_text_layout(target)
+            if hasattr(target, "set_caret") and position is not None:
+                target.set_caret(position, anchor, after=after, segment=segment, reveal=False)
+            if getattr(self._text_selection_widget(), "text_selection_range", None) is not None:
+                action()
+
+        return again
+
+    def _again_on_marks(
+        self, action: Callable[[], Any], xrefs: list[int] | None = None
+    ) -> Callable[[], Any] | None:
+        """For a command on selected marks of a signed PDF that goes on in
+        an unsigned copy: the same marks selected in the copy -- found by
+        their kind and place, as the copy numbers its objects anew -- and
+        then the command. The copy opened with nothing selected, and the
+        marks had to be found and selected again (2026-11-21's walk). None
+        when nothing is selected."""
+        if self.document is None:
+            return None
+        xrefs = list(self._selected_annotation_xrefs if xrefs is None else xrefs)
+        if not xrefs:
+            return None
+        page_index = self.page_index
+        page = self.document[page_index]
+        marks: list[tuple[int, fitz.Rect]] = []
+        for xref in xrefs:
+            try:
+                annotation = page.load_annot(xref)
+                marks.append((annotation.type[0], fitz.Rect(annotation.rect)))
+            except Exception:
+                return None
+
+        def again() -> None:
+            if self.document is None or not 0 <= page_index < len(self.document):
+                return
+            if self.page_index != page_index:
+                self.go_to_page(page_index)
+            copy_page = self.document[page_index]
+            found: list[int] = []
+            for kind, rect in marks:
+                match = next((
+                    annotation.xref for annotation in copy_page.annots()
+                    if annotation.type[0] == kind and annotation.xref not in found
+                    and all(abs(a - b) < 0.5 for a, b in zip(annotation.rect, rect))
+                ), None)
+                if match is None:
+                    return
+                found.append(match)
+            self._clear_annotation_selection()
+            self._selected_annotation_xrefs = found
+            self._sync_annotation_selection()
+            action()
+
+        return again
+
+    def _with_selected_mark(self, action: Callable[[fitz.Annot], Any]) -> Any:
+        """`action` on the one selected mark, its page bound to a name: an
+        Annot holds only a weak reference to its page."""
+        if self.document is None or not self._selected_annotation_xrefs:
+            return None
+        page = self.document[self.page_index]
+        try:
+            annotation = page.load_annot(self._selected_annotation_xrefs[0])
+        except Exception:
+            return None
+        return action(annotation)
+
+    def _again_on_form_field(self, field: dict[str, Any]) -> Callable[[], Any]:
+        """A field clicked in a signed PDF that does not allow filling it
+        in: the same field, by its name, in the unsigned copy."""
+        page_index, name = self.page_index, str(field.get("name") or "")
+
+        def again() -> None:
+            if self.document is None or not 0 <= page_index < len(self.document):
+                return
+            if self.page_index != page_index:
+                self.go_to_page(page_index)
+            same = next((
+                candidate for candidate in self._page_form_fields(self.document[page_index])
+                if str(candidate.get("name") or "") == name
+            ), None)
+            if same is not None:
+                self.activate_form_field(same)
+
+        return again
 
     def _text_selection_widget(self) -> QWidget:
         """The page widget holding the page-text selection: the current one,
@@ -27463,6 +31456,10 @@ class AnnotationsMixin:
         return self._markup_xrefs_by_kind(page, line_rects)[kind]
 
     def _apply_markup_to_selection(self, kind: str) -> bool:
+        if not self._signed_gate(  # 7.9: a signed PDF
+            "annotation", self._again_on_text_selection(lambda: self._apply_markup_to_selection(kind))
+        ):
+            return False
         if self.document is None:
             return False
         target = self._current_markup_target()
@@ -27576,9 +31573,7 @@ class AnnotationsMixin:
         line_edit.setContextMenuPolicy(Qt.CustomContextMenu)
 
         def show(position: QPoint, editor: QLineEdit = line_edit) -> None:
-            if self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
-                return
-            self._text_input_context_menu(editor).exec(editor.mapToGlobal(position))
+            self._context_menu_ready(self._text_input_context_menu(editor)).exec(editor.mapToGlobal(position))
 
         line_edit.customContextMenuRequested.connect(show)
 
@@ -27632,7 +31627,7 @@ class AnnotationsMixin:
         """The page's and the navigation lists' menus all open here, by
         mouse or by Shift+F10 -- one place a test can stand in for, since a
         modal exec() never returns offscreen."""
-        self._apply_premium_menu_marks(menu)
+        self._context_menu_ready(menu)
         menu.exec(position)
         self._open_menu_size_row = None
 
@@ -27765,12 +31760,23 @@ class AnnotationsMixin:
         page = self.document[self.page_index]
         target = self._annotation_at_point(page, page_point)
         if target is not None:
+            if target.xref in self._selected_annotation_xrefs and len(self._selected_annotation_xrefs) > 1:
+                # One of several selected: the menu of them all, which they
+                # stay selected for -- align among it (7.0). It used to
+                # select the one under the pointer alone.
+                return self._annotation_context_menu()
             return self._annotation_menu_for(target)
 
         form_field = self._form_field_at_point(page_point)
         if form_field is not None:
             self._clear_annotation_selection()
             return self._form_field_context_menu(form_field)
+
+        if self._hold_page_picture_at(page, page_point):
+            # A picture of the PDF's own: held, with the menu of what the
+            # toolbar offers for it (7.9).
+            self._clear_annotation_selection()
+            return self._annotation_context_menu(page_picture=True)
 
         widget = self._canvas_widget()
         if getattr(widget, "text_selection_range", None) is not None:
@@ -27852,12 +31858,12 @@ class AnnotationsMixin:
 
     @staticmethod
     def _show_held_dimensions(
-        spins: dict[str, QDoubleSpinBox], held: tuple[float, float, float | None]
+        spins: dict[str, QDoubleSpinBox], held: tuple[float, float, float]
     ) -> None:
+        # Everything held turns, a picture too (7.9): its angle box was
+        # greyed out, with "a picture cannot be turned" for its tip.
         width, height, angle = held
-        spins["angle"].setEnabled(angle is not None)
-        spins["angle"].setToolTip("" if angle is not None else tr("画像とテキスト ボックスは回転できません"))
-        for side, value in (("width", width), ("height", height), ("angle", angle or 0.0)):
+        for side, value in (("width", width), ("height", height), ("angle", angle)):
             spin = spins[side]
             if spin.hasFocus() and spin.lineEdit().isModified():
                 continue
@@ -27866,7 +31872,14 @@ class AnnotationsMixin:
             spin.blockSignals(False)
 
     def _apply_held_angle(self, value: float) -> None:
-        """An angle typed or stepped in the menu, for a held shape."""
+        """An angle typed or stepped in the menu, for a held shape -- or a
+        held text box (7.0)."""
+        if self._active_text_box is not None:
+            self._turn_active_text_box(value)
+            return
+        if self._active_image_box is not None:
+            self._turn_active_image(value)
+            return
         if self._active_object_box is None:
             return
         self.shape_rotation_spin.blockSignals(True)
@@ -27875,6 +31888,44 @@ class AnnotationsMixin:
         self._apply_shape_rotation_from_toolbar()
         self._update_shape_format_controls()
 
+    def _focus_held_size(self, side: str) -> bool:
+        """Alt+Shift+W, H and R (7.0): the width, height or angle box of
+        the object in hand -- or of the one object selected, taken in hand
+        as a click takes it -- with its value selected to type over."""
+        if self.document is None:
+            return False
+        if self._held_dimensions() is None:
+            self._hold_single_selection()
+        held = self._held_dimensions()
+        if held is None:
+            self.status_label.setText(tr("項目を選択してください"))
+            return False
+        self._update_shape_format_controls()
+        if self._text_format_relayout_pending:
+            self._relayout_for_text_format()
+        spin = {
+            "width": self.shape_width_spin, "height": self.shape_height_spin,
+            "angle": self.shape_rotation_spin,
+        }[side]
+        spin.setFocus(Qt.ShortcutFocusReason)
+        spin.lineEdit().selectAll()
+        return True
+
+    def _toggle_writing_filter(self) -> None:
+        """Ctrl+Shift+L (7.0): the filter of the 文字装飾 or オブジェクト
+        tab -- the one shown, or 文字装飾 -- shown or put away, as Excel's
+        key turns its filter on and off."""
+        if not self.sidebar.isVisible():
+            self.toggle_sidebar()
+        pane = self.tabs.currentWidget()
+        if pane not in self.writing_panes:
+            pane = self.writing_panes[0]
+            self.tabs.setCurrentWidget(pane)
+        pane.filter_action.trigger()
+        if pane.filter_panel.isVisible():
+            pane.filter_panel.setFocus(Qt.ShortcutFocusReason)
+            pane.filter_panel.focusNextChild()
+
     def _held_box_menu(self, global_position: QPoint) -> None:
         """A right-click on a held object's frame or handles opens the menu
         its page shows, and the object stays held (6.20). The frames of
@@ -27882,8 +31933,6 @@ class AnnotationsMixin:
         crop); and in continuous scrolling, where they stand over the column
         of pages, a right-click on one reached no page and opened none."""
         if self.document is None or not self._holds_object():
-            return
-        if self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
             return
         if self._active_text_box is not None:
             held, rect = self._active_text_xref, self._active_text_rect
@@ -27953,15 +32002,22 @@ class AnnotationsMixin:
         )
         menu.addSeparator()
         self._menu_commands(menu, (self.act_undo, self.act_redo, None))
+        # A sticky note and a text box where the page was clicked, and the
+        # sidebar, at once (7.9, the owner): the note was here and again in
+        # 挿入, and the text box and the sidebar were a submenu away.
         self._add_menu_action(
-            menu, "ここに付箋を追加",
+            menu, "付箋を追加",
             lambda _checked=False, point=page_point: self.add_note_at_page_point(point),
             icon="note",
         )
+        self._add_menu_action(
+            menu, "テキスト ボックスを追加",
+            lambda _checked=False, point=page_point: self.add_text_box_at_page_point(point),
+            icon="text",
+        )
+        self._menu_commands(menu, (self.act_sidebar, None))
         insert_menu = self._submenu(menu, "挿入", "insert")
         for label, mode in (
-            ("テキスト ボックス", "text"),
-            ("付箋", "note"),
             ("手書き", "ink"),
             ("四角形", "rectangle"),
             ("矢印", "arrow"),
@@ -27978,7 +32034,7 @@ class AnnotationsMixin:
                 icon=(
                     self._menu_icon(mode, self._tool_color(mode))
                     if mode in TOOL_COLOR_KINDS
-                    else self._premium_menu_icon(mode) if mode == "text" else mode
+                    else mode
                 ),
             )
         insert_menu.addSeparator()
@@ -28001,12 +32057,12 @@ class AnnotationsMixin:
         self._menu_commands(view_menu, (
             self.act_zoom_in, self.act_zoom_out, self.act_actual, self.act_fit_page,
             self.act_fit_width, None, self.act_single_page, self.act_facing_pages,
-            self.act_fix_page, None, self.act_sidebar,
+            self.act_fix_page,
         ))
         tools_menu = self._submenu(menu, "ツール", "tools")
         self._menu_commands(tools_menu, (
             self.act_fill_form, None, self.act_ocr_page, self.act_ocr_document, None,
-            self.act_apply_redactions, self.act_sanitize, None, self.act_merge_pdfs,
+            self.act_apply_redactions, self.act_sanitize, self.act_restore, None, self.act_merge_pdfs,
             self.act_split_pdf,
         ))
         menu.addSeparator()
@@ -28247,7 +32303,8 @@ class AnnotationsMixin:
                 if annotation_type in (fitz.PDF_ANNOT_POPUP, fitz.PDF_ANNOT_WIDGET):
                     continue
                 try:
-                    if page.load_annot(xref).rect.intersects(rect):
+                    annotation = page.load_annot(xref)
+                    if not annotation_is_unseen(annotation) and annotation.rect.intersects(rect):
                         selected.append(xref)
                 except Exception:
                     continue
@@ -28257,8 +32314,6 @@ class AnnotationsMixin:
             return
         if mode == "context_select":
             local, global_position = payload  # type: ignore[misc]
-            if self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
-                return
             self._finish_active_overlays()
             menu = self.context_menu_at(local)
             # The object stays held in its box while its menu is open, and
@@ -28269,7 +32324,18 @@ class AnnotationsMixin:
             if menu is not None:
                 self._popup_menu(menu, global_position)
             return
+        # A tool draws from here on. Taking a tool asks, in a signed PDF
+        # whose signers do not allow what it draws (_toggle_edit_mode) --
+        # but the tool is the window's, and one taken in another tab was
+        # still on in this one: it drew on a certified PDF without a word
+        # (7.9's review). Asked here too, and the tool put down in this tab.
+        if not self._signed_edit_allowed("content" if mode == "text" else "annotation"):
+            self.set_edit_mode("select")
+            # In the copy the tool is taken again, as when it is taken there.
+            self._offer_unsigned_copy("", rerun=lambda m=mode: self._toggle_edit_mode(m))
+            return
         page = self.document[self.page_index]
+        checkpoint: tuple | None = None
         active_color = self._tool_color(mode) if mode in TOOL_COLOR_KINDS else self._drawing_color
         color = (active_color.redF(), active_color.greenF(), active_color.blueF())
         try:
@@ -28287,7 +32353,7 @@ class AnnotationsMixin:
                 points = [self._screen_point_to_page(point) for point in payload]  # type: ignore[union-attr]
                 if len(points) < 2:
                     return
-                self._snapshot_for_edit()
+                checkpoint = self._begin_edit()
                 strokes = [[(point.x, point.y) for point in points]]
                 annot = page.add_ink_annot(strokes)
                 annot.set_colors(stroke=color)
@@ -28306,7 +32372,7 @@ class AnnotationsMixin:
                 end = self._screen_point_to_page(second)
                 if ((end.x - start.x) ** 2 + (end.y - start.y) ** 2) ** 0.5 < 2:
                     return
-                self._snapshot_for_edit()
+                checkpoint = self._begin_edit()
                 annot = page.add_line_annot(start, end)
                 if mode == "arrow":
                     annot.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
@@ -28324,7 +32390,7 @@ class AnnotationsMixin:
                 rect = self._screen_rect_to_page(payload)  # type: ignore[arg-type]
                 if rect.width < 2 or rect.height < 2:
                     return
-                self._snapshot_for_edit()
+                checkpoint = self._begin_edit()
                 annot = page.add_rect_annot(rect)
                 annot.set_colors(stroke=color)
                 annot.set_border(width=2)
@@ -28350,8 +32416,27 @@ class AnnotationsMixin:
                 # toolbar button that started the tool, where Ctrl+Z, the
                 # arrow keys and Delete mean other things or nothing.
                 self._focus_main_view()
+            if mode in ("rectangle", "arrow", "line"):
+                # And the shape just drawn is held, as PowerPoint leaves a
+                # new shape selected: the arrows move it, its size boxes
+                # are on the row, Delete removes it (7.9, the owner). Only
+                # one put down with Enter was; one drawn with the mouse
+                # had to be clicked first.
+                # The page kept in a name: an annotation holds its page
+                # weakly, and is of no use once the page is let go.
+                held_page = self.document[self.page_index]
+                try:
+                    drawn = held_page.load_annot(annot.xref)
+                except Exception:
+                    drawn = None
+                if drawn is not None:
+                    self._open_canvas_object_box(drawn)
         except Exception as exc:
             self._overlay_commit_failed = True
+            # Put back whole: a step of Undo that undid nothing was left
+            # (7.9's review).
+            if checkpoint is not None:
+                self._rollback_edit(checkpoint)
             QMessageBox.critical(
                 self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
             )
@@ -28359,17 +32444,25 @@ class AnnotationsMixin:
     def _write_new_note(
         self, where: Any, text: str, html: str | None,
         color: tuple[float, float, float],
+        anchor: tuple[int, list[Any], str] | None = None,
     ) -> None:
-        """A note written in the editor, put on the page."""
+        """A note written in the editor, put on the page -- on the selected
+        text's page, with its lines and words, when `anchor` (page index,
+        rectangles, words) says what it was put on (7.9)."""
         if self.document is None or not text.strip():
             return
-        self._snapshot_for_edit()
+        checkpoint = self._begin_edit()
         try:
-            self._add_sticky_note(
-                self.document[self.page_index], where, text.strip(), html, color
+            page_index = anchor[0] if anchor is not None else self.page_index
+            note = self._add_sticky_note(
+                self.document[page_index], where, text.strip(), html, color
             )
+            if anchor is not None:
+                set_note_anchor(self.document, note.xref, anchor[1], anchor[2])
         except Exception as exc:
             self._overlay_commit_failed = True
+            # Put back whole: a step of Undo that undid nothing was left (7.9's review).
+            self._rollback_edit(checkpoint)
             QMessageBox.critical(
                 self, APP_NAME, tr("編集を適用できませんでした。\n\n{error}").format(error=exc)
             )
@@ -28400,7 +32493,8 @@ class AnnotationsMixin:
         return annot
 
     def _annotation_context_menu(
-        self, image_marker_xref: int | None = None, text_box_xref: int | None = None
+        self, image_marker_xref: int | None = None, text_box_xref: int | None = None,
+        page_picture: bool = False,
     ) -> QMenu:
         """Right-clicking an annotation, in PowerPoint's order: the
         clipboard; the object's own command (Edit Text, Crop), duplicate
@@ -28426,18 +32520,20 @@ class AnnotationsMixin:
                 shortcut="F2", icon="text",
             )
             menu.setDefaultAction(edit)
-        if image_marker_xref is not None:
+        if image_marker_xref is not None or page_picture:
+            # A picture of the PDF's own crops as one put in with pdfNote
+            # does: its box held the crop all along, the menu only did not
+            # offer it (2026-11-21's walk). F2 is the key, as the box says.
             crop = self._add_menu_action(
                 menu, "トリミング",
-                lambda _checked=False, xref=image_marker_xref: self._start_image_crop(xref),
-                icon="crop",
+                (lambda _checked=False, xref=image_marker_xref: self._start_image_crop(xref))
+                if image_marker_xref is not None else (lambda _checked=False: self._crop_held_image()),
+                shortcut="F2", icon="crop",
             )
             menu.setDefaultAction(crop)
-        duplicate = self._menu_command(menu, self.act_duplicate)
-        if text_box_xref is not None:
-            # Duplicating a placed text box makes another one, which is the
-            # premium "add a text box"; duplicating anything else is free.
-            duplicate.setProperty("pdfnotePremium", True)
+        # Free for every object, a text box too: adding text boxes is free
+        # for good (7.2, the owner's decision of 2026-11-07).
+        self._menu_command(menu, self.act_duplicate)
         self._add_menu_action(
             menu, "削除", self.delete_selected_annotations, shortcut="Del", icon="delete"
         )
@@ -28449,33 +32545,46 @@ class AnnotationsMixin:
             self.act_bring_to_front, self.act_bring_forward,
             self.act_send_backward, self.act_send_to_back,
         ))
-        if image_marker_xref is not None:
+        if len(self._selected_annotation_xrefs) > 1:
+            # Align, for several (7.0), as PowerPoint's Arrange > Align.
+            align_menu = self._submenu(menu, "配置〔オブジェクト〕", "obj_align_left")
+            self._menu_commands(align_menu, (
+                self.object_align_actions["left"], self.object_align_actions["hcenter"],
+                self.object_align_actions["right"], None,
+                self.object_align_actions["top"], self.object_align_actions["vcenter"],
+                self.object_align_actions["bottom"],
+            ))
+            menu._align_menu = align_menu  # type: ignore[attr-defined]
+        if image_marker_xref is not None or page_picture:
             menu.addSeparator()
             self._add_menu_action(
                 menu, "画像として保存...",
-                lambda _checked=False, xref=image_marker_xref: self.save_selected_image(xref),
+                (lambda _checked=False, xref=image_marker_xref: self.save_selected_image(xref))
+                if image_marker_xref is not None
+                else (lambda _checked=False: self.save_selected_image(None, image_xref=self._active_image_xref)),
                 icon="save_as",
             )
         if text_box_xref is not None:
             # This is the menu of a box already placed on the page -- which
             # is where you go back to change its font.
             menu.addSeparator()
-            font_menu = self._submenu(menu, "フォント", "font")
-            for display_name in TEXT_BOX_FONTS:
-                if display_name not in MAIN_TEXT_BOX_FONT_KEYS:
-                    continue  # the toolbar's list has every font
-                font_menu.addAction(
-                    self.font_display_name(display_name),
-                    lambda _checked=False, xref=text_box_xref, name=display_name:
-                    self._restyle_text_box(xref, family=name),
-                )
-            size_menu = self._submenu(menu, "フォント サイズ", "font_size")
-            for size in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48):
-                size_menu.addAction(
-                    str(size),
-                    lambda _checked=False, xref=text_box_xref, value=size:
-                    self._restyle_text_box(xref, size=float(value)),
-                )
+            # The toolbar's font and size boxes (7.9), showing the box's:
+            # the toolbar shows the held box's own.
+            current = self.text_font_combo.currentData()
+            menu.addAction(font_row_action(
+                menu, current if isinstance(current, str) else DEFAULT_TEXT_BOX_FONT,
+                self.text_font_size.value(),
+                lambda key, xref=text_box_xref: self._restyle_text_box(xref, family=key),
+                lambda value, xref=text_box_xref: self._restyle_text_box(xref, size=float(value)),
+            ))
+            # Bold for all of the box's words, as the toolbar's button and
+            # Ctrl+B do while it is held (7.9).
+            # An item of its own: the toolbar's action is hidden while no
+            # box is open, as it is while this menu is built.
+            self._add_menu_action(
+                menu, "太字", self._toggle_active_text_bold, shortcut="Ctrl+B",
+                icon=self.act_text_bold.icon(),
+            )
             # The box's font colour, from the Font Color button's palette
             # (the shape colour menu offered here before changed nothing).
             text_colour_menu = self._submenu(
@@ -28496,12 +32605,11 @@ class AnnotationsMixin:
                 ),
                 icon="more_colors",
             )
-            menu._font_menu = font_menu  # type: ignore[attr-defined]
-            menu._size_menu = size_menu  # type: ignore[attr-defined]
             menu._text_colour_menu = text_colour_menu  # type: ignore[attr-defined]
             # The outline weight draws a frame round the box, so it stays.
             colourable, weighted = False, True
-        elif image_marker_xref is not None:
+        elif image_marker_xref is not None or page_picture:
+            # `page_picture`: a picture of the PDF's own, held (7.9).
             colourable = weighted = False
         else:
             # Without a recorded selection, offer both, as before. Line
@@ -28606,6 +32714,18 @@ class AnnotationsMixin:
         which is what "bring to front" / "send to back" mean for a PDF."""
         if self.document is None or not order:
             return False
+        # The same entries, in another order -- or nothing is written. An
+        # annotation written into the array itself, not as an object of its
+        # own, has no number (PyMuPDF lists it as 0): the array was written
+        # back with "0 0 R" in its place, and it was gone (7.9's review).
+        # ISO 32000 asks for references, but such files are read, and are
+        # left as they are rather than lose a mark.
+        try:
+            present = [xref for xref, _kind, _name in page.annot_xrefs()]
+        except Exception:
+            return False
+        if 0 in present or sorted(present) != sorted(order):
+            return False
         try:
             self.document.xref_set_key(
                 page.xref, "Annots", "[" + " ".join(f"{x} 0 R" for x in order) + "]"
@@ -28627,6 +32747,8 @@ class AnnotationsMixin:
     def raise_selected_annotations(self, to_front: bool = True, one_step: bool = False) -> bool:
         """PowerPoint's Bring to Front / Send to Back, and with `one_step`
         its Bring Forward / Send Backward (Ctrl+Shift+] / Ctrl+Shift+[)."""
+        if not self._signed_gate("annotation", self._again_on_marks(lambda: self.raise_selected_annotations(to_front, one_step))):  # 7.9: a signed PDF
+            return False
         if self.document is None or not self._selected_annotation_xrefs:
             return False
         page = self.document[self.page_index]
@@ -28709,8 +32831,14 @@ class AnnotationsMixin:
             return list(self._selected_annotation_xrefs)
         if self._active_image_box is not None:
             # A picture that came with the PDF is copied through its marker,
-            # which it only gets now.
-            self._give_active_image_a_marker()
+            # which it only gets now -- and keeps: the marker of a picture
+            # only looked at is taken back as its box closes
+            # (_withdraw_provisional_image_marker), which left the command
+            # nothing to act on. Duplicate, Bring Forward and Send Backward
+            # were on the toolbar for such a picture and answered "select
+            # an item" (7.9's walk through the app).
+            if self._give_active_image_a_marker() is not None:
+                self._provisional_image_marker = None
         held = (
             self._active_object_xref if self._active_object_box is not None
             else getattr(self, "_active_image_marker_xref", None) if self._active_image_box is not None
@@ -28798,12 +32926,13 @@ class AnnotationsMixin:
             last["copies"][last["copies"].index(old)] = new
 
     def _duplicate_offset(self, page: fitz.Page, targets: list[int]) -> tuple[float, float]:
-        """How far Ctrl+D puts a copy from its original, as PowerPoint does:
-        a little right and down -- or, when what is copied is the copy Ctrl+D
-        made last, as far from it as that copy now is from its original. A
-        copy moved into place, and Ctrl+D again, lays out the next one the
-        same way."""
-        default = (self.DUPLICATE_OFFSET, self.DUPLICATE_OFFSET)
+        """How far Ctrl+D puts a copy from its original: straight below it,
+        left edges in line (7.0; it went a little right and down, as in
+        PowerPoint, which the owner did not want) -- or, when what is copied
+        is the copy Ctrl+D made last, as far from it as that copy now is
+        from its original. A copy moved into place, and Ctrl+D again, lays
+        out the next one the same way."""
+        default = self._duplicate_below(page, targets)
         last = getattr(self, "_last_duplicate", None)
         if (
             last is None
@@ -28906,12 +33035,19 @@ class AnnotationsMixin:
                         break
             except Exception:
                 pass
+            # Turned (7.9): its own upright box and its angle. A copy came
+            # out upright, as large as the box around the turned picture.
+            angle = 0.0
+            if self._is_image_stamp(annotation):
+                angle, upright = self._stamp_turn(annotation)
+                if angle:
+                    rect = drawn = upright
             return {
                 "kind": "image", "rect": rect, "drawn": drawn, "data": data, "mask": mask,
-                "source": source_xref or 0, "crop": QRectF(crop),
+                "source": source_xref or 0, "crop": QRectF(crop), "angle": angle,
                 # Pasted into this same document, the copy draws the very
                 # same picture rather than a second copy of it (6.1).
-                "document": id(self.document), "xref": image_xref,
+                "document": document_key(self.document), "xref": image_xref,
             }
         if subject.startswith("SumiRichText"):
             html = self._freetext_rich_html(annotation)
@@ -28921,11 +33057,12 @@ class AnnotationsMixin:
             return {
                 "kind": "richtext", "rect": rect, "html": html,
                 "size": font_size, "color": color, "family": font_family,
+                "angle": text_box_angle(annotation),
             }
         return {
             "kind": "plain", "rect": rect,
             "object": self.document.xref_object(xref, compressed=False),
-            "document": id(self.document),
+            "document": document_key(self.document),
         }
 
     def _create_from_capture(
@@ -28953,7 +33090,7 @@ class AnnotationsMixin:
         the document it came from. Pasting into another is turned away
         by the caller rather than making a mark with nothing in it.
         """
-        if self.document is None or capture.get("document") != id(self.document):
+        if self.document is None or capture.get("document") != document_key(self.document):
             return None
         rect = fitz.Rect(capture["rect"])
         # Add a real annotation first so MuPDF registers it on the page,
@@ -28985,7 +33122,7 @@ class AnnotationsMixin:
         source_xref = int(capture.get("source") or 0)
         crop = QRectF(capture.get("crop") or QRectF(0.0, 0.0, 1.0, 1.0))
         drawn = fitz.Rect(capture.get("drawn") or capture["rect"]) + shift
-        same_document = capture.get("document") == id(self.document)
+        same_document = capture.get("document") == document_key(self.document)
         reuse = int(capture.get("xref") or 0) if same_document else 0
         if reuse and self.document.xref_get_key(reuse, "Subtype")[1] != "/Image":
             reuse = 0  # undone or deleted since it was copied
@@ -29015,6 +33152,9 @@ class AnnotationsMixin:
             page, drawn, data=None if reuse else data, image_xref=reuse,
             source_xref=source_xref, crop=crop,
         )
+        angle = float(capture.get("angle") or 0.0)
+        if angle:
+            self._turn_stamp(page, copy.xref, drawn, angle)
         return copy.xref
 
     def _create_captured_rich_text(
@@ -29043,8 +33183,10 @@ class AnnotationsMixin:
             laid_out, font_size, QColor.fromRgbF(*color), qt_family, lines=True,
             scale=layout_scale,
         )
+        angle = float(capture.get("angle") or 0.0)
         baked_xref = self._bake_rich_text_box(
-            page, rect, page_html, families, rect.width, laid_out.size().height() / layout_scale
+            page, rect, page_html, families, rect.width, laid_out.size().height() / layout_scale,
+            angle=angle,
         )
         copy = page.add_freetext_annot(
             rect, "", fontsize=font_size, fontname="japan", text_color=color, border_width=0,
@@ -29054,20 +33196,36 @@ class AnnotationsMixin:
             subject=f"SumiRichText|{font_size}|{color_csv}|{display}|{baked_xref or 0}"
         )
         self.document.xref_set_key(copy.xref, "SumiHTML", fitz.get_pdf_str(html))
+        if abs(angle) >= 0.05:
+            self.document.xref_set_key(copy.xref, TEXT_BOX_ANGLE_KEY, f"{angle:.2f}")
         copy.update(fontsize=font_size, fontname="japan", text_color=color)
         return copy.xref
 
-    def _selection_has_text_box(self, page: fitz.Page) -> bool:
-        for xref in self._selected_annotation_xrefs:
+    # The space between an original and the copy Ctrl+D puts under it (7.0).
+    DUPLICATE_GAP = 6.0
+
+    def _duplicate_below(self, page: fitz.Page, targets: list[int]) -> tuple[float, float]:
+        """The offset that puts a copy of `targets` straight under them,
+        their left edges in line, DUPLICATE_GAP apart -- over them instead
+        when the page has no room below (7.0)."""
+        bounds: fitz.Rect | None = None
+        for xref in targets:
             try:
-                if page.load_annot(xref).type[0] == fitz.PDF_ANNOT_FREE_TEXT:
-                    return True
+                rect = annotation_frame_rect(page.load_annot(xref))
             except Exception:
                 continue
-        return False
+            bounds = rect if bounds is None else bounds | rect
+        if bounds is None or bounds.is_empty:
+            return (0.0, self.DUPLICATE_GAP)
+        step = bounds.height + self.DUPLICATE_GAP
+        try:
+            area = self._unrotated_bounds(page)
+        except Exception:
+            area = page.rect
+        if bounds.y1 + step > area.y1 + 0.5 and bounds.y0 - step >= area.y0 - 0.5:
+            return (0.0, -step)
+        return (0.0, step)
 
-    # PowerPoint's Duplicate puts the copy this far right and down (pt).
-    DUPLICATE_OFFSET = 12.0
 
     def duplicate_selected_annotations(self, targets: list[int] | None = None) -> bool:
         """PowerPoint's Duplicate (Ctrl+D), 6.12: every selected mark is
@@ -29075,6 +33233,8 @@ class AnnotationsMixin:
         each used to go 12 pt further than the one before -- the copies are
         on top and are what is selected afterwards, and the distance is the
         one the last copy was moved to (_duplicate_offset)."""
+        if not self._signed_gate(self._selection_edit_kind()):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         targets = list(targets if targets is not None else self._selected_annotation_xrefs)
@@ -29083,9 +33243,6 @@ class AnnotationsMixin:
         page_index = self.page_index
         page = self.document[page_index]
         self._selected_annotation_xrefs = list(targets)
-        # A copy of a text box is a new text box.
-        if self._selection_has_text_box(page) and self._premium_blocked("テキスト ボックスの追加"):
-            return False
         dx, dy = self._duplicate_offset(page, targets)
         captures: list[tuple[dict[str, Any], int]] = []
         for xref in targets:
@@ -29138,19 +33295,46 @@ class AnnotationsMixin:
         box, which is page content, is drawn again in its new place. With
         `coalesce` -- the arrow keys -- the moves of one selection are one
         step of undo."""
+        if not self._signed_gate(self._selection_edit_kind()):  # 7.9: a signed PDF
+            return False
         if self.document is None or not self._selected_annotation_xrefs:
             return False
         if abs(dx) < 0.01 and abs(dy) < 0.01:
             return False
         page_index = self.page_index
-        page = self.document[page_index]
         targets = list(self._selected_annotation_xrefs)
-        key = (id(self.document), page_index, tuple(targets))
+        key = (document_key(self.document), page_index, tuple(targets))
         if not coalesce or getattr(self, "_moving_selection_key", None) != key:
             self._snapshot_for_edit()
+        moved = self._shift_marks(page_index, {xref: (dx, dy) for xref in targets})
+        page = self.document[page_index]
+        self._selected_annotation_xrefs = [
+            xref for xref in moved if xref in {x for x, _k, _n in page.annot_xrefs()}
+        ]
+        # Arrow presses after one another are one step; a drag is its own.
+        self._moving_selection_key = (
+            (document_key(self.document), page_index, tuple(self._selected_annotation_xrefs))
+            if coalesce else None
+        )
+        self._mark_dirty()
+        self._invalidate_notes()
+        self._invalidate_render_cache(page_index)
+        self.schedule_render(immediate=True)
+        self._sync_annotation_selection()
+        return True
+
+    def _shift_marks(self, page_index: int, shifts: dict[int, tuple[float, float]]) -> list[int]:
+        """Move each mark by its own (dx, dy), in the order given, and say
+        what each is now: a mark that carries its own drawing is moved where
+        it is; a picture or a text box, which is page content, is drawn
+        again in its new place under a new number."""
+        page = self.document[page_index]
         moved: list[int] = []
         redrawn: list[int] = []
-        for xref in targets:
+        for xref, (dx, dy) in shifts.items():
+            if abs(dx) < 0.01 and abs(dy) < 0.01:
+                moved.append(xref)
+                continue
             try:
                 annotation = page.load_annot(xref)
                 subject = str(annotation.info.get("subject") or "")
@@ -29176,15 +33360,62 @@ class AnnotationsMixin:
                 moved.append(xref)
         if redrawn:
             self._delete_marks(page_index, redrawn)
+        return moved
+
+    def align_selected_annotations(self, edge: str) -> bool:
+        """PowerPoint's Align for several objects selected (7.0): left,
+        centre, right, top, middle or bottom, each in line with the
+        selection's outermost edge -- or its middle -- as PowerPoint's
+        Align Selected Objects does. One step of undo."""
+        if not self._signed_gate("annotation", self._again_on_marks(lambda: self.align_selected_annotations(edge))):  # 7.9: a signed PDF
+            return False
+        if self.document is None:
+            return False
+        held = self._put_down_held_object()
+        targets = list(self._selected_annotation_xrefs)
+        if len(targets) < 2:
+            if held:
+                self._hold_single_selection()
+            self.status_label.setText(tr("項目を選択してください"))
+            return False
+        page_index = self.page_index
         page = self.document[page_index]
-        self._selected_annotation_xrefs = [
-            xref for xref in moved if xref in {x for x, _k, _n in page.annot_xrefs()}
-        ]
-        # Arrow presses after one another are one step; a drag is its own.
-        self._moving_selection_key = (
-            (id(self.document), page_index, tuple(self._selected_annotation_xrefs))
-            if coalesce else None
-        )
+        rects: dict[int, fitz.Rect] = {}
+        for xref in targets:
+            try:
+                rects[xref] = annotation_frame_rect(page.load_annot(xref))
+            except Exception:
+                continue
+        if len(rects) < 2:
+            return False
+        bounds = fitz.Rect(next(iter(rects.values())))
+        for rect in rects.values():
+            bounds |= rect
+        shifts: dict[int, tuple[float, float]] = {}
+        for xref, rect in rects.items():
+            dx = dy = 0.0
+            if edge == "left":
+                dx = bounds.x0 - rect.x0
+            elif edge == "right":
+                dx = bounds.x1 - rect.x1
+            elif edge == "hcenter":
+                dx = (bounds.x0 + bounds.x1 - rect.x0 - rect.x1) / 2
+            elif edge == "top":
+                dy = bounds.y0 - rect.y0
+            elif edge == "bottom":
+                dy = bounds.y1 - rect.y1
+            elif edge == "vcenter":
+                dy = (bounds.y0 + bounds.y1 - rect.y0 - rect.y1) / 2
+            shifts[xref] = (dx, dy)
+        if all(abs(dx) < 0.01 and abs(dy) < 0.01 for dx, dy in shifts.values()):
+            return True
+        self._snapshot_for_edit()
+        moved = self._shift_marks(page_index, shifts)
+        page = self.document[page_index]
+        present = {x for x, _k, _n in page.annot_xrefs()}
+        self._clear_annotation_selection()
+        self._selected_annotation_xrefs = [xref for xref in moved if xref in present]
+        self._moving_selection_key = None
         self._mark_dirty()
         self._invalidate_notes()
         self._invalidate_render_cache(page_index)
@@ -29203,6 +33434,8 @@ class AnnotationsMixin:
                 self._hold_single_selection()
 
     def _set_selection_width(self, width: float) -> bool:
+        if not self._signed_gate("annotation", self._again_on_marks(lambda: self._set_selection_width(width))):  # 7.9: a signed PDF
+            return False
         if self.document is None or not self._selected_annotation_xrefs:
             return False
         page = self.document[self.page_index]
@@ -29224,19 +33457,32 @@ class AnnotationsMixin:
         self.schedule_render(immediate=True)
         return self._report_annotation_outcome(changed, total)
 
-    def save_selected_image(self, marker_xref: int, target: str | None = None) -> str | None:
-        """PowerPoint's Save as Picture."""
+    def _crop_held_image(self, toggle: bool = False) -> None:
+        """Crop the held picture, one put in with pdfNote or one of the
+        PDF's own; with `toggle`, end the crop when it is on (F2)."""
+        box = self._active_image_box
+        if box is None:
+            return
+        box.set_crop_mode(not box.crop_mode if toggle else True)
+
+    def save_selected_image(
+        self, marker_xref: int | None, target: str | None = None, image_xref: int | None = None
+    ) -> str | None:
+        """PowerPoint's Save as Picture: of a picture put in with pdfNote
+        (`marker_xref`), or of one of the PDF's own (`image_xref`, 2026-11-21:
+        its menu did not offer it)."""
         if self.document is None:
             return None
-        page = self.document[self.page_index]
-        try:
-            marker = page.load_annot(marker_xref)
-        except Exception:
-            return None
-        metadata = self._image_edit_metadata(marker)
-        if metadata is None:
-            return None
-        image_xref = metadata[2] or metadata[0]
+        if image_xref is None:
+            page = self.document[self.page_index]
+            try:
+                marker = page.load_annot(marker_xref)
+            except Exception:
+                return None
+            metadata = self._image_edit_metadata(marker)
+            if metadata is None:
+                return None
+            image_xref = metadata[2] or metadata[0]
         try:
             data = self.document.extract_image(image_xref)
         except Exception:
@@ -29253,8 +33499,11 @@ class AnnotationsMixin:
                 data = {**data, "image": encoded}
                 suffix = "png"
         if target is None:
-            base = Path(self.file_path).stem if self.file_path else tr("画像")
-            suggestion = str(Path.home() / f"{base}.{suffix}")
+            named = self._document_name_path()
+            base = named.stem if self._document_has_name() else "Image"
+            # Beside the document, as every other save offers (7.1).
+            folder = named.parent
+            suggestion = str(folder / f"{base}.{suffix}")
             selected, _filter = QFileDialog.getSaveFileName(
                 self, tr("画像として保存"), suggestion, tr("画像 (*.png *.jpg *.jpeg)")
             )
@@ -29265,15 +33514,31 @@ class AnnotationsMixin:
             Path(target).write_bytes(data["image"])
         except OSError as exc:
             QMessageBox.critical(
-                self, APP_NAME, tr("画像を保存できませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME, tr("画像を保存できませんでした。\n\n{error}").format(error=self._write_failure_detail(exc))
             )
             return None
         return target
+
+    def add_text_box_at_page_point(self, point: Any) -> bool:
+        """The page menu's テキスト ボックスを追加 (7.9): a text box where
+        the page was right-clicked, at the size a click of the text tool
+        gives, ready to type -- without taking the tool and clicking again."""
+        if not self._signed_gate("content", lambda: self.add_text_box_at_page_point(point)):  # 7.9: a signed PDF
+            return False
+        if self.document is None:
+            return False
+        at = fitz.Point(float(point.x), float(point.y))
+        screen = self._page_rect_to_screen(fitz.Rect(at, at)).topLeft()
+        self._finish_active_overlays()
+        self._begin_canvas_text_box((QPointF(screen), QPointF(screen)))
+        return self._active_text_box is not None
 
     def add_note_at_page_point(self, point: Any) -> bool:
         """The page menu's Add Sticky Note Here: a note where the page was
         right-clicked, as Acrobat's Add Note puts it at the cursor --
         without picking the note tool and clicking a second time."""
+        if not self._signed_gate("annotation", lambda: self.add_note_at_page_point(point)):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         if callable(getattr(point, "x", None)):
@@ -29291,26 +33556,41 @@ class AnnotationsMixin:
         return True
 
     def add_note_at_selection(self) -> bool:
-        """PowerPoint's New Comment, anchored on the selected text."""
+        """A comment on the selected text, as Google Slides makes one (7.9,
+        the owner): the note keeps the lines and the words it is on, the
+        sidebar shows the words, and the page lights them while the note is
+        selected."""
+        if not self._signed_gate("annotation", self._again_on_text_selection(self.add_note_at_selection)):  # 7.9: a signed PDF
+            return False
         target = self._current_markup_target()
-        if target is None or self.document is None:
+        selection = self._text_selection_target()
+        if target is None or selection is None or self.document is None:
             self.status_label.setText(tr("文字列を選択してください"))
             return False
-        _page, line_rects, _count = target
+        page, line_rects, _count = target
+        page_index, first, last = selection
+        _rects, words, _characters = self._line_rects_for_character_range(
+            self._page_characters(page), first, last
+        )
+        quote = " ".join(str(words).split())[:NOTE_QUOTE_CHARS]
         anchor = fitz.Point(line_rects[0].x0, line_rects[0].y0)
+        anchored = (page_index, [fitz.Rect(rect) for rect in line_rects], quote)
         # The colour is the note tool's, wherever the note comes from, and
         # formatting chosen in the editor is kept.
         note = self._tool_color("note")
         ink = (note.redF(), note.greenF(), note.blueF())
         self._open_note_editor(
             tr("付箋を追加"), "", None,
-            lambda text, html, at=anchor: self._write_new_note(at, text, html, ink),
+            lambda text, html, at=anchor: self._write_new_note(at, text, html, ink, anchored),
+            quote=quote,
         )
         return True
 
     def recolor_selected_annotations(self, colour: QColor) -> bool:
         """Change the colour of whatever annotations are selected, or of the
         shape or picture held in its box (6.20)."""
+        if not self._signed_gate("annotation", self._again_on_marks(lambda: self.recolor_selected_annotations(colour))):  # 7.9: a signed PDF
+            return False
         held = self._put_down_held_object(text_box=False)
         try:
             return self._recolor_selection(colour)
@@ -29398,6 +33678,50 @@ class AnnotationsMixin:
         self._sync_annotation_selection()
         self._hold_single_selection()
 
+    def _hold_page_picture_at(self, page: fitz.Page, page_point: fitz.Point) -> bool:
+        """A picture of the PDF's own under a point of the page, held in its
+        box as a click holds it; False for none there. For a click, and for
+        its right-click menu (7.9: a right-click on one, or Shift+F10 with
+        one held, put it down and opened the page's menu -- the picture had
+        no menu, where a picture put in with pdfNote has one)."""
+        image_matches = [
+            info
+            for info in page.get_image_info(xrefs=True)
+            if int(info.get("xref") or 0) > 0 and fitz.Rect(info["bbox"]).contains(page_point)
+            # Not the page itself: a scan, or a background as large as
+            # the page, is what the page is, not a picture put on it
+            # (7.9: a click anywhere on a scanned page took the whole
+            # scan up as a picture, and the least drag moved it).
+            and not is_page_background_image(page, fitz.Rect(info["bbox"]))
+        ]
+        if not image_matches:
+            return False
+        info = image_matches[-1]
+        image_xref = int(info["xref"])
+        occurrences = sum(
+            1 for candidate in page.get_image_info(xrefs=True)
+            if int(candidate.get("xref") or 0) == image_xref
+        )
+        if occurrences != 1:
+            return False
+        # Selecting a picture is not an edit: no marker and no write until
+        # it is moved, resized or cropped (_take_up_active_image).
+        self._finish_active_overlays()
+        page = self.document[self.page_index]
+        content_xref = self._find_image_content_xref(page, image_xref)
+        try:
+            image = self._image_with_alpha(image_xref)
+        except Exception:
+            image = QImage()
+        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        if pixmap.isNull():
+            return False
+        self._open_image_box(
+            pixmap, image_xref, content_xref, image_xref,
+            QRectF(0.0, 0.0, 1.0, 1.0), fitz.Rect(info["bbox"]), None,
+        )
+        return self._active_image_box is not None
+
     def _select_at_screen_point(self, screen_point: QPointF) -> None:
         if self.document is None:
             return
@@ -29413,36 +33737,7 @@ class AnnotationsMixin:
         target = self._annotation_at_point(page, page_point)
         self._clear_annotation_selection()
         if target is None:
-            image_matches = [
-                info
-                for info in page.get_image_info(xrefs=True)
-                if int(info.get("xref") or 0) > 0 and fitz.Rect(info["bbox"]).contains(page_point)
-            ]
-            if image_matches:
-                info = image_matches[-1]
-                image_xref = int(info["xref"])
-                occurrences = sum(
-                    1 for candidate in page.get_image_info(xrefs=True)
-                    if int(candidate.get("xref") or 0) == image_xref
-                )
-                if occurrences == 1:
-                    # Selecting a picture is not an edit: no marker and no
-                    # write until it is moved, resized or cropped
-                    # (_take_up_active_image).
-                    self._finish_active_overlays()
-                    page = self.document[self.page_index]
-                    content_xref = self._find_image_content_xref(page, image_xref)
-                    try:
-                        image = self._image_with_alpha(image_xref)
-                    except Exception:
-                        image = QImage()
-                    pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
-                    if not pixmap.isNull():
-                        self._open_image_box(
-                            pixmap, image_xref, content_xref, image_xref,
-                            QRectF(0.0, 0.0, 1.0, 1.0), fitz.Rect(info["bbox"]), None,
-                        )
-                    return
+            self._hold_page_picture_at(page, page_point)
             return
         if target.type[0] == fitz.PDF_ANNOT_FREE_TEXT:
             self._open_canvas_text_box(screen_point, quiet=True)
@@ -29467,6 +33762,8 @@ class AnnotationsMixin:
         failure looked identical to a success -- the user pressed Delete,
         nothing moved, and nothing said why.
         """
+        if not self._signed_gate(self._selection_edit_kind()):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         if self._active_text_box is not None:
@@ -29551,6 +33848,12 @@ class AnnotationsMixin:
             self._erase_rich_text_box(page, baked_rect, baked_content_xref)
         deleted = 0
         for xref in targets:
+            # A note's replies and states go with it (7.9).
+            for reply in note_children(page, xref):
+                try:
+                    page.delete_annot(reply)
+                except Exception:
+                    pass
             try:
                 page.delete_annot(page.load_annot(xref))
                 deleted += 1
@@ -29646,12 +33949,14 @@ class AnnotationsMixin:
 
     def paste_marks(self) -> bool:
         """Put the copied marks on the page, where the last click was."""
+        if not self._signed_gate("annotation", lambda: self.paste_marks()):  # 7.9: a signed PDF
+            return False
         if self.document is None or not self._annotation_clipboard:
             return False
         page = self.document[self.page_index]
         usable = [
             capture for capture in self._annotation_clipboard
-            if capture.get("kind") != "plain" or capture.get("document") == id(self.document)
+            if capture.get("kind") != "plain" or capture.get("document") == document_key(self.document)
         ]
         if not usable:
             self.status_label.setText(tr("この図形は別のPDFへは貼り付けられません"))
@@ -29844,6 +34149,8 @@ class TextBoxBakingMixin:
                 continue
             try:
                 annot = page.load_annot(xref)
+                if annotation_is_unseen(annot):
+                    continue  # a reply in a thread (7.9), not on the page
                 if annotation_hit_rect(annot).contains(point):
                     return annot
             except Exception:
@@ -29924,7 +34231,7 @@ class TextBoxBakingMixin:
 
     def _bake_rich_text_box(
         self, page: fitz.Page, rect: fitz.Rect, html: str, families: set[str],
-        width: float, height: float,
+        width: float, height: float, angle: float = 0.0,
     ) -> int | None:
         """Bake the box into the page and report the content stream that
         holds it, so a later edit can lift exactly this box's glyphs back
@@ -29950,7 +34257,7 @@ class TextBoxBakingMixin:
             try:
                 spare, _scale = insert_html_subset(
                     page, target, html, css=css, archive=archive,
-                    scale_low=scale_low, scale_word_width=scale_word_width,
+                    scale_low=scale_low, scale_word_width=scale_word_width, angle=angle,
                 )
             except (AttributeError, TypeError):
                 # A PyMuPDF without the Story calls used: whole fonts, but
@@ -30143,6 +34450,8 @@ class ImagesMixin:
     """Adding pictures from a file or the clipboard."""
 
     def insert_image(self) -> None:
+        if not self._signed_gate("annotation", lambda: self.insert_image()):  # 7.9: a signed PDF
+            return
         if self.document is None:
             return
         path, _filter = QFileDialog.getOpenFileName(
@@ -30156,6 +34465,8 @@ class ImagesMixin:
 
     def paste_clipboard_image(self) -> None:
         """Paste text in a box, else the copied marks, else a picture."""
+        if not self._signed_gate("annotation", lambda: self.paste_clipboard_image()):  # 7.9: a signed PDF
+            return
         clipboard = QApplication.clipboard()
         mime = clipboard_mime()
         focus = QApplication.focusWidget()
@@ -30354,6 +34665,8 @@ class PageOperationsMixin:
         self.schedule_render(immediate=True)
 
     def insert_blank_page(self) -> None:
+        if not self._signed_gate("pages", lambda: self.insert_blank_page()):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -30369,6 +34682,8 @@ class PageOperationsMixin:
         self._refresh_after_document_change()
 
     def insert_pdf_pages(self) -> None:
+        if not self._signed_gate("pages", lambda: self.insert_pdf_pages()):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -30377,12 +34692,13 @@ class PageOperationsMixin:
         if not path:
             return
         source: fitz.Document | None = None
+        checkpoint: tuple | None = None
         try:
             source = fitz.open(path)
             if source.needs_pass:
                 QMessageBox.warning(self, APP_NAME, tr("パスワードで保護されたPDFからはページを追加できません。"))
                 return
-            self._snapshot_for_edit()
+            checkpoint = self._begin_edit()
             self.document.insert_pdf(source, start_at=self.page_index + 1)
             # Marks made by pdfNote in that file name its objects, not ours.
             neutralize_marker_xrefs_on(
@@ -30394,6 +34710,12 @@ class PageOperationsMixin:
             self.page_index += 1
             self._refresh_after_document_change()
         except Exception as exc:
+            # Put back whole, as the other page commands are: an insert that
+            # failed part of the way left the pages it had got to in the
+            # document, with an undo step and no mark of a change (7.9's
+            # review).
+            if checkpoint is not None:
+                self._rollback_edit(checkpoint)
             QMessageBox.critical(
                 self, APP_NAME, tr("PDFページを追加できませんでした。\n\n{error}").format(error=exc)
             )
@@ -30404,6 +34726,8 @@ class PageOperationsMixin:
     def delete_current_page(self, *, pages: list[int] | None = None) -> None:
         """The page being read -- or `pages`, those chosen in the Pages
         pane (6.21)."""
+        if not self._signed_gate("pages", lambda: self.delete_current_page(pages=pages)):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -30421,6 +34745,8 @@ class PageOperationsMixin:
         """A copy of the page being read after it -- or of `pages`, those
         chosen in the Pages pane, after the last of them and then chosen
         themselves, as PowerPoint duplicates slides (6.21)."""
+        if not self._signed_gate("pages", lambda: self.duplicate_current_page(pages=pages)):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -30463,9 +34789,12 @@ class PageOperationsMixin:
         if len(copies) > 1:
             self._choose_pages_in_pane(copies)
 
-    def _pages_piece(self, pages: list[int]) -> fitz.Document:
+    def _pages_piece(self, pages: list[int], keep_outline: bool = False) -> fitz.Document:
         """A new document of `pages` of the open one, in that order: each
-        run of neighbouring pages in one insert."""
+        run of neighbouring pages in one insert. `keep_outline`: with the
+        outline entries that go to those pages (7.1) -- a file of its own
+        keeps them, as Acrobat's Extract Pages does; a copy put into this
+        document again does not."""
         piece = fitz.open()
         try:
             start = previous = pages[0]
@@ -30476,6 +34805,12 @@ class PageOperationsMixin:
                 piece.insert_pdf(self.document, from_page=start, to_page=previous)
                 if page is not None:
                     start = previous = page
+            if keep_outline:
+                outline = outline_for_pages(self.document, pages)
+                if outline:
+                    piece.set_toc(outline)
+                # Its properties, page labels and links (7.6).
+                carry_document_details(piece, self.document, pages)
         except Exception:
             piece.close()
             raise
@@ -30484,6 +34819,8 @@ class PageOperationsMixin:
     def rotate_pdf_page(self, *, pages: list[int] | None = None) -> None:
         """The page being read a quarter turn -- or `pages`, those chosen in
         the Pages pane, which stay chosen (6.21)."""
+        if not self._signed_gate("pages", lambda: self.rotate_pdf_page(pages=pages)):  # 7.9: a signed PDF
+            return
         if not self._commit_open_edits():
             return
         if self.document is None:
@@ -30509,15 +34846,19 @@ class PageOperationsMixin:
         if self.document is None:
             return
         pages = pages or [self.page_index]
-        name = f"page-{pages[0] + 1}.pdf" if len(pages) == 1 else f"pages-{page_list_label(pages)}.pdf"
+        # In the document's folder, named after it and its pages, as the
+        # export to Word names its file (7.1): it offered "page-3.pdf" in
+        # whatever folder the dialog happened to open.
+        base = self._document_name_path()
+        name = str(base.with_name(f"{base.stem} ({page_list_label(pages)}).pdf"))
         selected, _filter = QFileDialog.getSaveFileName(
             self, tr("現在のページを書き出し"), name, tr("PDFファイル (*.pdf)")
         )
-        if not selected:
+        if not selected or self._refuse_open_pdf(selected):
             return
         output = None
         try:
-            output = self._pages_piece(pages)
+            output = self._pages_piece(pages, keep_outline=True)
             # A page taken out of a protected PDF keeps its encryption and
             # usage restrictions (see protection_options). Through a
             # temporary file, as a save is: it was written straight over the
@@ -30531,7 +34872,8 @@ class PageOperationsMixin:
             )
         except Exception as exc:
             QMessageBox.critical(
-                self, APP_NAME, tr("ページを書き出せませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME,
+                tr("ページを書き出せませんでした。\n\n{error}").format(error=self._write_failure_detail(exc)),
             )
         finally:
             if output is not None:
@@ -30546,6 +34888,12 @@ class PageOperationsMixin:
         merged = fitz.open()
         protected = False
         permissions = -4
+        # Each file's outline, after the pages before it (7.1).
+        outline: list[list[Any]] = []
+        # Their page labels, and the first file's properties (7.6); a file
+        # without labels keeps the plain numbers of its pages there.
+        labels: list[dict[str, Any]] = []
+        labelled = False
         try:
             for path in paths:
                 source = fitz.open(path)
@@ -30564,11 +34912,23 @@ class PageOperationsMixin:
                         protected = True
                         permissions &= pdf_permissions(source)
                     first = len(merged)
+                    outline += outline_for_pages(source, list(range(len(source))), offset=first)
+                    if first == 0:
+                        carry_document_details(merged, source, [], labels=False)
+                    own = page_label_rules_for(source, list(range(len(source))), offset=first)
+                    labelled = labelled or bool(own)
+                    labels += own or [
+                        {"startpage": first, "prefix": "", "style": "D", "firstpagenum": first + 1}
+                    ]
                     merged.insert_pdf(source)
                     # Marks made by pdfNote in that file name its objects.
                     neutralize_marker_xrefs_on(merged, range(first, len(merged)))
                 finally:
                     source.close()
+            if outline:
+                merged.set_toc(outline)
+            if labelled:
+                merged.set_page_labels(labels)
             if protected:
                 # The combined document keeps every restriction any of its
                 # sources had (see protection_options).
@@ -30625,16 +34985,19 @@ class PageOperationsMixin:
         title = QLabel(tr("PDFを分割"))
         title.setStyleSheet("font-size: 16px; font-weight: 600; margin-bottom: 6px;")
         layout.addWidget(title)
-        each_page_radio = QRadioButton(tr("1ページごとに分割"))
+        # Check boxes, each a stop of Tab; clicking the range's box chooses
+        # it, ready to type (7.1).
+        choice_group, (each_page_radio, range_radio) = choice_boxes(
+            dialog, [tr("1ページごとに分割"), tr("ページ範囲を指定（例: 1-3, 4-6, 7-10）")]
+        )
         each_page_radio.setChecked(True)
         layout.addWidget(each_page_radio)
-        range_radio = QRadioButton(tr("ページ範囲を指定（例: 1-3, 4-6, 7-10）"))
         layout.addWidget(range_radio)
         range_edit = QLineEdit()
-        range_edit.setEnabled(False)
         range_edit.setPlaceholderText(f"1-{page_count}")
         layout.addWidget(range_edit)
-        range_radio.toggled.connect(range_edit.setEnabled)
+        choose_on_entry(range_edit, range_radio)
+        dialog._choices = (choice_group, each_page_radio, range_radio, range_edit)  # for the tests
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Cancel).setText(tr("キャンセル"))
         buttons.accepted.connect(dialog.accept)
@@ -30665,17 +35028,26 @@ class PageOperationsMixin:
                 )
                 return
             ranges = parsed
-        folder = QFileDialog.getExistingDirectory(
-            self, tr("分割したファイルの保存先フォルダーを選択"), str(Path.home())
+        # A file name, as every save asks for (7.1): it asked for a folder
+        # only and named the files itself. The name typed is the start of
+        # each file's, which goes on with its pages: 報告書_p1.pdf.
+        here = self._document_name_path() if self._document_has_name() else Path.home() / "split.pdf"
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self,
+            tr("分割したファイルを保存（名前の後ろにページ番号が付きます）"),
+            str(here.with_suffix(".pdf")),
+            tr("PDFファイル (*.pdf)"),
         )
-        if not folder:
+        if not chosen:
             return
-        stem = Path(self.file_path).stem if self.file_path else "split"
-        output_dir = Path(folder)
+        stem = Path(chosen).stem or "split"
+        output_dir = Path(chosen).parent
         names = [
             f"{stem}_p{start + 1}.pdf" if start == end else f"{stem}_p{start + 1}-{end + 1}.pdf"
             for start, end in ranges
         ]
+        if self._refuse_open_pdf(*(output_dir / name for name in names)):
+            return
         existing = [name for name in names if (output_dir / name).exists()]
         if existing:
             # Splitting again into the same folder replaced last time's
@@ -30704,6 +35076,12 @@ class PageOperationsMixin:
             piece = fitz.open()
             try:
                 piece.insert_pdf(self.document, from_page=start, to_page=end)
+                # The outline entries of those pages go with them (7.1).
+                outline = outline_for_pages(self.document, list(range(start, end + 1)))
+                if outline:
+                    piece.set_toc(outline)
+                # And its properties and page labels (7.6).
+                carry_document_details(piece, self.document, list(range(start, end + 1)))
                 write_file_atomically(
                     output_dir / name, piece.tobytes(**compact_page_copy(piece), **protection)
                 )
@@ -30712,9 +35090,9 @@ class PageOperationsMixin:
                     message = tr(
                         "PDFを分割できませんでした。{total}個のうち{done}個のファイルは書き出しました。"
                         "「{name}」から先は書き出していません。\n\n{error}"
-                    ).format(total=len(ranges), done=written, name=name, error=exc)
+                    ).format(total=len(ranges), done=written, name=name, error=self._write_failure_detail(exc))
                 else:
-                    message = tr("PDFを分割できませんでした。\n\n{error}").format(error=exc)
+                    message = tr("PDFを分割できませんでした。\n\n{error}").format(error=self._write_failure_detail(exc))
                 QMessageBox.critical(self, APP_NAME, message)
                 return
             finally:
@@ -30761,7 +35139,10 @@ class SavePrintMixin:
         if not self._finish_active_overlays():
             self.status_label.setText(tr("編集を確定できなかったため保存を中止しました"))
             return False
-        initial = self.file_path or str(Path.home() / tr("無題.pdf"))
+        session = self._current_session()
+        initial = self.file_path or (session.suggested_name if session is not None else "") or str(
+            Path.home() / UNTITLED_FILE_NAME
+        )
         # Word, PowerPoint and Excel among the types, as Acrobat lists them
         # (6.24): chosen, the document is exported to that file, as by File
         # > Export, and stays the PDF it is.
@@ -30785,21 +35166,227 @@ class SavePrintMixin:
             return self.export_document(kind, target=str(path))
         return self._save_to_path(str(path))
 
+    # ---- signed PDFs (7.9) -------------------------------------------------
+
+    # What each kind of edit needs the signers to have allowed (ISO 32000-1,
+    # 12.8.2.2): annotations P=3 or no certification; form filling P>=2;
+    # the outline as annotations; the pages and what is on them, never.
+    SIGNED_EDIT_KINDS = ("annotation", "form", "outline", "content", "pages")
+
+    def _signed_edit_allowed(self, kind: str, field_name: str | None = None) -> bool:
+        session = self._current_session()
+        if session is None or session.signed_end is None:
+            return True
+        if session.signed_refused:
+            # The signature cannot be kept anyway; the save asks.
+            return True
+        rules = session.signature_rules or {}
+        docmdp = rules.get("docmdp")
+        if kind in ("annotation", "outline"):
+            return docmdp in (None, 3)
+        if kind == "form":
+            if docmdp == 1:
+                return False
+            locked = rules.get("locked") or set()
+            # "" is every field (clearing them all): any lock refuses it.
+            if field_name is not None and (
+                rules.get("lock_all") or field_name in locked or (field_name == "" and locked)
+            ):
+                return False
+            return True
+        return False
+
+    def _selection_edit_kind(self) -> str:
+        """What changing the selection is: "content" when it holds a text box
+        (its words are in the page) or a picture of the PDF's own, else
+        "annotation"."""
+        if self.document is None:
+            return "annotation"
+        try:
+            page = self.document[self.page_index]
+        except Exception:
+            return "annotation"
+        xrefs = list(self._selected_annotation_xrefs)
+        for name in ("_active_text_xref", "_active_object_xref"):
+            xref = getattr(self, name, None)
+            if xref is not None:
+                xrefs.append(xref)
+        if self._active_text_box is not None:
+            return "content"
+        if self._active_image_box is not None:
+            # The picture held in its box: deleting it is deleting from the
+            # page, for one of the PDF's own (7.9's review).
+            return self._active_image_edit_kind()
+        for xref in xrefs:
+            try:
+                annotation = page.load_annot(xref)
+            except Exception:
+                continue
+            if str(annotation.info.get("subject") or "").startswith(("SumiRichText", "SumiEditableText")):
+                return "content"
+            if self._image_xref_from_annotation(annotation) is not None and not self._is_image_stamp(annotation):
+                return "content"
+        return "annotation"
+
+    def _signed_gate(
+        self, kind: str, rerun: Callable[[], Any] | None = None, field_name: str | None = None,
+    ) -> bool:
+        """Before an edit of a signed PDF: True when the signers allow it,
+        and it is done in place, the signed revision kept. Otherwise the
+        signed document is not changed: asked first, the edit goes to an
+        unsigned copy in a tab of its own -- run there again when it is a
+        command (`rerun`), or to be done there again when it was drawn
+        (7.9, D2: as Acrobat does not redact a signed document in place)."""
+        if self._signed_edit_allowed(kind, field_name):
+            return True
+        self._offer_unsigned_copy("", rerun=rerun)
+        return False
+
+    def _signed_copy_question(self, for_save: bool, reason: str = "") -> QMessageBox:
+        """The question before a signed PDF is left for an unsigned copy."""
+        if for_save:
+            text = tr(
+                "このPDFの電子署名を残したまま保存できません。\n\n"
+                "署名を外したコピーを作って、名前を付けて保存しますか？元のPDFは変わりません。"
+            )
+        else:
+            text = tr(
+                "このPDFには電子署名があります。この操作をすると、署名した人が認めた範囲を超えて文書が変わります。\n\n"
+                "署名を外したコピーを作って、そちらで行いますか？元のPDFは変わりません。"
+            )
+        if reason:
+            text += "\n\n" + tr("（理由：{reason}）").format(reason=reason)
+        box = QMessageBox(QMessageBox.Question, tr("電子署名"), text, QMessageBox.NoButton, self)
+        box.setObjectName("signedCopyQuestion")
+        go = box.addButton(
+            tr("署名を外したコピーで保存") if for_save else tr("署名を外したコピーで行う"),
+            QMessageBox.AcceptRole,
+        )
+        cancel = box.addButton(tr("キャンセル"), QMessageBox.RejectRole)
+        box.setDefaultButton(go)
+        box.setEscapeButton(cancel)
+        return box
+
+    def _offer_unsigned_copy(
+        self, reason: str, for_save: bool = False, rerun: Callable[[], Any] | None = None,
+    ) -> bool:
+        """Ask to go on in an unsigned copy; True when it was made (and,
+        `for_save`, saved under a name of its own)."""
+        box = self._signed_copy_question(for_save, reason)
+        self._last_signed_question = box  # for the tests: exec() never returns offscreen
+        box.exec()
+        if box.clickedButton() is not box.defaultButton():
+            return False
+        if self._make_unsigned_copy() is None:
+            return False
+        if for_save:
+            return self.save_as()
+        if rerun is not None:
+            QTimer.singleShot(0, self, rerun)
+        else:
+            self.status_label.setText(tr("署名を外したコピーで、もう一度行ってください"))
+        return True
+
+    def _make_unsigned_copy(self) -> DocumentSession | None:
+        """The document as it is, in a tab of its own, with its signatures
+        taken off -- their values, their appearance and the certification,
+        the fields left empty to be signed again, as Acrobat's Clear
+        Signature leaves them -- so it does not look signed when it is not
+        (7.9, N-2). Its encryption and restrictions go with it."""
+        session = self._current_session()
+        if session is None or self.document is None:
+            return None
+        if not self._finish_active_overlays():
+            return None
+        try:
+            staged = serialize_document(self.document, password=session.password)
+            copy = fitz.open(stream=staged, filetype="pdf")
+            if session.password and copy.needs_pass:
+                copy.authenticate(session.password)
+            strip_signatures(copy)
+            # Its protection as protection_options() gives it (none: none).
+            options = dict(protection_options(copy, session.password))
+            data = copy.tobytes(
+                garbage=4, clean=True, deflate=True,
+                encryption=options.pop("encryption", fitz.PDF_ENCRYPT_NONE), **options,
+            )
+            copy.close()
+            document = fitz.open(stream=data, filetype="pdf")
+            if session.password and document.needs_pass:
+                document.authenticate(session.password)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, APP_NAME,
+                tr("署名を外したコピーを作れませんでした。\n\n{error}").format(error=exc),
+            )
+            return None
+        source = self._document_name_path()
+        copy_session = DocumentSession(
+            document=document, file_path="", password=session.password, dirty=True,
+            page_index=session.page_index,
+            # Shown as the signed one was: it opened in the default view, a
+            # single page turning continuous at another zoom (2026-11-21's walk).
+            # The window's own, which the tab's record catches up with only
+            # when the tab is left.
+            zoom_mode=self.zoom_mode, zoom_percent=self.zoom_percent,
+            extra_rotation=self.extra_rotation, page_layout=self.page_layout,
+            continuous=self.continuous, facing_cover_separate=self.facing_cover_separate,
+            # An English word, as every name Save As offers (CLAUDE.md).
+            suggested_name=str(source.with_name(f"{source.stem} (unsigned).pdf")),
+        )
+        self._append_session(copy_session)
+        return copy_session
+
     def _save_to_path(self, path: str) -> bool:
         session = self._current_session()
         if self.document is None or session is None:
             return False
         target = Path(path).resolve()
         same_file = bool(self.file_path) and target == Path(self.file_path).resolve()
+        # Another tab's or window's PDF: Windows refuses to replace a file
+        # that copy holds (7.5), as it did for a sanitized copy.
+        if not same_file and self._refuse_open_pdf(target):
+            return False
+        # A read-only file is not replaced by force: Windows refuses it too,
+        # and Word sends a read-only document to Save As (7.5).
+        if target.exists() and not target.stat().st_mode & stat.S_IWRITE:
+            QMessageBox.warning(self, APP_NAME, tr(
+                "このファイルは読み取り専用のため、上書きできません。"
+                "［名前を付けて保存］で別の名前を付けて保存してください。"
+            ))
+            return False
         rebuilt = session.needs_full_rewrite
         data: bytes | None = None
+        signed_data: bytes | None = None
+        old_document: fitz.Document | None = None
+        ocr_pages: set[int] | None = None
+        if session.signed_end is not None:
+            # A signed PDF keeps its signed revision (7.9): written as it and
+            # one update. Another program changed the file since: stop, as
+            # writing over it would take that away.
+            if same_file and session.disk_digest and target.exists():
+                try:
+                    on_disk = hashlib.sha256(target.read_bytes()).hexdigest()
+                except OSError:
+                    on_disk = session.disk_digest
+                if on_disk != session.disk_digest:
+                    QMessageBox.warning(self, APP_NAME, tr(
+                        "このPDFは、開いたあとにほかのアプリで変更されています。"
+                        "電子署名と、その変更を守るため、上書き保存を中止しました。"
+                        "［名前を付けて保存］で別のファイルに保存してください。"
+                    ))
+                    return False
+            try:
+                signed_data = self._document_bytes(strict=True)
+            except SignedSaveRefused as exc:
+                return self._offer_unsigned_copy(str(exc), for_save=True)
         temp_path: Path | None = None
         try:
             # Inside the try: serialising refuses (raises) rather than write
             # an encrypted document in the clear, and that has to reach the
             # error message below like any other failure. Outside it, the
             # save simply did nothing and said nothing.
-            data = self._document_bytes()
+            data = signed_data if signed_data is not None else self._document_bytes()
             target.parent.mkdir(parents=True, exist_ok=True)
             # No ".bak" copy. The swap below is atomic, so the previous
             # file is never at risk, and the fixed name overwrote (then
@@ -30811,7 +35398,7 @@ class SavePrintMixin:
             # would leave a truncated PDF behind if the process died
             # mid-write, destroying whatever was there before.
             file_descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
+                prefix=".pdfnote-", suffix=".sumi.tmp", dir=str(target.parent)
             )
             temp_path = Path(temp_name)
             with os.fdopen(file_descriptor, "wb") as stream:
@@ -30826,7 +35413,7 @@ class SavePrintMixin:
             holds_file = bool(old_document.name)
             if same_file and holds_file:
                 self.document.close()
-            os.replace(temp_path, target)
+            replace_file(temp_path, target)
             temp_path = None
             # A rebuilding save (after redactions) drops the removed objects
             # from the file -- but not from the Document in memory, which
@@ -30867,6 +35454,8 @@ class SavePrintMixin:
             # rewrite it no longer needs.
             session.needs_full_rewrite = False
             session.shrink_estimate = None
+            if session.signed_end is not None:
+                session.disk_digest = hashlib.sha256(data).hexdigest()
             self._clear_recovery_snapshot(session)
             self.settings.add(str(target))
             self.document_tabs.setTabText(self.current_session_index, session.title)
@@ -30892,10 +35481,20 @@ class SavePrintMixin:
                     if session.journal:
                         session.journal = journal_attach(restored)
                         self._forget_history_of_closed_documents(session)
+                    # Another Document, as after a save that went through:
+                    # the same is owed here. It was not done, and after a
+                    # rebuild (its objects renumbered) the selection named
+                    # other objects, and a running OCR wrote nothing more
+                    # (7.9's review).
+                    self._document_reopened(old_document, restored, ocr_pages)
+                    if rebuilt:
+                        self._clear_annotation_selection()
+                        self._invalidate_notes()
+                    self._invalidate_render_cache()
                 except Exception:
                     pass
             QMessageBox.critical(
-                self, APP_NAME, tr("PDFを保存できませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME, tr("PDFを保存できませんでした。\n\n{error}").format(error=self._write_failure_detail(exc))
             )
             return False
         finally:
@@ -30937,7 +35536,10 @@ class SavePrintMixin:
         self.activateWindow()
         preparing = tr("印刷を準備しています…")
         self.status_label.setText(preparing)
-        QApplication.processEvents()
+        # Painted, and no key or click taken meanwhile: one that closed the
+        # document or changed the tab here left the pages chosen above
+        # pointing into another document (7.9's review).
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         try:
             if is_pdf_writer_printer(printer.printerName()):
                 self._print_to_pdf_file(printer, page_indices, layout_options)
@@ -30967,7 +35569,7 @@ class SavePrintMixin:
         as they are, text and all."""
         if self.document is None or not page_indices:
             return False
-        stem = Path(self.file_path).stem if self.file_path else Path(tr("無題.pdf")).stem
+        stem = self._document_name_path().stem
         folder = Path(
             QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
         )
@@ -30976,7 +35578,7 @@ class SavePrintMixin:
         }
         initial = folder / f"{stem}.pdf"
         if str(initial.resolve()) in open_paths:
-            initial = folder / (tr("{name} (印刷)").format(name=stem) + ".pdf")
+            initial = folder / f"{stem} (printed).pdf"
         selected, _filter = QFileDialog.getSaveFileName(
             self, tr("PDFとして保存"), str(initial), tr("PDFファイル (*.pdf)")
         )
@@ -30985,15 +35587,12 @@ class SavePrintMixin:
         if not selected.lower().endswith(".pdf"):
             selected += ".pdf"
         target = Path(selected).resolve()
-        if str(target) in open_paths:
-            QMessageBox.warning(
-                self, APP_NAME, tr("開いているPDFには上書きできません。別の名前を指定してください。")
-            )
+        # Every window's open PDFs, not this window's alone (7.3).
+        if self._refuse_open_pdf(target):
             return False
         layout = printer.pageLayout()
         full = layout.fullRect(QPageLayout.Point)
         paint = layout.paintRect(QPageLayout.Point)
-        temp_path: Path | None = None
         try:
             data = self._build_print_pdf(
                 page_indices,
@@ -31004,30 +35603,14 @@ class SavePrintMixin:
                 collate=printer.collateCopies(),
                 **(layout_options or {}),
             )
-            target.parent.mkdir(parents=True, exist_ok=True)
             # Through a temporary file, as a save does: an interrupted write
             # never leaves half a file where the user asked for one.
-            file_descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{target.stem}-", suffix=".sumi.tmp", dir=str(target.parent)
-            )
-            temp_path = Path(temp_name)
-            with os.fdopen(file_descriptor, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp_path, target)
-            temp_path = None
+            write_file_atomically(target, data)
         except Exception as exc:
             QMessageBox.critical(
-                self, APP_NAME, tr("PDFを書き出せませんでした。\n\n{error}").format(error=exc)
+                self, APP_NAME, tr("PDFを書き出せませんでした。\n\n{error}").format(error=self._write_failure_detail(exc))
             )
             return False
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
         return True
 
     def _build_print_pdf(
@@ -31172,7 +35755,7 @@ class SavePrintMixin:
                 pass
             output.set_metadata(
                 {
-                    "title": Path(self.file_path).stem if self.file_path else "",
+                    "title": self._document_name_path().stem if self._document_has_name() else "",
                     "creator": APP_NAME,
                 }
             )
@@ -31310,6 +35893,7 @@ class SavePrintMixin:
         scale_percent: float = 100.0,
         grid: tuple[int, int] | None = None,
         order: str = "across",
+        going_on: Callable[[int, int], bool] | None = None,
     ) -> bool:
         """Paint `page_indices` onto `printer`.
 
@@ -31317,10 +35901,16 @@ class SavePrintMixin:
         so the preview is drawn by the code that does the printing rather
         than by a second implementation that could drift from it -- which
         is also why N-up and scaling live here and not in a driver.
+
+        `going_on(pages done, pages in all)` is asked before each page and
+        once at the end; False stops the job, which is then called off at
+        the printer (_run_print's progress and its Cancel, 7.9).
         """
         if self.document is None or not page_indices:
             return False
         per_sheet = max(1, per_sheet)
+        painted = 0
+        stopped = False
         painter = QPainter()
         if not painter.begin(printer):
             if not preview:
@@ -31367,6 +35957,10 @@ class SavePrintMixin:
                         cell_width,
                         cell_height,
                     ).adjusted(gutter, gutter, -gutter, -gutter)
+                    if going_on is not None and not going_on(painted, len(page_indices)):
+                        stopped = True
+                        break
+                    painted += 1
                     page = self.document[page_index]
                     width, height = page.rect.width, page.rect.height
                     requested_scale = printer.resolution() / 72.0
@@ -31413,8 +36007,22 @@ class SavePrintMixin:
                         QRect(QPoint(round(x), round(y)), drawn), image
                     )
                     painter.restore()
+                if stopped:
+                    break
+            if not stopped and going_on is not None:
+                going_on(painted, len(page_indices))
         finally:
+            # Called off: the printer is told to drop the job, so the sheets
+            # already sent are not printed either -- where it can.
+            dropped = printer.abort() if stopped else False
             ended = painter.end()
+        if stopped:
+            if not dropped and not preview:
+                QMessageBox.warning(self, APP_NAME, tr(
+                    "印刷を中止しました。すでにプリンターへ送ったページは、印刷されることがあります。"
+                    "プリンターの印刷待ちの一覧をご確認ください。"
+                ))
+            return False
         if not ended or printer.printerState() in (QPrinter.Error, QPrinter.Aborted):
             if not preview:
                 QMessageBox.critical(
@@ -31431,7 +36039,48 @@ class SavePrintMixin:
         page_indices: list[int],
         layout_options: dict[str, object] | None = None,
     ) -> None:
-        self._paint_pages_to_printer(printer, page_indices, **(layout_options or {}))
+        """Send the pages to the printer, saying how far it has got, with a
+        Cancel (7.9, the owner's choice from the code review). Nothing was
+        said and nothing could be stopped: the window stood still until the
+        last page had gone, "not responding" to Windows for a long
+        document. The dialog comes up only for a job that takes a moment,
+        as the export's and the OCR download's are made (QProgressDialog)."""
+        label = tr("印刷しています… {done} / {total} ページ")
+        dialog = self._print_progress_dialog(len(page_indices))
+        self._print_dialog = dialog
+
+        def going_on(done: int, pages: int) -> bool:
+            dialog.setLabelText(label.format(done=done, total=pages))
+            # Shows the dialog once the job has taken its moment, and, shown,
+            # takes the clicks and keys meant for it -- Cancel, Esc.
+            dialog.setValue(done)
+            return not dialog.wasCanceled()
+
+        try:
+            self._paint_pages_to_printer(
+                printer, page_indices, going_on=going_on, **(layout_options or {})
+            )
+        finally:
+            self._print_dialog = None
+            dialog.close()
+            dialog.deleteLater()
+
+    # How long a print job runs before its progress is shown: a page or two
+    # are gone before a dialog could be read.
+    PRINT_PROGRESS_AFTER_MS = 700
+
+    def _print_progress_dialog(self, total: int) -> QProgressDialog:
+        dialog = QProgressDialog(
+            tr("印刷しています… {done} / {total} ページ").format(done=0, total=total),
+            tr("キャンセル"), 0, max(total, 1), self,
+        )
+        dialog.setObjectName("printProgress")
+        dialog.setWindowTitle(tr("印刷"))
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(self.PRINT_PROGRESS_AFTER_MS)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        return dialog
 
 
 class InfoDialogsMixin:
@@ -31476,7 +36125,7 @@ class InfoDialogsMixin:
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
         rows = [
-            (tr("ファイル"), source.name if source is not None else tr("無題.pdf")),
+            (tr("ファイル"), source.name if source is not None else self._document_display_name()),
             (tr("場所"), str(source.parent) if source is not None else "—"),
             (tr("サイズ"), size_text),
             (tr("ページ数"), str(len(self.document))),
@@ -31487,10 +36136,14 @@ class InfoDialogsMixin:
             (tr("PDFのバージョン"), metadata.get("format") or "—"),
             # needs_pass alone reported "None" for a PDF encrypted with only
             # an owner password -- the kind that carries usage restrictions.
+            # And read on a document opened with its password, needs_pass
+            # undid the unlocking (PyMuPDF 1.28): after the properties, the
+            # pages went blank and a save wrote a file no one could read
+            # (7.9). The password it was opened with says the same.
             (
                 tr("暗号化"),
                 metadata.get("encryption")
-                or (tr("あり") if self.document.needs_pass else tr("なし")),
+                or (tr("あり") if self.password else tr("なし")),
             ),
             (
                 tr("制限"),
@@ -31498,7 +36151,8 @@ class InfoDialogsMixin:
                 or tr("なし〔制限〕"),
             ),
         ]
-        for name, value in rows:
+        restrictions_row = len(rows) - 1
+        for row_index, (name, value) in enumerate(rows):
             name_label = QLabel(name)
             name_label.setStyleSheet(f"color: {COLORS['muted']};")
             value_label = QLabel(str(value))
@@ -31512,6 +36166,21 @@ class InfoDialogsMixin:
                 # names -- by alignment, not by a mark in the text as there:
                 # these can be copied, and a path would carry the mark.
                 value_label.setAlignment(Qt.AlignRight | Qt.AlignAbsolute | Qt.AlignVCenter)
+            if row_index == restrictions_row and self._restrictions_to_lift():
+                # Beside the restrictions, the way to lift them (7.9).
+                cell = QWidget()
+                cell_layout = QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.addWidget(value_label, 1)
+                lift_button = QPushButton(tr("制限を外して復元..."))
+                lift_button.setAutoDefault(False)
+                lift_button.clicked.connect(
+                    lambda _checked=False: (dialog.accept(), QTimer.singleShot(0, self, self.restore_document_copy))
+                )
+                cell_layout.addWidget(lift_button, 0, Qt.AlignTop)
+                dialog._lift_button = lift_button  # type: ignore[attr-defined]  # for the tests
+                form.addRow(name_label, cell)
+                continue
             form.addRow(name_label, value_label)
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -31565,7 +36234,7 @@ class InfoDialogsMixin:
             grid.addWidget(header, row, 0, 1, 2)
             row += 1
             for keys, description_key, action_name in rows:
-                keys_shown = " / ".join(key_text(value) for value in keys)
+                keys_shown = keys_or(key_text(value) for value in keys)
                 shortcut_label = QLabel(keys_shown)
                 # "Ctrl+Shift+<" must never be taken for the start of a tag.
                 shortcut_label.setTextFormat(Qt.PlainText)
@@ -31888,7 +36557,7 @@ class PremiumMixin:
     PREMIUM_ALT_KEYS = "Alt キーのショートカット"
     # What limited mode puts behind a purchase, as the status bar lists it.
     PREMIUM_FEATURES = (
-        "OCR", "墨消し〔名詞〕", "テキスト ボックスの追加", "ショートカット メニュー",
+        "OCR", "墨消し〔名詞〕", "ショートカット メニュー",
         "Alt キーのショートカット",
     )
 
@@ -31907,9 +36576,7 @@ class PremiumMixin:
             action = getattr(self, name, None)
             if action is not None:
                 found[action] = feature
-        text_tool = getattr(self, "edit_actions", {}).get("text")
-        if text_tool is not None:
-            found[text_tool] = "テキスト ボックスの追加"
+        # The text box tool was one, until it was made free for good (7.2).
         return found
 
     @staticmethod
@@ -31925,9 +36592,10 @@ class PremiumMixin:
         its access key still works."""
         return f"{text}{PREMIUM_MENU_MARK}" if self._premium_marks_visible() else text
 
-    def _apply_premium_menu_marks(self, menu: QMenu | None) -> None:
+    def _apply_premium_menu_marks(self, menu: QMenu | None, every_entry: bool = False) -> None:
         """Mark every entry of `menu` (and its submenus) that opens a premium
-        feature, so the badge is drawn on it.
+        feature, so the badge is drawn on it -- or, for a right-click menu
+        (`every_entry`), every command in it, the menu itself being one (7.7).
 
         Entries are matched by the source string they carry, not by their
         label, so this works in all eight languages.
@@ -31938,14 +36606,17 @@ class PremiumMixin:
         for action in menu.actions():
             submenu = action.menu()
             if submenu is not None:
-                self._apply_premium_menu_marks(submenu)
+                self._apply_premium_menu_marks(submenu, every_entry)
+            if isinstance(action, QWidgetAction) or action.isSeparator() or not action.text():
+                continue
             key = action.property("pdfnoteKey")
             text = action.text()
             # Either the command is always premium (its source string is in
             # the table), or this particular entry was marked when it was
             # built -- Duplicate is premium only on a text box.
             wanted = visible and (
-                key in PREMIUM_MENU_KEYS or bool(action.property("pdfnotePremium"))
+                (every_entry and submenu is None)
+                or key in PREMIUM_MENU_KEYS or bool(action.property("pdfnotePremium"))
             )
             marked = PREMIUM_MENU_MARK in text
             if wanted and not marked:
@@ -31955,6 +36626,24 @@ class PremiumMixin:
             elif marked and not wanted:
                 action.setText(text.replace(PREMIUM_MENU_MARK, ""))
         install_premium_badges(menu)
+
+    def _context_menu_ready(self, menu: QMenu) -> QMenu:
+        """A right-click menu, as the premium feature it is (7.7): every
+        command in it marked while the marks show, and after the trial the
+        offer when one is chosen (guard_premium_menu)."""
+        self._apply_premium_menu_marks(menu, every_entry=True)
+        license_state = getattr(self, "license", None)
+        if license_state is not None:
+            before = (license_state.mode, license_state.days_left)
+            license_state.refresh()
+            if (license_state.mode, license_state.days_left) != before:
+                self._license_changed()
+            if license_state.limited:
+                ref = weakref.ref(self)
+                guard_premium_menu(menu, lambda: (window := ref()) is not None and window._premium_blocked(
+                    window.PREMIUM_CONTEXT_MENU
+                ))
+        return menu
 
     def _premium_menu_icon(self, kind: str) -> QIcon:
         icon = self._menu_icon(kind)
@@ -31979,54 +36668,105 @@ class PremiumMixin:
         self._show_premium_prompt(feature)
         return True
 
+    # The premium features as the offers list them, by the name the gates
+    # use (7.2): the right-click menu named so a first-timer knows it.
+    PREMIUM_LIST_NAMES = {
+        # What is premium of redaction is marking what to redact; applying
+        # marks a document already has stays free. Named so, as the purchase
+        # screen, the first-start notice, the Terms and the listing do (7.8).
+        "OCR": "OCR", "墨消し〔名詞〕": "墨消しの範囲の指定",
+        "ショートカット メニュー": "ショートカット メニュー（右クリック）",
+        "Alt キーのショートカット": "Alt キーのショートカット",
+    }
+
+    def _premium_list_line(self) -> str:
+        return tr("プレミアム機能：{features}").format(features=tr("、").join(
+            tr(self.PREMIUM_LIST_NAMES.get(name, name)) for name in self.PREMIUM_FEATURES
+        ))
+
+    @staticmethod
+    def _premium_free_line(trial: bool) -> str:
+        """What stays free, said the same way in every offer (7.2; the
+        owner's sentence of 2026-11-09, during the trial and after it)."""
+        return tr("その他のショートカット、テキスト ボックス・エクスポートなどは、これまでどおり無料でお使いいただけます。")
+
+    @staticmethod
+    def _developer_line() -> str:
+        """The owner's appeal for support, then his words of 2026-10-31
+        asked as a purchase (7.2). The appeal stood at the top of the
+        purchase screen; the owner moved it here (2026-11-09)."""
+        appeal = tr(
+            "pdfNoteは若き開発者がたった一人で作っています。"
+            "もし気に入っていただけたなら、有償版を購入して開発者を応援していただけないでしょうか。"
+        )
+        return appeal + "\n" + tr("ご購入いただけると、このアプリの開発者が大層喜んで小躍りし、シェイプアップを達成することでしょう。")
+
     def _premium_offer_text(self, feature: str | None = None) -> str:
-        """What the paid version adds, and what stays free. One wording for
-        the prompt and for the status bar's button."""
-        lines: list[str] = []
-        if feature is not None:
-            lines.append(tr("「{feature}」はプレミアム機能です").format(feature=tr(feature)))
-        lines.append(self._trial_ended_text())
-        lines.append("")
-        lines.append(tr("プレミアムでお使いいただけるもの:"))
-        lines += [tr("　・{item}").format(item=tr(name)) for name in self.PREMIUM_FEATURES]
-        lines.append("")
-        lines.append(self._premium_buy_line())
+        """The offer after the trial (7.2, the owner's wording of
+        2026-11-07): what was refused and why, the free way where there is
+        one, the premium features, what stays free, and how to buy. Long
+        every time, as the owner chose."""
+        if feature == self.PREMIUM_ALT_KEYS and not getattr(self, "_premium_alt_pressed", None):
+            self._premium_alt_pressed = (tr("Alt キー"), tr("Alt キーのショートカット"))
+        if feature == self.PREMIUM_ALT_KEYS and getattr(self, "_premium_alt_pressed", None):
+            key, command = self._premium_alt_pressed
+            first = tr(
+                "「{key}（{command}）」は Alt キーのショートカットで、プレミアム機能です。"
+                "ツール バーのボタンからは、無料でお使いいただけます。"
+            ).format(key=key, command=command)
+        elif feature == self.PREMIUM_CONTEXT_MENU:
+            first = tr(
+                "右クリックのメニュー（ショートカット メニュー）はプレミアム機能です。"
+                "同じ操作は、ツール バーのボタンや Ctrl キーのショートカットから無料でお使いいただけます。"
+            )
+        elif feature is not None:
+            first = tr(
+                "「{feature}」はプレミアム機能です。{days} 日間のプレミアム無料体験期間が終わったため、"
+                "使うにはプレミアムの購入が必要です。"
+            ).format(feature=tr(self.PREMIUM_LIST_NAMES.get(feature, feature)), days=TRIAL_DAYS)
+        else:
+            first = tr(
+                "{days} 日間のプレミアム無料体験期間が終わりました。プレミアム機能を使うには、プレミアムの購入が必要です。"
+            ).format(days=TRIAL_DAYS)
+        lines = [
+            first, "",
+            self._premium_list_line(), self._premium_free_line(trial=False), "",
+            self._developer_line(), self._premium_buy_line(),
+        ]
         return "\n".join(lines)
 
     @staticmethod
-    def _trial_ended_text() -> str:
-        """What the end of the free trial means, in the owner's words
-        (2026-10-31): the mouse stays free, the paid version brings the
-        premium features, and the developer would dance for joy and get in
-        shape."""
-        return tr(
-            "{days}日間のプレミアム機能無料体験期間が終了してしまいました。"
-            "マウスを使えば引き続き無料でpdfNoteをご利用いただけます。"
-            "右クリックメニューやショートカットなどのプレミアム機能をお求めの場合は、"
-            "有償版を購入してください。"
-            "このアプリの開発者が大層喜んで小躍りし、シェイプアップを達成することでしょう。"
-        ).format(days=TRIAL_DAYS)
-
-    @staticmethod
     def _premium_buy_line() -> str:
-        """How to buy, in the last line of every offer."""
-        if StoreClient.shared() is not None:
-            return tr("［購入する］を選ぶと、購入の前に内容を確認する画面が開きます。")
-        return tr("プレミアム機能は、Microsoft Store 版の pdfNote で購入できます。")
+        """How to buy, in the last line of every offer. The source is the
+        Store edition's alone (the owner, 2026-11-10): no other copy is
+        told where to buy."""
+        return tr("［購入する］を選ぶと、購入の前に内容を確認する画面が開きます。")
 
     def _premium_message(self, text: str) -> None:
-        """An offer, with Buy where this copy can buy (the Store edition)."""
-        client = StoreClient.shared()
-        if client is None:
-            QMessageBox.information(self, tr("プレミアム機能"), text)
-            return
+        """An offer, with Buy (7.0: at every time)."""
         box = QMessageBox(QMessageBox.Information, tr("プレミアム機能"), text, QMessageBox.NoButton, self)
-        buy = box.addButton(tr("購入する…"), QMessageBox.AcceptRole)
+        box.setObjectName("premiumOffer")
+        buy = box.addButton(tr("購入する..."), QMessageBox.AcceptRole)
         box.addButton(tr("閉じる"), QMessageBox.RejectRole)
         box.setDefaultButton(buy)
+        self._last_premium_box = box  # for the tests: exec() never returns offscreen
         box.exec()
         if box.clickedButton() is buy:
+            self.buy_premium()
+
+    def buy_premium(self) -> None:
+        """File > Buy Premium and every offer's Buy (7.0): the purchase
+        screen, during the trial too. Without the Store (its part of Windows
+        could not be loaded), it says so: a copy from elsewhere was sent to
+        pdfNote's Store page until 7.9, which the owner had taken out -- the
+        source is for the Store edition alone (2026-11-10)."""
+        if StoreClient.shared() is not None:
             self._open_purchase()
+            return
+        QMessageBox.warning(self, tr("プレミアムの購入"), tr(
+            "Microsoft Store に接続できませんでした。"
+            "インターネットへの接続を確かめて、もう一度お試しください。"
+        ))
 
     def _show_premium_prompt(self, feature: str) -> None:
         self._hide_keytips()
@@ -32142,6 +36882,18 @@ class PremiumMixin:
         except RuntimeError:
             return  # the window closed meanwhile
 
+    def _alt_key_named(self, event: QEvent) -> tuple[str, str]:
+        """An Alt key pressed, as the offer names it: the key in the UI's
+        words, and the command it runs."""
+        modifiers = event.modifiers() & ~Qt.KeypadModifier
+        pressed = QKeySequence(QKeyCombination(modifiers, Qt.Key(event.key()))).toString(QKeySequence.PortableText)
+        actions = getattr(self, "_shortcut_action_map", {}).get(pressed, ())
+        if actions:
+            command = actions[0].property("pdfnoteTipText") or actions[0].text()
+        else:
+            command = tr("回転〔動詞〕")  # Alt+Left and Alt+Right turn what is held
+        return key_text(pressed), str(command).replace("&", "").rstrip(".…")
+
     def _premium_alt_key(self, event: QEvent) -> bool:
         """Is this key an Alt shortcut limited mode must turn into the
         prompt? Only pdfNote's own Alt chords in this window: Alt+F4, Alt+Tab,
@@ -32172,12 +36924,14 @@ class PremiumMixin:
         return license_state.limited
 
     def _premium_context_menu_request(self, watched: Any, event: QEvent) -> bool:
-        """A right-click menu about to open in this window, in limited mode:
-        the prompt instead. Dialogs keep their own text menus."""
-        if not isinstance(watched, QWidget):
+        """A right-click menu Qt builds itself (a text box's standard menu
+        in this window), after the trial: the offer instead, since it cannot
+        be marked and guarded as pdfNote's own menus are (_context_menu_ready,
+        7.7). pdfNote's menus open, and offer when an entry is chosen."""
+        if not isinstance(watched, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
             return False
         try:
-            if watched.window() is not self:
+            if watched.window() is not self or watched.contextMenuPolicy() != Qt.DefaultContextMenu:
                 return False
         except RuntimeError:
             return False
@@ -32195,9 +36949,8 @@ class PremiumMixin:
 
     def createPopupMenu(self) -> QMenu | None:  # noqa: N802 - Qt's name
         """The toolbar's own right-click menu (Qt's list of toolbars)."""
-        if self._premium_blocked(self.PREMIUM_CONTEXT_MENU):
-            return None
-        return super().createPopupMenu()
+        menu = super().createPopupMenu()
+        return self._context_menu_ready(menu) if menu is not None else None
 
     def _apply_premium_icons(self) -> None:
         visible = self._premium_marks_visible()
@@ -32245,14 +36998,19 @@ class PremiumMixin:
     def _license_status_text(self) -> str:
         license_state = self.license
         if license_state.mode == LicenseState.TRIAL:
-            return tr_n("無料試用版: 残り {count} 日", license_state.days_left).format(
+            # One name for the period everywhere (7.2).
+            return tr_n("プレミアム無料体験期間: あと {count} 日", license_state.days_left).format(
                 count=license_state.days_left
             )
         if license_state.mode == LicenseState.LIMITED:
-            return tr("無料試用期間が終了しました")
+            return tr("プレミアム無料体験期間が終わりました")
         return ""
 
     def _update_license_status(self) -> None:
+        action = getattr(self, "act_buy_premium", None)
+        if action is not None and getattr(self, "license", None) is not None:
+            # Nothing to buy once premium is owned.
+            action.setVisible(self.license.mode != LicenseState.PREMIUM)
         button = getattr(self, "license_status_button", None)
         if button is None:
             return
@@ -32262,7 +37020,7 @@ class PremiumMixin:
             # Only limited mode is a premium state; the trial is just a
             # countdown and needs no badge.
             button.setText(
-                f"{PREMIUM_BADGE_TEXT}  {text}" if self._premium_marks_visible() else text
+                f"{PREMIUM_BADGE_TEXT}  {text}" if self.license.mode == LicenseState.LIMITED else text
             )
             button.setToolTip(tr("プレミアム機能"))
 
@@ -32271,12 +37029,28 @@ class PremiumMixin:
         if self.license.mode == LicenseState.LIMITED:
             self._premium_message(self._premium_offer_text())
             return
-        lines = [self._license_status_text(), ""]
-        lines += [tr("　・{item}").format(item=tr(feature)) for feature in self.PREMIUM_FEATURES]
-        lines += ["", tr("開く・読む・ハイライト・付箋・手書き・図形・保存・印刷は、"
-                         "これまでどおり無料でお使いいただけます。")]
-        lines.append(self._premium_buy_line())
-        self._premium_message("\n".join(lines).strip())
+        self._premium_message(self._trial_offer_text())
+
+    def _trial_offer_text(self) -> str:
+        """What the status bar's button says during the trial (7.2, made
+        one with the offer after the trial): the days left and the last
+        day, that every feature works now and premium can be bought now,
+        the premium features, what stays free, and how to buy."""
+        license_state = self.license
+        # The end itself, with its time (7.8): the date alone could not say
+        # whether the last day was whole.
+        end = QDateTime.fromSecsSinceEpoch(int(license_state.trial_ends().timestamp())).toLocalTime()
+        head = tr_n("プレミアム無料体験期間: あと {count} 日（{date} まで）", license_state.days_left).format(
+            count=license_state.days_left, date=QLocale.system().toString(end, QLocale.ShortFormat)
+        )
+        lines = [
+            head, "",
+            tr("プレミアム無料体験期間中は、すべての機能をお使いいただけます。期間が終わる前でも、プレミアムを購入できます。"),
+            tr("プレミアム無料体験期間が終わると、次の機能にはプレミアムの購入が必要になります。"),
+            self._premium_list_line(), self._premium_free_line(trial=True), "",
+            self._developer_line(), self._premium_buy_line(),
+        ]
+        return "\n".join(lines)
 
 
 # The outline entry for where the reader is (6.8), by this role on its item.
@@ -32344,6 +37118,8 @@ class WritingPane(QWidget):
         self.filter_button: QToolButton | None = None
         self.count_label = QLabel()
         self.filter_panel: QFrame | None = None
+        self.select_all_button: QPushButton | None = None
+        self.clear_all_button: QPushButton | None = None
         self.kind_boxes: dict[str, QCheckBox] = {}
         self.color_boxes: dict[str, QCheckBox] = {}
         # The sections whose headers the list shows so far, while it fills.
@@ -32443,10 +37219,149 @@ def outline_entries(document: fitz.Document | None) -> list[OutlineEntry]:
     return entries
 
 
-def outline_new_entry(document: fitz.Document, title: str, page_index: int) -> int:
-    """A new entry going to the top of the page, not yet in the outline."""
+def outline_for_pages(document: fitz.Document, pages: list[int], offset: int = 0) -> list[list[Any]]:
+    """The outline entries that go to `pages`, for a new document made of
+    them in that order (7.1): split, exported and merged files lost their
+    outline. Each goes to its page's new place (`offset` more, for pages
+    put after others); an entry whose page is not taken is left out, and
+    the levels are closed up so the outline stays a tree."""
+    try:
+        toc = document.get_toc(simple=True)
+    except Exception:
+        return []
+    position = {page: index for index, page in enumerate(pages)}
+    kept: list[list[Any]] = []
+    last = 0
+    for level, title, page_number, *_rest in toc:
+        index = position.get(int(page_number) - 1)
+        if index is None:
+            continue
+        level = max(1, min(int(level), last + 1))
+        kept.append([level, str(title), index + 1 + offset])
+        last = level
+    return kept
+
+
+def page_label_rules_for(
+    document: fitz.Document, pages: list[int], offset: int = 0, *, numbered: bool = False
+) -> list[dict[str, Any]]:
+    """The page-label rules that give `pages`, put in a new document in
+    that order (`offset` more, after others), the labels they have here
+    (7.6): split, exported and merged files lost them, and a page that read
+    "iv" or "A-3" became plain 4 or 3. A page before the first rule, or in
+    a document with none (`numbered`, for a merge where another file has
+    them), keeps the plain number it shows here. Nothing for a document
+    without labels, unless `numbered`."""
+    try:
+        rules = sorted(document.get_page_labels(), key=lambda rule: int(rule.get("startpage", 0)))
+    except Exception:
+        rules = []
+    if not rules and not numbered:
+        return []
+    made: list[dict[str, Any]] = []
+    previous: tuple[int, int] | None = None
+    for index, page in enumerate(pages):
+        governing = -1
+        for number, rule in enumerate(rules):
+            if int(rule.get("startpage", 0)) <= page:
+                governing = number
+        if governing < 0:
+            style, prefix, value = "D", "", page + 1
+        else:
+            rule = rules[governing]
+            style = str(rule.get("style") or "")
+            prefix = str(rule.get("prefix") or "")
+            value = int(rule.get("firstpagenum") or 1) + page - int(rule.get("startpage", 0))
+        if previous == (governing, value - 1) and made and made[-1]["style"] == style:
+            previous = (governing, value)
+            continue
+        made.append({"startpage": index + offset, "prefix": prefix, "style": style, "firstpagenum": value})
+        previous = (governing, value)
+    return made
+
+
+def carry_document_details(
+    target: fitz.Document, source: fitz.Document, pages: list[int], *, labels: bool = True
+) -> None:
+    """Give `target`, made of `pages` of `source` in that order, what the
+    source says about itself and its pages (7.6): the document properties
+    (title, author, subject, keywords, and the XMP that Acrobat shows), the
+    page labels, and the links from one of those pages to another. The
+    split, exported and merged files lost the first two, and an export of
+    pages not next to each other lost the links between them, since each run
+    of pages is copied on its own. The outline goes with them too
+    (outline_for_pages); form fields are copied with their pages."""
+    try:
+        details = {
+            key: value for key, value in source.metadata.items()
+            if key not in ("format", "encryption") and value
+        }
+        if details:
+            target.set_metadata(details)
+        xmp = source.get_xml_metadata()
+        if xmp:
+            target.set_xml_metadata(xmp)
+    except Exception:
+        pass
+    if labels:
+        try:
+            rules = page_label_rules_for(source, pages)
+            if rules:
+                target.set_page_labels(rules)
+        except Exception:
+            pass
+    carry_links_between(target, source, pages)
+
+
+def carry_links_between(
+    target: fitz.Document, source: fitz.Document, pages: list[int], offset: int = 0
+) -> None:
+    """The links from page to page of `source` whose both ends are among
+    `pages`, on their copies in `target` (page pages[i] is offset + i
+    there). A link insert_pdf already copied -- one inside a run of pages
+    copied together -- is not made twice."""
+    position = {page: index for index, page in enumerate(pages)}
+    for index, page in enumerate(pages):
+        try:
+            links = source[page].get_links()
+        except Exception:
+            continue
+        wanted = [
+            link for link in links
+            if link.get("kind") in (fitz.LINK_GOTO, fitz.LINK_NAMED)
+            and isinstance(link.get("page"), int) and link["page"] in position
+        ]
+        if not wanted:
+            continue
+        copy = target[offset + index]
+        try:
+            there = {
+                (tuple(round(v, 1) for v in link["from"]), link.get("page"))
+                for link in copy.get_links()
+            }
+        except Exception:
+            there = set()
+        for link in wanted:
+            goes_to = offset + position[link["page"]]
+            if (tuple(round(v, 1) for v in link["from"]), goes_to) in there:
+                continue
+            made = {"kind": fitz.LINK_GOTO, "from": link["from"], "page": goes_to}
+            point = link.get("to")
+            if isinstance(point, fitz.Point):
+                made["to"] = point
+            try:
+                copy.insert_link(made)
+            except Exception:
+                continue
+
+
+def outline_new_entry(
+    document: fitz.Document, title: str, page_index: int, at: fitz.Point | None = None
+) -> int:
+    """A new entry going to the top of the page -- or to `at`, a point of
+    the page as it is shown -- not yet in the outline."""
     page = document[page_index]
-    top = (fitz.Point(0, 0) * ~page.transformation_matrix).y
+    top = ((at if at is not None else fitz.Point(0, 0)) * ~page.transformation_matrix).y
     xref = document.get_new_xref()
     document.update_object(
         xref, f"<</Title{fitz.get_pdf_str(title)}/Dest[{page.xref} 0 R/XYZ null {top:g} null]>>"
@@ -32658,33 +37573,68 @@ class OutlineEditMixin:
             best = best[:40].rstrip() + "…"
         return best or tr("ページ {page}").format(page=page_index + 1)
 
+    # The longest title taken from selected text.
+    OUTLINE_SELECTION_TITLE_CHARS = 120
+
+    def _outline_entry_from_selection(self) -> tuple[int, str, fitz.Point] | None:
+        """The page text selected, as an outline entry (7.9, the owner): its
+        page, its words as one line, and where its first line starts."""
+        target = self._text_selection_target()
+        if target is None:
+            return None
+        page_index, first, _last = target
+        title = " ".join(self._selected_page_text().split())
+        if not title:
+            return None
+        if len(title) > self.OUTLINE_SELECTION_TITLE_CHARS:
+            title = title[: self.OUTLINE_SELECTION_TITLE_CHARS].rstrip() + "…"
+        try:
+            rect = self._page_characters(self.document[page_index])[first][0]
+            at = fitz.Point(0, rect.y0)
+        except Exception:
+            at = None
+        return page_index, title, at
+
     def add_outline_entry(self, page_index: int | None = None) -> int | None:
         """Add the page being read -- or `page_index` -- to the outline,
         named after its heading, and start renaming it where the outline or
-        the Pages tab is showing. The new entry's key, or None."""
+        the Pages tab is showing. With page text selected (and no page
+        named), the selection is the entry: its words its title, and its
+        place where it goes (7.9, the owner) -- named already, it is not
+        opened for renaming. The new entry's key, or None."""
+        if not self._signed_gate("outline", lambda: self.add_outline_entry(page_index)):  # 7.9: a signed PDF
+            return None
         if self.document is None or not self.document.is_pdf:
             return None
         if not self._commit_open_edits():
             return None
-        page = self._reading_page() if page_index is None else page_index
+        chosen = self._outline_entry_from_selection() if page_index is None else None
+        at = None
+        if chosen is not None:
+            page, title, at = chosen
+        else:
+            page = self._reading_page() if page_index is None else page_index
         if not 0 <= page < len(self.document):
             return None
-        title = self._outline_title_for_page(page)
+        if chosen is None:
+            title = self._outline_title_for_page(page)
         checkpoint = self._begin_edit()
         try:
             entries = self._editable_outline()
             position, level = self._outline_place(entries, page)
-            xref = outline_new_entry(self.document, title, page)
+            xref = outline_new_entry(self.document, title, page, at)
             linked = [(entry.level, entry.xref) for entry in entries]
             linked.insert(position, (level, xref))
             outline_link(self.document, linked)
         except Exception as exc:
             self._outline_edit_failed(checkpoint, exc)
             return None
-        self._outline_changed(xref, rename=True)
+        self._outline_changed(xref, rename=chosen is None)
         return xref
 
     def rename_outline_entry(self, key: int, title: str) -> bool:
+        if not self._signed_gate("outline", lambda: self.rename_outline_entry(key, title)):  # 7.9: a signed PDF
+            return False
         title = " ".join(str(title).split())
         if self.document is None or not title:
             return False
@@ -32705,6 +37655,8 @@ class OutlineEditMixin:
     def delete_outline_entry(self, key: int) -> bool:
         """Take an entry out of the outline. What was under it moves up a
         level and stays: deleting a chapter's entry keeps its sections."""
+        if not self._signed_gate("outline", lambda: self.delete_outline_entry(key)):  # 7.9: a signed PDF
+            return False
         if self.document is None:
             return False
         index = self._outline_index(outline_entries(self.document), key)
@@ -32793,7 +37745,93 @@ class OutlineEditMixin:
                 self.delete_current_outline_entry()
                 event.accept()
                 return True
+        if (
+            focus is self.outline_tree
+            and event.modifiers() & ~Qt.KeypadModifier == (Qt.AltModifier | Qt.ShiftModifier)
+            and event.key() in (Qt.Key_Left, Qt.Key_Right)
+        ):
+            # Alt+Shift+Left and Right, Word's promote and demote (7.9). An
+            # Alt key, premium as every Alt key is; ＋'s neighbours are free.
+            promote = event.key() == Qt.Key_Left
+            if QApplication.isRightToLeft():
+                promote = not promote
+            self._premium_alt_pressed = (
+                key_text("Alt+Shift+Left" if event.key() == Qt.Key_Left else "Alt+Shift+Right"),
+                tr("目次のレベル上げ" if promote else "目次のレベル下げ"),
+            )
+            try:
+                blocked = self._premium_blocked(self.PREMIUM_ALT_KEYS)
+            finally:
+                self._premium_alt_pressed = None
+            if not blocked:
+                self.change_current_outline_level(-1 if promote else 1)
+            event.accept()
+            return True
         return False
+
+    def _outline_level_moves(self, key: int | None) -> tuple[bool, bool]:
+        """Can the entry `key` go up a level, and down one? Up while it is
+        not at the top; down while the entry before it is at its level or
+        deeper, so it can go under it -- an entry is never two levels below
+        the one before it."""
+        if self.document is None or key is None:
+            return False, False
+        entries = outline_entries(self.document)
+        index = self._outline_index(entries, key)
+        if index is None:
+            return False, False
+        level = entries[index].level
+        return level > 1, index > 0 and entries[index - 1].level >= level
+
+    def _update_outline_level_actions(self) -> None:
+        up, down = self._outline_level_moves(self._current_outline_key())
+        self.act_outline_promote.setEnabled(up)
+        self.act_outline_demote.setEnabled(down)
+
+    def change_current_outline_level(self, step: int) -> bool:
+        key = self._current_outline_key()
+        return key is not None and self.change_outline_level(key, step)
+
+    def change_outline_level(self, key: int, step: int) -> bool:
+        """The entry `key` a level up (step -1) or down (+1), with the
+        entries under it, which stay under it (7.9, the owner: an outline
+        that groups). One step of undo."""
+        if not self._signed_gate("outline", lambda: self.change_outline_level(key, step)):  # 7.9: a signed PDF
+            return False
+        if self.document is None or step not in (-1, 1):
+            return False
+        up, down = self._outline_level_moves(key)
+        if (step < 0 and not up) or (step > 0 and not down):
+            return False
+        index = self._outline_index(outline_entries(self.document), key)
+        if index is None:
+            return False
+        checkpoint = self._begin_edit()
+        try:
+            entries = self._editable_outline()
+            level = entries[index].level
+            end = index + 1
+            while end < len(entries) and entries[end].level > level:
+                end += 1
+            linked = [
+                (entry.level + step if index <= number < end else entry.level, entry.xref)
+                for number, entry in enumerate(entries)
+            ]
+            outline_link(self.document, linked)
+            moved = entries[index].xref
+        except Exception as exc:
+            self._outline_edit_failed(checkpoint, exc)
+            return False
+        self._outline_changed(moved)
+        if step > 0:
+            # Its new parent shows it.
+            item = self._outline_items.get(moved)
+            parent = item.parent() if item is not None else None
+            if parent is not None:
+                parent.setExpanded(True)
+                self.outline_tree.scrollToItem(item)
+        self._update_outline_level_actions()
+        return True
 
     # ---- the sections -------------------------------------------------------
     def _outline_folds(self, kind: str) -> set[int]:
@@ -32906,7 +37944,7 @@ class OutlineEditMixin:
 
     def _page_section_menu(self, key: int) -> QMenu:
         menu = QMenu(self.thumbnail_list)
-        self._add_menu_action(menu, "名前の変更", lambda: self._edit_page_section_title(key))
+        self._add_menu_action(menu, "名前の変更", lambda: self._edit_page_section_title(key), icon="text")
         self._add_menu_action(
             menu, "目次から削除", lambda: self.delete_outline_entry(key), icon="delete"
         )
@@ -33119,11 +38157,20 @@ class OutlineEditMixin:
             grid.addWidget(box, number // 3, number % 3)
             pane.color_boxes[name] = box
         layout.addLayout(grid)
+        # Every box ticked, or none, at once (7.9, the owner: a filter should
+        # have both, as Excel's Select All and Outlook's Clear All).
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        everything = named(QPushButton(), "すべて表示")
-        everything.clicked.connect(lambda _checked=False: self._reset_note_filter(pane))
-        buttons.addWidget(everything)
+        pane.select_all_button = named(QPushButton(), "すべて選択")
+        pane.select_all_button.clicked.connect(
+            lambda _checked=False: self._set_every_note_filter_box(pane, True)
+        )
+        buttons.addWidget(pane.select_all_button)
+        pane.clear_all_button = named(QPushButton(), "すべてクリア")
+        pane.clear_all_button.clicked.connect(
+            lambda _checked=False: self._set_every_note_filter_box(pane, False)
+        )
+        buttons.addWidget(pane.clear_all_button)
         layout.addLayout(buttons)
         return panel
 
@@ -33135,14 +38182,14 @@ class OutlineEditMixin:
             chosen.discard(key)
         self._apply_note_rows(pane)
 
-    def _reset_note_filter(self, pane: WritingPane) -> None:
-        """Every kind and every colour again, in that tab."""
+    def _set_every_note_filter_box(self, pane: WritingPane, shown: bool) -> None:
+        """Every kind and every colour in that tab ticked, or none."""
         for box in [*pane.kind_boxes.values(), *pane.color_boxes.values()]:
             box.blockSignals(True)
-            box.setChecked(True)
+            box.setChecked(shown)
             box.blockSignals(False)
-        pane.kinds_shown = pane.all_kinds()
-        pane.colors_shown = self._all_note_colors()
+        pane.kinds_shown = pane.all_kinds() if shown else set()
+        pane.colors_shown = self._all_note_colors() if shown else set()
         self._apply_note_rows(pane)
 
     def _note_item_clicked(self, item: QListWidgetItem) -> None:
@@ -33176,7 +38223,7 @@ class ExportMixin:
         names = EXPORT_FORMATS[kind]
         name = tr(names["name"])
         suffix = f".{kind}"
-        base = Path(self.file_path) if self.file_path else Path.home() / tr("無題.pdf")
+        base = self._document_name_path()
         if pages is not None and pages == list(range(len(self.document))):
             pages = None
         if pages is not None:
@@ -33201,7 +38248,7 @@ class ExportMixin:
                 data = serialize_document(self.document)
             else:
                 # Just those pages, kept under the document's password.
-                piece = self._pages_piece(pages)
+                piece = self._pages_piece(pages, keep_outline=True)
                 try:
                     data = piece.tobytes(
                         **compact_page_copy(piece), **protection_options(self.document, self.password)
@@ -33253,14 +38300,11 @@ class ExportMixin:
                     return
                 try:
                     write_file_atomically(selected, output.read_bytes())
-                except PermissionError as exc:
-                    reason = tr("ほかのアプリでこのファイルを開いている場合は、閉じてからもう一度お試しください。")
-                    QMessageBox.critical(
-                        self, APP_NAME, failure.format(format=name, error=f"{reason}\n\n{exc}")
-                    )
-                    return
                 except OSError as exc:
-                    QMessageBox.critical(self, APP_NAME, failure.format(format=name, error=exc))
+                    # One way of saying it for every file written (7.5).
+                    QMessageBox.critical(
+                        self, APP_NAME, failure.format(format=name, error=self._write_failure_detail(exc))
+                    )
                     return
                 if skipped:
                     # Numbered as in the document, not in the pages sent.
@@ -33378,6 +38422,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         self._ocr_download_dialog: QProgressDialog | None = None
         self._export_process: ExportProcess | None = None
         self._export_dialog: QProgressDialog | None = None
+        self._print_dialog: QProgressDialog | None = None
         self._ocr_applied_pages = 0
         self._ocr_session: "DocumentSession | None" = None
         self._ocr_language = ""
@@ -33473,6 +38518,14 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         # (session, marker xref, page, state before) for a picture that was
         # selected but not yet changed -- see _withdraw_provisional_image_marker.
         self._provisional_image_marker: tuple[Any, int, int, tuple] | None = None
+        # The undo step that gave a picture of the PDF's own its marker,
+        # for the change that follows to join (_snapshot_for_edit).
+        self._image_marker_step: tuple[Any, Any] | None = None
+        # How far the picture in the box is turned, and was when it was
+        # taken in hand (7.9).
+        self._active_image_angle = 0.0
+        self._active_image_original_angle = 0.0
+        self._snapshot_joined_the_marker = False
         # (document, state id, count) -- see _pending_redaction_count_for_notice.
         self._redaction_count_kept: tuple[Any, Any, int] | None = None
         # {(document id, page): {annotation xref: white cover rect or None}}
@@ -33551,7 +38604,8 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         # Scrolling moves where the reader is without moving the current
         # page: the outline's mark follows the view (6.8).
         self.continuous_timer.timeout.connect(
-            lambda: (self._mark_outline_position(), self._mark_page_sections_here())
+            lambda: self._continuous_column_is_current()
+            and (self._mark_outline_position(), self._mark_page_sections_here())
         )
         self.continuous_timer.timeout.connect(self._follow_view_page)
         self._recovery_writer = shared_recovery_writer()
@@ -33571,6 +38625,10 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         self._setup_keytips()
         QApplication.instance().installEventFilter(self)
         QApplication.instance().focusChanged.connect(self._update_pane_indicator)
+        # Paste comes and goes with what is on the clipboard (7.0).
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.dataChanged.connect(self._update_text_format_visibility)
         self._update_controls()
         self._rebuild_welcome()
 
@@ -33750,12 +38808,25 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             return False
         if event.type() == QEvent.Close:
             return self._close_requested_while_closing(watched, event)
+        if event.type() == QEvent.ShortcutOverride and self._list_widens_selection(watched, event):
+            # Shift and an arrow in the page list widen the selection, as in
+            # any Windows list and PowerPoint's slides: Shift+Down was the
+            # window's Next Page there, which the arrow alone already is in
+            # the list, and pages could be chosen together only with the
+            # mouse (2026-11-21's walk).
+            event.accept()
+            return False
         if event.type() in (QEvent.ShortcutOverride, QEvent.KeyPress) and self._premium_alt_key(event):
             # Claiming the override keeps Qt from running the shortcut; the
             # key press that follows asks instead.
             event.accept()
             if event.type() == QEvent.KeyPress:
-                self._premium_blocked(self.PREMIUM_ALT_KEYS)
+                # Which key, and what it does, for the offer (7.2).
+                self._premium_alt_pressed = self._alt_key_named(event)
+                try:
+                    self._premium_blocked(self.PREMIUM_ALT_KEYS)
+                finally:
+                    self._premium_alt_pressed = None
             return True
         if event.type() == QEvent.KeyPress:
             focus = QApplication.focusWidget()
@@ -33780,8 +38851,8 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             # while the user walked a context menu.
             if QApplication.activePopupWidget() is not None:
                 return super().eventFilter(watched, event)
-            is_text_input = isinstance(watched, (QLineEdit, QTextEdit)) or isinstance(
-                focus, (QLineEdit, QTextEdit)
+            is_text_input = isinstance(watched, TEXT_INPUT_TYPES) or isinstance(
+                focus, TEXT_INPUT_TYPES
             )
             # Order is behaviour here: the first group that claims the key
             # wins, and a text box being edited must see its own arrow keys
@@ -33789,6 +38860,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             # it consumed the key, False to pass it to the next group, and
             # None to stop and hand the key to Qt untouched.
             for group in (
+                self._key_press_welcome,
                 self._key_press_outline,
                 self._key_press_navigation,
                 self._key_press_editing,
@@ -33971,6 +39043,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
                 widget.setParent(None)
                 widget.deleteLater()
         self._recent_rows = []
+        self._recent_buttons: list[QPushButton] = []
         # All of them (6.19): the four it showed left six of the ten kept
         # out of reach but for the File menu.
         recent = self.settings.existing()
@@ -33982,8 +39055,15 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         )
         self.recent_layout.addWidget(title)
         self.recent_layout.addWidget(self._recent_header())
+        previous: QWidget = self.welcome_new_button
+        QWidget.setTabOrder(self.welcome_open_button, self.welcome_new_button)
         for path in recent:
-            self.recent_layout.addWidget(self._recent_row(path))
+            row = self._recent_row(path)
+            self.recent_layout.addWidget(row)
+            # Tab goes Open, New, then the files, as the arrows do: made
+            # after the status bar's buttons, they came after them.
+            QWidget.setTabOrder(previous, row)
+            previous = row
         if self._recent_rows:
             self.recent_info_timer.start(0)
 
@@ -34101,6 +39181,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             cells.append(cell)
         button.setAccessibleName(Path(path).name)
         button.clicked.connect(lambda _checked=False, p=path: self.open_document(p))
+        self._recent_buttons.append(button)
         if not remote:
             key = (path, modified, size)
             self._recent_rows.append((key, button, thumb, cells[2]))
@@ -34211,6 +39292,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             self.act_duplicate_page,
             self.act_rotate_pdf_page,
             self.act_extract_page,
+            self.act_present_current,
             self.act_outline_add,
             self.act_split_pdf,
             *self.export_actions.values(),
@@ -34218,6 +39300,7 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             self.act_redact_selection,
             self.act_apply_redactions,
             self.act_sanitize,
+            self.act_restore,
             self.act_ocr_page,
             self.act_ocr_document,
             self.act_add_note_here,
@@ -34250,7 +39333,8 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         # says so by greying out when no box is being edited. The other three
         # each drive whichever text is selected (see _toggle_unified_*), so
         # they only depend on a document being open.
-        self.act_text_bold.setEnabled(editing_text)
+        # A text box held as an object takes it for all of its words (7.9).
+        self.act_text_bold.setEnabled(editing_text or self._active_text_box is not None)
         # Alignment applies to the open box, typing or selected as an object.
         for action in (self.act_align_left, self.act_align_center, self.act_align_right):
             action.setEnabled(self._active_text_box is not None)
@@ -34263,7 +39347,6 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
             button.setEnabled(has_document)
         self.facing_cover_checkbox.setEnabled(has_document)
         self._sync_format_action_states()
-        self._update_search_navigation_buttons()
         self._update_pane_indicator()
         if self.document is None:
             self.act_prev.setEnabled(False)
@@ -34299,6 +39382,9 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
 
         # The size boxes follow what is held, whichever kind (6.21).
         self._update_shape_format_controls()
+        # The outline entry's level, as far as it can go (7.9).
+        if hasattr(self, "act_outline_promote"):
+            self._update_outline_level_actions()
 
     @staticmethod
     def _dropped_pdf_paths(event: Any) -> list[str]:
@@ -34333,10 +39419,29 @@ class PDFReaderWindow(ChromeMixin, CentralUiMixin, KeyboardMixin, SessionsMixin,
         super().resizeEvent(event)
         if getattr(self, "_toolbar_rows", None):
             self._toolbar_relayout_timer.start(80)
+        if getattr(self, "_keytip_labels", None) and getattr(self, "_keytip_colour_kind", None) is None:
+            # The Alt key guide, open while the window is made smaller or
+            # larger: laid out again over the buttons where the toolbar
+            # rows put them, rather than left where they were (7.7).
+            timer = getattr(self, "_keytip_follow_timer", None)
+            if timer is None:
+                timer = self._keytip_follow_timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._keytips_follow_resize)
+            timer.start(120)
+
+    def _keytips_follow_resize(self) -> None:
+        if self._keytip_labels and getattr(self, "_keytip_colour_kind", None) is None:
+            self._show_root_keytips()
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
         self._watch_for_screen_changes()
+        if not getattr(self, "_welcome_focused_once", False):
+            # The first time the window is shown: Open chosen, not the
+            # side bar's close button.
+            self._welcome_focused_once = True
+            QTimer.singleShot(0, self, self._focus_welcome)
 
     def _watch_for_screen_changes(self) -> None:
         """Listen for the display's scale changing, and for this window
@@ -35265,6 +40370,15 @@ def _self_test_store_projection() -> None:
     assert importlib.import_module("winrt.windows.services.store").StoreContext is not None
 
 
+def _self_test_signature_reader() -> None:
+    """Who signed a signed PDF is read with asn1crypto, imported only when
+    such a PDF is opened (7.9): a build without it would start and run, and
+    name no signer."""
+    import importlib
+
+    assert importlib.import_module("asn1crypto.cms").ContentInfo is not None
+
+
 def run_self_test(app: QApplication) -> int:
     """Run the self-test with message boxes that fail instead of waiting.
 
@@ -35516,7 +40630,8 @@ def _run_self_test_steps(app: QApplication) -> int:
         assert len(saved_check) == 3
         saved_check.close()
         window._snapshot_for_edit()
-        saved_annot = window.document[0].add_rect_annot(fitz.Rect(45, 45, 95, 85))
+        saved_page = window.document[0]  # an annotation holds its page only weakly
+        saved_annot = saved_page.add_rect_annot(fitz.Rect(45, 45, 95, 85))
         saved_annot.update()
         window._mark_dirty()
         assert window.save_document()
@@ -35541,6 +40656,7 @@ def _run_self_test_steps(app: QApplication) -> int:
         _self_test_legal()
         _self_test_languages()
         _self_test_store_projection()
+        _self_test_signature_reader()
         return 0
     except Exception:
         print(traceback.format_exc(), file=sys.stderr)
@@ -35669,11 +40785,12 @@ class SingleInstance(QObject):
         if socket is None:
             return
         try:
-            payload = bytearray()
-            while b"\n" not in payload and socket.waitForReadyRead(600):
+            # What is there already first: waitForReadyRead() waits for
+            # *new* data, and a request that had arrived whole would have
+            # been waited out and dropped (7.9's review).
+            payload = bytearray(bytes(socket.readAll()))
+            while b"\n" not in payload and len(payload) <= 8192 and socket.waitForReadyRead(600):
                 payload += bytes(socket.readAll())
-                if len(payload) > 8192:
-                    break
             if self.dispatch(bytes(payload)):
                 socket.write(b"ok")
                 socket.waitForBytesWritten(600)
@@ -35947,7 +41064,7 @@ class TermsNoticeDialog(QDialog):
             tr(
                 "{app}を初めて起動した時から{days}日間は、すべての機能を無料でお使いいただけます。"
                 "その後、OCR や墨消しの範囲の指定などのプレミアム機能を使うには、購入が必要です。"
-                "購入の前に、必要な機能が使えることを無料期間中にお確かめください。"
+                "購入の前に、必要な機能が使えることをプレミアム無料体験期間中にお確かめください。"
             ).format(days=TRIAL_DAYS, app=APP_NAME),
             tr(
                 "大切な文書は、編集する前に複製を保存してください。"
@@ -36033,6 +41150,17 @@ def show_legal_document(parent: QWidget, title: str, files: dict[str, str]) -> N
     layout.addWidget(buttons)
     viewer.exec()
     viewer.deleteLater()
+
+
+def store_subscription_text(offer: StoreOffer) -> str:
+    """A subscription's second line among the offers: that it is one, and
+    how often it renews -- one sentence per period, so that each language
+    words the part in brackets as it would (the owner, 2026-11-20)."""
+    if offer.period_unit == "month" and offer.period > 0:
+        return tr_n("サブスクリプション（{count} か月ごとに自動更新されます）", offer.period).format(count=offer.period)
+    if offer.period_unit == "year" and offer.period > 0:
+        return tr_n("サブスクリプション（{count} 年ごとに自動更新されます）", offer.period).format(count=offer.period)
+    return tr("サブスクリプション（自動更新されます）")
 
 
 def store_renewal_text(offer: StoreOffer) -> str:
@@ -36124,9 +41252,11 @@ class VersionHistoryDialog(QDialog):
     def check(self) -> None:
         """Ask, then ask the Store. Nothing goes online before the yes."""
         if self.client is None:
+            # The Store's part of Windows could not be loaded (7.9: a copy
+            # not from the Store had words of its own, taken out).
             self.status.setText(tr(
-                "この{app}は Microsoft Store から入れたものではないため、新しい版を確かめられません。"
-            ).format(app=APP_NAME))
+                "Microsoft Store に接続できませんでした。インターネットへの接続を確かめて、もう一度お試しください。"
+            ))
             return
         if QMessageBox.question(
             self, tr("新しい版の確認"),
@@ -36164,6 +41294,716 @@ class VersionHistoryDialog(QDialog):
         QDesktopServices.openUrl(QUrl(f"ms-windows-store://pdp/?productid={STORE_PRODUCT_ID}"))
 
 
+# ---- 発表 (7.0) ----------------------------------------------------------
+#
+# The document shown page by page over the whole screen, as PowerPoint's
+# slide show: the same keys move through it, and the right-click menu and
+# Ctrl keys give the same pointer -- a laser pointer, a pen, a highlighter
+# and an eraser. What is drawn is kept in the PDF only if the presenter
+# says so at the end, as PowerPoint asks.
+PRESENTATION_PEN_COLOR = QColor(220, 30, 30)
+PRESENTATION_HIGHLIGHTER_COLOR = QColor(255, 214, 51, 120)
+# PowerPoint hides the arrow after three seconds without a move.
+PRESENTATION_POINTER_IDLE_MS = 3000
+# The ink written into the PDF when it is kept: the pen's width and the
+# highlighter's, in points, and the highlighter's opacity.
+PRESENTATION_PEN_WIDTH_PT = 2.0
+PRESENTATION_HIGHLIGHTER_WIDTH_PT = 12.0
+PRESENTATION_HIGHLIGHTER_OPACITY = 0.45
+PRESENTATION_SIDEBAR_WIDTH = 260
+
+
+class PresentationWindow(QWidget):
+    """The slide show of a document (7.0). Every command is in
+    PRESENTATION_COMMANDS: the keys, the right-click menu and the F1 list
+    are all made from it, so they cannot disagree, and the checks hold it
+    against keys used twice. A number and Enter goes to that page."""
+
+    ended = Signal(int, object)
+
+    MODES = ("arrow", "laser", "pen", "highlighter", "eraser")
+
+    def __init__(self, owner: Any, start: int) -> None:
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint)
+        self.owner = owner
+        self.document = owner.document
+        self.page_index = max(0, min(start, len(self.document) - 1))
+        self.setWindowTitle(tr("発表"))
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAutoFillBackground(False)
+        self.mode = "arrow"
+        self.pointer_hidden = False
+        self.ink_hidden = False
+        # None, "black" or "white".
+        self.blank: str | None = None
+        self.typed_number = ""
+        # What was drawn, page by page: strokes of (mode, points) with the
+        # points as fractions of the page as shown, so they stay put at any
+        # size and can be written into the page if they are kept.
+        self.ink: dict[int, list[tuple[str, list[QPointF]]]] = {}
+        self._stroke: list[QPointF] | None = None
+        self._pointer = QPointF(-1, -1)
+        self._cache: dict[tuple[int, int, int], QImage] = {}
+        self._page_area = QRectF()
+        self._finished = False
+        self._idle = QTimer(self)
+        self._idle.setSingleShot(True)
+        self._idle.setInterval(PRESENTATION_POINTER_IDLE_MS)
+        self._idle.timeout.connect(self._pointer_idle)
+        self._keys: dict[str, str] = {
+            key: command for command, _label, keys, _icon in PRESENTATION_COMMANDS for key in keys
+        }
+        # The window's own look -- its menus, its sidebar -- for the show,
+        # a window of its own that took none of it (7.9, the owner: the
+        # right-click menu was Qt's bare one).
+        self.setStyleSheet(owner.styleSheet())
+        # The window's sidebar, lent to the show while it is out (7.9): the
+        # same pages, outline, search and lists, not a copy of two of them.
+        # (index in the splitter, the splitter's sizes, shown there)
+        self._borrowed: tuple[int, list[int], bool] | None = None
+        self._following = False
+        # Zoomed in on the page (7.9): 1 is the whole page; the point of
+        # the page at the middle of the screen, as fractions of the page.
+        self.zoom = 1.0
+        self.zoom_center = QPointF(0.5, 0.5)
+        self._pan_from: QPointF | None = None
+        self._panned = False
+        QApplication.instance().installEventFilter(self)
+        self._update_cursor()
+
+    # -- the sidebar ------------------------------------------------------
+    @property
+    def sidebar(self) -> QWidget:
+        return self.owner.sidebar
+
+    def sidebar_shown(self) -> bool:
+        return self._borrowed is not None and self.owner.sidebar.isVisible()
+
+    def _borrow_sidebar(self) -> None:
+        """Take the window's sidebar over the left of the screen (7.9). It
+        lies over the page, which stays where it is (7.0)."""
+        if self._borrowed is not None:
+            return
+        owner = self.owner
+        sidebar = owner.sidebar
+        splitter = owner.splitter
+        index = splitter.indexOf(sidebar)
+        self._borrowed = (index, splitter.sizes(), sidebar.isVisible())
+        self._sidebar_width = max(sidebar.minimumWidth(), sidebar.width() if sidebar.isVisible() else 0,
+                                  getattr(owner, "_sidebar_size", 0), 270)
+        sidebar.setParent(self)
+
+    def _return_sidebar(self) -> None:
+        """Give the sidebar back to the window, where and as it was."""
+        borrowed, self._borrowed = self._borrowed, None
+        if borrowed is None:
+            return
+        index, sizes, visible = borrowed
+        owner = self.owner
+        try:
+            sidebar = owner.sidebar
+            sidebar.hide()
+            owner.splitter.insertWidget(max(0, index), sidebar)
+            sidebar.setVisible(visible)
+            owner.splitter.setSizes(sizes)
+        except RuntimeError:
+            pass
+
+    def focusNextPrevChild(self, _next: bool) -> bool:  # noqa: N802 - Qt's name
+        """Tab, which Qt takes before keyPressEvent: into the sidebar when
+        it is out, and nowhere else -- there is nothing else to go to."""
+        if self.sidebar_shown():
+            self.focus_sidebar()
+        return True
+
+    def focus_sidebar(self) -> None:
+        """Tab with the sidebar out: into its list, as Tab goes between the
+        page and the sidebar in the window."""
+        self.owner._focus_navigation_pane()
+
+    def back_to_the_page(self) -> None:
+        """The keys turn the pages again: what the window's "back to the
+        page" is while the sidebar is the show's."""
+        self.activateWindow()
+        self.setFocus(Qt.OtherFocusReason)
+
+    def eventFilter(self, watched: Any, event: QEvent) -> bool:  # noqa: N802 - Qt's name
+        """Keys in the lent sidebar: Tab or Esc goes back to the page, Alt+B
+        puts the sidebar away -- the window's own keys for them are the
+        window's, which is behind the show. The rest -- the arrows, Enter,
+        Ctrl+Left and Ctrl+Right -- are the sidebar's as in the window."""
+        if event.type() != QEvent.KeyPress or not self.sidebar_shown():
+            return False
+        try:
+            focus = QApplication.focusWidget()
+            inside = focus is not None and (focus is self.sidebar or self.sidebar.isAncestorOf(focus))
+        except RuntimeError:
+            return False
+        if not inside:
+            return False
+        key, modifiers = event.key(), event.modifiers() & ~Qt.KeypadModifier
+        if modifiers == Qt.AltModifier and key == Qt.Key_B:
+            self.run("sidebar")
+            return True
+        if key in (Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Escape):
+            self.back_to_the_page()
+            return True
+        if modifiers == Qt.ControlModifier and key in (Qt.Key_Left, Qt.Key_Right) and not isinstance(
+            focus, (QLineEdit, QAbstractSpinBox)
+        ):
+            # The sidebar's tabs, as in the window (the window's handler is
+            # the window's, behind the show).
+            self.owner._switch_navigation_tab(-1 if key == Qt.Key_Left else 1)
+            self.owner._focus_navigation_pane()
+            return True
+        # A key the sidebar's list leaves goes up to its parent, which is the
+        # show now: Enter, which shows the page chosen, then also turned to
+        # the next one. Noted here, it is not one of the show's keys.
+        self._sidebar_key = (key, event.timestamp())
+        return False
+
+    def toggle_sidebar(self) -> None:
+        sidebar = self.owner.sidebar
+        if self.sidebar_shown():
+            sidebar.hide()
+        else:
+            self._borrow_sidebar()
+            self._place_sidebar()
+            sidebar.show()
+            sidebar.raise_()
+            self._sync_sidebar()
+            # The pages it shows drawn, as the window draws them when they
+            # come into view.
+            QTimer.singleShot(0, self.owner, self.owner._queue_visible_thumbnails)
+        self.back_to_the_page()
+
+    def _place_sidebar(self) -> None:
+        width = min(getattr(self, "_sidebar_width", 270), max(190, self.width() // 2))
+        self.owner.sidebar.setGeometry(0, 0, width, self.height())
+
+    def _sync_sidebar(self) -> None:
+        """The window -- and so its sidebar -- on the page the show is on."""
+        if self._borrowed is None:
+            return
+        self._following = True
+        try:
+            if self.owner.page_index != self.page_index:
+                self.owner.go_to_page(self.page_index)
+        finally:
+            self._following = False
+
+    def follow_window(self, page_index: int) -> None:
+        """A page chosen in the sidebar -- a page, an outline entry, a
+        search result -- is the window's go_to_page: the show goes there."""
+        if self._following or self._finished:
+            return
+        if 0 <= page_index < self.page_count() and page_index != self.page_index:
+            self.go_to(page_index)
+
+    def document_changed(self) -> None:
+        """A page edited, added or taken away from the sidebar's menus: draw
+        it again."""
+        self._cache.clear()
+        self.page_index = max(0, min(self.page_index, self.page_count() - 1))
+        self.update()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if self.sidebar_shown():
+            self._place_sidebar()
+
+    # -- showing ----------------------------------------------------------
+    def start(self) -> None:
+        screen = self.owner.screen() if hasattr(self.owner, "screen") else None
+        if screen is not None:
+            self.setGeometry(screen.geometry())
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.ActiveWindowFocusReason)
+        self._idle.start()
+
+    def page_count(self) -> int:
+        return len(self.document)
+
+    def _page_image(self, index: int, width: int, height: int) -> QImage:
+        key = (index, width, height)
+        image = self._cache.get(key)
+        if image is not None:
+            return image
+        page = self.document[index]
+        bounds = page.rect
+        ratio = self.devicePixelRatioF() or 1.0
+        zoom = min(width / max(bounds.width, 1), height / max(bounds.height, 1)) * ratio
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True, alpha=False)
+        image = QImage(
+            pixmap.samples, pixmap.width, pixmap.height, pixmap.stride, QImage.Format_RGB888
+        ).copy()
+        image.setDevicePixelRatio(ratio)
+        if len(self._cache) > 6:
+            self._cache.clear()
+        self._cache[key] = image
+        return image
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.blank is not None:
+            painter.fillRect(self.rect(), QColor("black" if self.blank == "black" else "white"))
+            return
+        painter.fillRect(self.rect(), QColor("black"))
+        image = self._page_image(
+            self.page_index, int(self.width() * self.zoom), int(self.height() * self.zoom)
+        )
+        size = QSizeF(image.width(), image.height()) / image.devicePixelRatio()
+        self._page_area = self._placed(size)
+        painter.drawImage(self._page_area, image)
+        if not self.ink_hidden:
+            for mode, points in self.ink.get(self.page_index, []):
+                self._draw_stroke(painter, mode, [self._to_screen(point) for point in points])
+            if self._stroke is not None:
+                self._draw_stroke(painter, self.mode, [self._to_screen(point) for point in self._stroke])
+        if self.mode == "laser" and self.rect().contains(self._pointer.toPoint()):
+            glow = QRadialGradient(self._pointer, 14)
+            glow.setColorAt(0.0, QColor(255, 40, 40, 230))
+            glow.setColorAt(0.45, QColor(255, 30, 30, 160))
+            glow.setColorAt(1.0, QColor(255, 0, 0, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(glow)
+            painter.drawEllipse(self._pointer, 14, 14)
+
+    def _placed(self, size: QSizeF) -> QRectF:
+        """Where the page of `size` is drawn: in the middle, or -- zoomed in
+        -- with zoom_center at the middle of the screen, no further than the
+        page's edges allow (7.9)."""
+        lefts = []
+        for extent, screen, centre in (
+            (size.width(), self.width(), self.zoom_center.x()),
+            (size.height(), self.height(), self.zoom_center.y()),
+        ):
+            if extent <= screen:
+                lefts.append((screen - extent) / 2)
+            else:
+                lefts.append(min(0.0, max(screen - extent, screen / 2 - centre * extent)))
+        area = QRectF(QPointF(lefts[0], lefts[1]), size)
+        if self.zoom > 1.0:
+            # What the clamping left at the middle, so the next step starts there.
+            self.zoom_center = QPointF(
+                (self.width() / 2 - area.left()) / max(1.0, size.width()),
+                (self.height() / 2 - area.top()) / max(1.0, size.height()),
+            )
+        return area
+
+    def zoom_by(self, factor: float, anchor: QPointF | None = None) -> None:
+        """In or out by `factor`, the point of the page under `anchor` (the
+        pointer, for Ctrl+wheel) staying where it is; at most 4 times, and
+        no less than the whole page."""
+        zoom = max(1.0, min(PRESENTATION_ZOOM_MAX, self.zoom * factor))
+        if abs(zoom - self.zoom) < 1e-6:
+            return
+        if anchor is None:
+            anchor = QPointF(self.width() / 2, self.height() / 2)
+        if self._page_area.isEmpty():
+            fixed = QPointF(0.5, 0.5)
+        else:
+            fixed = self._to_page(anchor)
+        old_size = self._page_area.size()
+        ratio = zoom / self.zoom
+        size = QSizeF(old_size.width() * ratio, old_size.height() * ratio)
+        self.zoom = zoom
+        if zoom <= 1.0:
+            self.zoom_center = QPointF(0.5, 0.5)
+        elif size.width() > 0 and size.height() > 0:
+            left = anchor.x() - fixed.x() * size.width()
+            top = anchor.y() - fixed.y() * size.height()
+            self.zoom_center = QPointF(
+                (self.width() / 2 - left) / size.width(), (self.height() / 2 - top) / size.height()
+            )
+        self._update_cursor()
+        self.update()
+
+    def zoom_fit(self) -> None:
+        self.zoom = 1.0
+        self.zoom_center = QPointF(0.5, 0.5)
+        self._update_cursor()
+        self.update()
+
+    def _draw_stroke(self, painter: QPainter, mode: str, points: list[QPointF]) -> None:
+        if len(points) < 2:
+            return
+        if mode == "highlighter":
+            pen = QPen(PRESENTATION_HIGHLIGHTER_COLOR, 18, Qt.SolidLine, Qt.FlatCap, Qt.RoundJoin)
+        else:
+            pen = QPen(PRESENTATION_PEN_COLOR, 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPolyline(QPolygonF(points))
+
+    def _to_page(self, point: QPointF) -> QPointF:
+        area = self._page_area
+        if area.isEmpty():
+            return QPointF(0, 0)
+        return QPointF((point.x() - area.left()) / area.width(), (point.y() - area.top()) / area.height())
+
+    def _to_screen(self, point: QPointF) -> QPointF:
+        area = self._page_area
+        return QPointF(area.left() + point.x() * area.width(), area.top() + point.y() * area.height())
+
+    # -- the commands -----------------------------------------------------
+    def run(self, command: str) -> None:
+        """One of PRESENTATION_COMMANDS, by its name."""
+        if command == "next":
+            self.next_page()
+        elif command == "previous":
+            self.previous_page()
+        elif command == "first":
+            self.go_to(0)
+        elif command == "last":
+            self.go_to(self.page_count() - 1)
+        elif command in self.MODES:
+            self.set_mode(command)
+        elif command == "erase_ink":
+            self.erase_page_ink()
+        elif command == "hide_pointer":
+            self.toggle_pointer_hidden()
+        elif command == "hide_ink":
+            self.toggle_ink_hidden()
+        elif command in ("black", "white"):
+            self.toggle_blank(command)
+        elif command == "sidebar":
+            blocked = getattr(self.owner, "_premium_blocked", None)
+            # Alt+B is an Alt key, premium in limited mode as in the window;
+            # the offer names it (7.2).
+            self.owner._premium_alt_pressed = (key_text("Alt+B"), tr("サイド バーを表示/非表示"))
+            try:
+                allowed = blocked is None or not blocked(self.owner.PREMIUM_ALT_KEYS)
+            finally:
+                self.owner._premium_alt_pressed = None
+            if allowed:
+                self.toggle_sidebar()
+        elif command == "zoom_in":
+            self.zoom_by(PRESENTATION_ZOOM_STEP)
+        elif command == "zoom_out":
+            self.zoom_by(1 / PRESENTATION_ZOOM_STEP)
+        elif command == "zoom_fit":
+            self.zoom_fit()
+        elif command == "end":
+            if self.zoom > 1.0:
+                # Zoomed in, Esc first shows the whole page again, as
+                # PowerPoint's does; the next one ends the show.
+                self.zoom_fit()
+            else:
+                self.end()
+
+    def go_to(self, index: int) -> None:
+        index = max(0, min(index, self.page_count() - 1))
+        self.blank = None
+        if index != self.page_index:
+            self.zoom, self.zoom_center = 1.0, QPointF(0.5, 0.5)
+        self.page_index = index
+        self._sync_sidebar()
+        self.update()
+
+    def next_page(self) -> None:
+        if self.blank is not None:
+            self.blank = None
+            self.update()
+            return
+        if self.page_index >= self.page_count() - 1:
+            # PowerPoint ends after the last slide; here the last page stays
+            # until Esc, so a click too many does not throw the talk away.
+            return
+        self.go_to(self.page_index + 1)
+
+    def previous_page(self) -> None:
+        if self.blank is not None:
+            self.blank = None
+            self.update()
+            return
+        self.go_to(self.page_index - 1)
+
+    def toggle_blank(self, colour: str) -> None:
+        self.blank = None if self.blank == colour else colour
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in self.MODES:
+            return
+        # The same key again goes back to the arrow, as in PowerPoint.
+        self.mode = "arrow" if self.mode == mode and mode != "arrow" else mode
+        if self.mode != "arrow":
+            self.pointer_hidden = False
+        self._update_cursor()
+        self.update()
+
+    def toggle_pointer_hidden(self) -> None:
+        self.pointer_hidden = not self.pointer_hidden
+        if self.pointer_hidden:
+            self.mode = "arrow"
+        self._update_cursor()
+        self.update()
+
+    def toggle_ink_hidden(self) -> None:
+        self.ink_hidden = not self.ink_hidden
+        self.update()
+
+    def erase_page_ink(self) -> None:
+        self.ink.pop(self.page_index, None)
+        self.update()
+
+    def _update_cursor(self) -> None:
+        if self.zoom > 1.0 and self.mode == "arrow" and not self.pointer_hidden:
+            self.setCursor(Qt.ClosedHandCursor if self._pan_from is not None else Qt.OpenHandCursor)
+        elif self.mode == "laser" or self.pointer_hidden:
+            self.setCursor(Qt.BlankCursor)
+        elif self.mode in ("pen", "highlighter"):
+            self.setCursor(Qt.CrossCursor)
+        elif self.mode == "eraser":
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _pointer_idle(self) -> None:
+        if self.mode == "arrow" and not self.pointer_hidden:
+            self.setCursor(Qt.BlankCursor)
+
+    def drawn_ink(self) -> dict[int, list[tuple[str, list[QPointF]]]]:
+        return {page: strokes for page, strokes in self.ink.items() if strokes}
+
+    def end(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._idle.stop()
+        ink = self.drawn_ink()
+        self._leave()
+        self.close()
+        self.ended.emit(self.page_index, ink)
+
+    def closeEvent(self, event: Any) -> None:
+        if not self._finished:
+            self._finished = True
+            self._leave()
+            self.ended.emit(self.page_index, self.drawn_ink())
+        super().closeEvent(event)
+
+    def _leave(self) -> None:
+        """The sidebar back to the window, and the keys left alone."""
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except RuntimeError:
+            pass
+        self._return_sidebar()
+
+    # -- keys and mouse ---------------------------------------------------
+    @staticmethod
+    def _pressed(event: Any) -> str:
+        combination = event.keyCombination()
+        modifiers = combination.keyboardModifiers() & ~Qt.KeypadModifier
+        return QKeySequence(QKeyCombination(modifiers, combination.key())).toString(QKeySequence.PortableText)
+
+    def keyPressEvent(self, event: Any) -> None:
+        key = event.key()
+        if getattr(self, "_sidebar_key", None) == (key, event.timestamp()):
+            self._sidebar_key = None
+            event.accept()
+            return
+        modifiers = event.modifiers() & ~Qt.KeypadModifier
+        if modifiers == Qt.NoModifier and Qt.Key_0 <= key <= Qt.Key_9:
+            self.typed_number += chr(ord("0") + key - Qt.Key_0)
+            event.accept()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter) and self.typed_number:
+            number, self.typed_number = int(self.typed_number), ""
+            self.go_to(number - 1)
+            event.accept()
+            return
+        self.typed_number = ""
+        if key in (Qt.Key_Tab, Qt.Key_Backtab) and self.sidebar_shown():
+            self.focus_sidebar()
+            event.accept()
+            return
+        command = self._keys.get(self._pressed(event))
+        if command is None:
+            if self.blank is not None and key not in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta):
+                # Any key brings the page back, as from PowerPoint's black screen.
+                self.blank = None
+                self.update()
+                event.accept()
+                return
+            super().keyPressEvent(event)
+            return
+        if self.blank is not None and command not in ("black", "white", "end"):
+            self.blank = None
+            self.update()
+        else:
+            self.run(command)
+        event.accept()
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        self._pointer = QPointF(event.position())
+        if self._pan_from is not None and event.buttons() & Qt.LeftButton:
+            # Zoomed in: the page follows the pointer (7.9).
+            if not self._panned and not drag_has_started(self._pan_from, self._pointer):
+                return
+            delta = self._pointer - self._pan_from
+            self._pan_from = QPointF(self._pointer)
+            self._panned = True
+            size = self._page_area.size()
+            if size.width() > 0 and size.height() > 0:
+                self.zoom_center = QPointF(
+                    self.zoom_center.x() - delta.x() / size.width(),
+                    self.zoom_center.y() - delta.y() / size.height(),
+                )
+            self.update()
+            return
+        if self.mode == "arrow" and not self.pointer_hidden:
+            self._update_cursor()
+            self._idle.start()
+        if self._stroke is not None:
+            self._stroke.append(self._to_page(self._pointer))
+        elif self.mode == "eraser" and event.buttons() & Qt.LeftButton:
+            self._erase_at(self._pointer)
+        self.update()
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        position = QPointF(event.position())
+        if self.zoom > 1.0 and self.mode in ("arrow", "laser") and self.blank is None:
+            self._pan_from = position
+            self._panned = False
+            self._update_cursor()
+        elif self.mode in ("pen", "highlighter") and self.blank is None:
+            self._stroke = [self._to_page(position)]
+        elif self.mode == "eraser":
+            self._erase_at(position)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() != Qt.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        if self._pan_from is not None:
+            # Zoomed in, a click moves the page, not to the next one.
+            self._pan_from = None
+            self._update_cursor()
+        elif self._stroke is not None:
+            stroke, self._stroke = self._stroke, None
+            if len(stroke) > 1:
+                self.ink.setdefault(self.page_index, []).append((self.mode, stroke))
+            self.update()
+        elif self.mode in ("arrow", "laser"):
+            self.next_page()
+        event.accept()
+
+    def wheelEvent(self, event: Any) -> None:
+        if event.modifiers() & Qt.ControlModifier:
+            # Ctrl+wheel zooms, about the pointer, as in the window (7.9).
+            if event.angleDelta().y() > 0:
+                self.zoom_by(PRESENTATION_ZOOM_STEP, QPointF(event.position()))
+            elif event.angleDelta().y() < 0:
+                self.zoom_by(1 / PRESENTATION_ZOOM_STEP, QPointF(event.position()))
+            event.accept()
+            return
+        if event.angleDelta().y() < 0:
+            self.next_page()
+        elif event.angleDelta().y() > 0:
+            self.previous_page()
+        event.accept()
+
+    def _erase_at(self, position: QPointF) -> None:
+        strokes = self.ink.get(self.page_index)
+        if not strokes:
+            return
+        kept = [
+            (mode, points) for mode, points in strokes
+            if all(
+                QLineF(self._to_screen(point), position).length() > 10 for point in points
+            )
+        ]
+        if len(kept) != len(strokes):
+            self.ink[self.page_index] = kept
+            self.update()
+
+    def contextMenuEvent(self, event: Any) -> None:
+        menu = self.context_menu()
+        ready = getattr(self.owner, "_context_menu_ready", None)
+        if ready is not None:
+            ready(menu)
+        self._last_menu = menu
+        menu.exec(event.globalPos())
+
+    def _checked(self, command: str) -> bool | None:
+        if command in self.MODES:
+            return self.mode == command and not (command == "arrow" and self.pointer_hidden)
+        return {
+            "hide_pointer": self.pointer_hidden, "hide_ink": self.ink_hidden,
+            "black": self.blank == "black", "white": self.blank == "white",
+            "sidebar": self.sidebar_shown(),
+        }.get(command)
+
+    def context_menu(self) -> QMenu:
+        """Every command of the show, each with its keys (7.0): PowerPoint's
+        slide-show menu -- the pages, the pointer, the screen, the end --
+        and the sidebar."""
+        menu = QMenu(self)
+        commands = {command: (label, keys, icon) for command, label, keys, icon in PRESENTATION_COMMANDS}
+
+        def entry(target: QMenu, command: str) -> QAction:
+            label, keys, icon = commands[command]
+            shown = keys_or(key_text(key) for key in keys[:2])
+            action = target.addAction(f"{tr(label)}\t{shown}", lambda c=command: self.run(c))
+            action.setProperty("pdfnoteKey", label)
+            action.setProperty("pdfnoteCommand", command)
+            if icon is not None:
+                action.setIcon(menu_icon(icon))
+            checked = self._checked(command)
+            if checked is not None:
+                action.setCheckable(True)
+                action.setChecked(checked)
+            return action
+
+        for command in ("next", "previous", "first", "last"):
+            entry(menu, command)
+        pages = QMenu(tr("ページへ移動"), menu)
+        menu.addMenu(pages)
+        pages.setProperty("pdfnoteKey", "ページへ移動")
+        pages.menuAction().setIcon(menu_icon("page_jump"))
+        for index in range(self.page_count()):
+            action = pages.addAction(
+                tr("ページ {number}").format(number=index + 1),
+                lambda i=index: self.go_to(i),
+            )
+            action.setCheckable(True)
+            action.setChecked(index == self.page_index)
+        menu.addSeparator()
+        # The pointer at the top, a click away (7.9, the owner): it was
+        # PowerPoint's Pointer Options submenu.
+        for command in ("laser", "pen", "highlighter", "eraser", "arrow"):
+            entry(menu, command)
+        for command in ("erase_ink", "hide_pointer", "hide_ink"):
+            entry(menu, command)
+        menu.addSeparator()
+        for command in ("zoom_in", "zoom_out", "zoom_fit"):
+            entry(menu, command)
+        screen = QMenu(tr("画面"), menu)
+        menu.addMenu(screen)
+        screen.setProperty("pdfnoteKey", "画面")
+        screen.menuAction().setIcon(menu_icon("screen_black"))
+        for command in ("black", "white"):
+            entry(screen, command)
+        entry(menu, "sidebar")
+        menu.addSeparator()
+        entry(menu, "end")
+        menu._pages_menu = pages  # type: ignore[attr-defined]
+        menu._screen_menu = screen  # type: ignore[attr-defined]
+        return assign_access_keys(menu)
+
+
 class PurchaseDialog(QDialog):
     """The last screen before Microsoft's purchase window.
 
@@ -36191,26 +42031,23 @@ class PurchaseDialog(QDialog):
         )
         self.resize(660, 640)
         layout = QVBoxLayout(self)
-        # The owner's appeal for support, and thanks to the first customer (6.52).
-        self.appeal = QLabel(tr(
-            "pdfNoteは若き開発者がたった一人で作っています。"
-            "もし気に入っていただけたなら、有償版を購入して開発者を応援していただけないでしょうか。"
+        # What this screen is for (7.7). The appeal and the thanks to the
+        # first customer stood here (6.52); the owner took them off the
+        # screen of the law's final confirmation, and the appeal went to
+        # the offers (2026-11-09).
+        self.lead = QLabel(tr(
+            "内容をご確認のうえ、［Microsoft Store で購入］を押してください。"
+            "次に開く Microsoft Store の画面で購入を確定すると、購入が完了します。"
         ))
-        self.appeal.setWordWrap(True)
-        layout.addWidget(self.appeal)
-        self.thanks = QLabel(tr(
-            "このアプリを最初に有償購入してくれたのはデンマークの方でした。"
-            "彼または彼女への最大限の感謝の印にデンマーク語とその祖先の古ノルド語対応をしました。"
-        ))
-        self.thanks.setWordWrap(True)
-        layout.addWidget(self.thanks)
+        self.lead.setWordWrap(True)
+        layout.addWidget(self.lead)
         self.status = QLabel(tr("Microsoft Store から商品と価格を読み込んでいます…"))
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.choices = QWidget(self)
         self.choices_layout = QVBoxLayout(self.choices)
         self.choices_layout.setContentsMargins(0, 0, 0, 0)
-        self.choice_group = QButtonGroup(self)
+        self.choice_group = ChoiceGroup(self)
         self.choice_group.buttonToggled.connect(lambda *_args: self._choice_changed())
         layout.addWidget(self.choices)
         self.details = QLabel()
@@ -36287,8 +42124,15 @@ class PurchaseDialog(QDialog):
                 return
             self.status.setText(tr("購入する商品を選んでください。"))
             for offer in self.offers:
-                kind = store_renewal_text(offer) if offer.subscription else tr("買い切り（お支払いは1回だけです）")
-                button = QRadioButton(f"{offer.title}  {offer.price}\n{kind}", self.choices)
+                # "サブスクリプション" named beside how often it renews, as
+                # 買い切り is named for the one-time offer (the owner, 2026-11-20).
+                kind = (
+                    store_subscription_text(offer)
+                    if offer.subscription
+                    else tr("買い切り（お支払いは1回だけです）")
+                )
+                # A check box, each a stop of Tab, one ticked at a time (7.1).
+                button = QCheckBox(f"{offer.title}  {offer.price}\n{kind}", self.choices)
                 button.setProperty("pdfnoteStoreId", offer.store_id)
                 self.choice_group.addButton(button)
                 self.choices_layout.addWidget(button)
@@ -36336,8 +42180,9 @@ class PurchaseDialog(QDialog):
         rows = [
             (tr("購入する商品"), offer.title),
             (tr("内容"), tr(
+                # (7.2: テキスト ボックスの追加 left the list, free for good)
                 "この Microsoft Store 版の pdfNote で、プレミアム機能（OCR、墨消しの範囲の指定、"
-                "テキスト ボックスの追加、右クリックのメニュー、Alt キーのショートカット）が"
+                "右クリックのメニュー、Alt キーのショートカット）が"
                 "使えるようになります。購入に使う Microsoft アカウントに結び付きます。"
             )),
             (tr("数量"), "1"),
@@ -36685,10 +42530,12 @@ def main() -> int:
     window = PDFReaderWindow()
     window.show()
     if args.pdf:
-        QTimer.singleShot(80, lambda: window.open_document(args.pdf))
-    QTimer.singleShot(150, window._offer_recovery_restore)
+        QTimer.singleShot(80, window, lambda: window.open_document(args.pdf))
+    QTimer.singleShot(150, window, window._offer_recovery_restore)
+    # What a pdfNote that crashed in the middle of OCR or an export left.
+    QTimer.singleShot(5000, window, remove_abandoned_work_folders)
     # After the recovery question, if it is asked (when_no_dialog_is_up).
-    QTimer.singleShot(1200, lambda: when_no_dialog_is_up(window.offer_default_pdf_app))
+    QTimer.singleShot(1200, window, lambda: when_no_dialog_is_up(window.offer_default_pdf_app))
     record_faults()
     code = app.exec()
     end_process(code)

@@ -24,5 +24,7 @@ winrt-runtime==3.2.1; sys_platform == "win32"
 winrt-Windows.Foundation==3.2.1; sys_platform == "win32"
 winrt-Windows.Foundation.Collections==3.2.1; sys_platform == "win32"
 winrt-Windows.Services.Store==3.2.1; sys_platform == "win32"
+# Who signed a signed PDF (7.9): reads the signature's PKCS #7 data.
+asn1crypto==1.5.1
 # Used by PyWinRT, python-docx and python-pptx.
 typing_extensions==4.15.0

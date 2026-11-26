@@ -97,7 +97,8 @@ a = Analysis(
     # The interface languages kept one file a language (6.4); the
     # self-test fails an executable that left one out.
     + [(path, 'i18n') for path in sorted(glob.glob(f'{ROOT}/i18n/*.json'))],
-    hiddenimports=STORE_MODULES,
+    # asn1crypto reads who signed a signed PDF (7.9); imported where used.
+    hiddenimports=STORE_MODULES + ['asn1crypto', 'asn1crypto.cms'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

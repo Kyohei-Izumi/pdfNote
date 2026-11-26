@@ -2,6 +2,182 @@
  "_comment": "The release notes of each version, as the Store's \"What's new in this version\" said them, in every display language of pdfNote (6.52). The current version's notes must match store/listing/listing_<language>.md word for word (functional_qa). Old Norse is in runes, made by tools/runes.py from docs/l10n/non_normalized.json.",
  "versions": [
   {
+   "version": "1.1.1",
+   "notes": {
+    "ja": [
+     "PDF を全画面で 1 ページずつ映す「発表」を追加しました。レーザー ポインター、ペン、蛍光ペンで書き込みながら発表でき、PowerPoint に資料を作り直す必要はありません。",
+     "付箋に返信したり、選んだ文字に付箋を付けたりできるようになりました。",
+     "複数の画像や図形を、左揃え・中央揃えなどできれいに配置できるようになりました。",
+     "画像とテキスト ボックスも回転できるようになりました。",
+     "目次（しおり）の項目のレベルを上げ下げして、章と節を整理できるようになりました。",
+     "ダイナミックツールバーを改良し、そのとき使えるボタンだけが出るようにしました。",
+     "そのほかの不具合の修正と改善。"
+    ],
+    "en": [
+     "Present a PDF full screen, one page at a time, and draw on the page with the laser pointer, pen and highlighter as you speak. No more remaking your slides in PowerPoint.",
+     "Reply to sticky notes, and add a sticky note to selected text.",
+     "Line up several images and shapes neatly with Align Left, Align Center and more.",
+     "Rotate images and text boxes, too.",
+     "Promote and demote table of contents entries to organize chapters and sections.",
+     "Improved the dynamic toolbar so that it shows only the buttons you can use at that moment.",
+     "Other fixes and improvements."
+    ],
+    "zh_CN": [
+     "新增“演示”：可全屏逐页放映 PDF，演示时可用激光笔、笔和荧光笔在页面上书写，无需再把资料重新做成 PowerPoint。",
+     "可回复便笺，也可为选中的文本添加便笺。",
+     "可用左对齐、水平居中等方式整齐排列多个图片和图形。",
+     "图片和文本框现在也可旋转。",
+     "可在目录中提升或降低条目的级别，整理章节结构。",
+     "改进了动态工具栏，只显示当前可用的按钮。",
+     "其他问题修复和改进。"
+    ],
+    "ko": [
+     "PDF를 전체 화면으로 한 페이지씩 보여 주는 프레젠테이션 기능이 추가되었습니다. 레이저 포인터, 펜, 형광펜으로 페이지에 쓰면서 발표할 수 있어 PowerPoint로 자료를 다시 만들 필요가 없습니다.",
+     "스티커 메모에 회신하고, 선택한 텍스트에 스티커 메모를 붙일 수 있습니다.",
+     "여러 이미지와 도형을 왼쪽 맞춤, 가운데 맞춤 등으로 깔끔하게 정렬할 수 있습니다.",
+     "이미지와 텍스트 상자도 회전할 수 있습니다.",
+     "목차 항목의 수준을 올리거나 내려 장과 절을 정리할 수 있습니다.",
+     "동적 도구 모음을 개선해 그때 사용할 수 있는 단추만 표시되도록 했습니다.",
+     "그 밖의 문제 수정 및 개선."
+    ],
+    "es": [
+     "Presenta el PDF a pantalla completa, página a página, y dibuja en la página con el puntero láser, el lápiz y el marcador de resaltado mientras hablas. Se acabó rehacer tus diapositivas en PowerPoint.",
+     "Responde a las notas adhesivas y añade una nota adhesiva al texto seleccionado.",
+     "Alinea con orden varias imágenes y formas, por ejemplo a la izquierda o al centro.",
+     "Gira también imágenes y cuadros de texto.",
+     "Aumenta o disminuye el nivel de las entradas de la tabla de contenido para organizar capítulos y secciones.",
+     "Barra de herramientas dinámica mejorada: ahora solo muestra los botones que puedes usar en cada momento.",
+     "Otras correcciones y mejoras."
+    ],
+    "fr": [
+     "Présentation du PDF en plein écran, page par page, en dessinant sur la page avec le pointeur laser, le stylet ou le surligneur. Fini de refaire vos diapositives dans PowerPoint.",
+     "Réponse aux pense-bêtes et ajout d'un pense-bête au texte sélectionné.",
+     "Alignement de plusieurs images et formes, par exemple à gauche ou au centre.",
+     "Rotation possible aussi pour les images et les zones de texte.",
+     "Hausse et abaissement du niveau des entrées du sommaire, pour organiser chapitres et sections.",
+     "Barre d'outils dynamique améliorée : seuls les boutons utilisables à ce moment-là s'affichent.",
+     "Autres corrections et améliorations."
+    ],
+    "ru": [
+     "Презентация: PDF во весь экран, страница за страницей, а во время показа можно рисовать на странице лазерной указкой, пером и маркером. Больше не нужно переделывать материалы в PowerPoint.",
+     "Ответы на записки и добавление записки к выделенному тексту.",
+     "Выравнивание нескольких изображений и фигур, например по левому краю или по центру.",
+     "Поворот теперь доступен и для изображений, и для текстовых полей.",
+     "Повышение и понижение уровня пунктов оглавления, чтобы упорядочить главы и разделы.",
+     "Улучшена динамическая панель инструментов: теперь на ней видны только кнопки, которые можно использовать в данный момент.",
+     "Прочие исправления и улучшения."
+    ],
+    "ar": [
+     "اعرض ملف PDF بملء الشاشة صفحةً بعد صفحة، وارسم على الصفحة أثناء العرض باستخدام مؤشر الليزر والقلم وقلم التمييز. لا حاجة بعد الآن إلى إعادة إعداد موادك في PowerPoint.",
+     "ردّ على الملاحظات الملصقة، وأضف ملاحظة ملصقة إلى النص المحدد.",
+     "استخدم محاذاة لليسار ومحاذاة المركز وغيرهما لترتيب عدة صور وأشكال بدقة.",
+     "دوّر الصور ومربعات النص أيضاً.",
+     "استخدم الترقية والتخفيض في جدول المحتويات لتنظيم الفصول والأقسام.",
+     "تحسين شريط الأدوات الديناميكي ليعرض فقط الأزرار التي يمكنك استخدامها في تلك اللحظة.",
+     "إصلاحات وتحسينات أخرى."
+    ],
+    "de": [
+     "PDFs im Vollbild präsentieren, Seite für Seite, und dabei mit Laserpointer, Stift und Textmarker auf die Seite zeichnen. Folien müssen nicht mehr in PowerPoint neu erstellt werden.",
+     "Auf Kurznotizen antworten und markierten Text mit einer Kurznotiz versehen.",
+     "Mehrere Bilder und Formen sauber ausrichten, etwa linksbündig oder horizontal zentriert.",
+     "Auch Bilder und Textfelder drehen.",
+     "Einträge im Inhaltsverzeichnis höher- oder tieferstufen und so Kapitel und Abschnitte gliedern.",
+     "Verbesserte dynamische Symbolleiste: Sie zeigt nur die Schaltflächen, die gerade verwendet werden können.",
+     "Weitere Fehlerbehebungen und Verbesserungen."
+    ],
+    "pt_BR": [
+     "Apresente o PDF em tela inteira, página por página, e desenhe na página com o apontador laser, a caneta e o marca-texto enquanto fala. Chega de refazer seus slides no PowerPoint.",
+     "Responda a notas autoadesivas e adicione uma nota autoadesiva ao texto selecionado.",
+     "Alinhe várias imagens e formas com precisão, por exemplo à esquerda ou ao centro.",
+     "Gire também imagens e caixas de texto.",
+     "Promova ou rebaixe as entradas do sumário para organizar capítulos e seções.",
+     "Barra de ferramentas dinâmica aprimorada: agora ela mostra apenas os botões que você pode usar no momento.",
+     "Outras correções e melhorias."
+    ],
+    "pt_PT": [
+     "Apresente o PDF em ecrã inteiro, página a página, e desenhe na página com o ponteiro laser, a caneta e o marcador enquanto fala. Acabou-se refazer os diapositivos no PowerPoint.",
+     "Responda a notas autocolantes e adicione uma nota autocolante ao texto selecionado.",
+     "Alinhe várias imagens e formas com precisão, por exemplo à esquerda ou ao centro.",
+     "Rode também imagens e caixas de texto.",
+     "Aumente ou diminua o nível das entradas do índice para organizar capítulos e secções.",
+     "Barra de ferramentas dinâmica melhorada: agora mostra apenas os botões que pode utilizar nesse momento.",
+     "Outras correções e melhorias."
+    ],
+    "hi": [
+     "PDF को पूर्ण स्क्रीन में एक-एक पृष्ठ करके प्रस्तुत करें और प्रस्तुति के दौरान लेसर सूचक, पेन और हाइलाइटर से पृष्ठ पर लिखें. अब PowerPoint में स्लाइड दोबारा बनाने की ज़रूरत नहीं.",
+     "स्टिकी नोट का उत्तर दें और चयनित टेक्स्ट पर स्टिकी नोट जोड़ें.",
+     "कई छवियों और आकृतियों को बाएँ या केंद्र में संरेखित करके व्यवस्थित करें.",
+     "छवियों और टेक्स्ट बॉक्स को भी घुमाएँ.",
+     "सामग्री तालिका की प्रविष्टियों का स्तर बढ़ाएँ या घटाएँ और अध्यायों व खंडों को व्यवस्थित करें.",
+     "डायनैमिक टूलबार बेहतर किया गया: अब यह केवल वही बटन दिखाता है जिनका उस समय उपयोग किया जा सकता है.",
+     "अन्य समस्याओं का समाधान और सुधार."
+    ],
+    "bn": [
+     "PDF পূর্ণ স্ক্রিনে এক পৃষ্ঠা করে উপস্থাপন করুন, আর উপস্থাপনার সময় লেজার নির্দেশক, পেন ও হাইলাইটার দিয়ে পৃষ্ঠায় লিখুন। PowerPoint-এ স্লাইড নতুন করে বানানোর দিন শেষ।",
+     "স্টিকি নোটে উত্তর দিন, আর নির্বাচিত টেক্সটে স্টিকি নোট যোগ করুন।",
+     "একাধিক ছবি ও আকৃতিকে বামে বা কেন্দ্রে সারিবদ্ধ করে গুছিয়ে রাখুন।",
+     "ছবি ও টেক্সট বক্সও ঘোরান।",
+     "সূচিপত্রের এন্ট্রির স্তর বাড়িয়ে বা কমিয়ে অধ্যায় ও অংশ গুছিয়ে নিন।",
+     "ডায়নামিক টুলবার উন্নত করা হয়েছে: এখন এটি শুধু সেই মুহূর্তে ব্যবহারযোগ্য বোতামগুলো দেখায়।",
+     "অন্যান্য সমস্যার সমাধান ও উন্নতি।"
+    ],
+    "ur": [
+     "PDF کو پوری اسکرین پر ایک ایک صفحہ کر کے پیش کریں، اور پیشکش کے دوران لیزر پوائنٹر، قلم اور نمایاں کنندہ سے صفحے پر لکھیں۔ اب PowerPoint میں سلائیڈز دوبارہ بنانے کی ضرورت نہیں۔",
+     "اسٹکی نوٹس کا جواب دیں، اور منتخب متن پر اسٹکی نوٹ شامل کریں۔",
+     "کئی تصاویر اور اشکال کو بائیں یا مرکز میں سیدھ کر کے ترتیب دیں۔",
+     "تصاویر اور ٹیکسٹ باکس کو بھی گھمائیں۔",
+     "فہرست مضامین کے اندراجات کا درجہ بڑھا یا گھٹا کر ابواب اور حصوں کو ترتیب دیں۔",
+     "ڈائنامک ٹول بار بہتر کیا گیا: اب یہ صرف وہی بٹن دکھاتا ہے جو اس وقت استعمال کیے جا سکتے ہیں۔",
+     "دیگر خرابیوں کی درستی اور بہتریاں۔"
+    ],
+    "la": [
+     "PDF toto velo ostende, paginam post paginam, et dum loqueris, radio indicante, calamo calamove fulgente in pagina scribe. Non iam opus est materiam in PowerPoint denuo conficere.",
+     "Schedulis adhaerentibus responde, et schedulam textui selecto adfige.",
+     "Plures imagines figurasque ad sinistram, ad medium latitudinis aliterve dirige.",
+     "Imagines quoque et capsas textus converte.",
+     "Gradum in indice capitum attolle vel demitte, ut capita et partes eorum disponas.",
+     "Tabula instrumentorum emendata est: nunc eos tantum globulos ostendit quibus tum uti potes.",
+     "Aliae correctiones et emendationes."
+    ],
+    "grc": [
+     "Δεῖξον τὸ PDF ἐφ' ὅλου τοῦ παραπετάσματος κατὰ σελίδα, καὶ λέγων γράφε ἐπὶ τῆς σελίδος τῇ δεικτικῇ ἀκτῖνι, τῷ καλάμῳ ἢ τῷ λαμπρῷ καλάμῳ. Οὐκέτι δεῖ τὴν ὕλην ἐν PowerPoint αὖθις κατασκευάζειν.",
+     "Ἀπόκριναι τοῖς σημειώμασι, καὶ πρόσαψον σημείωμα τῷ ἐπιλεχθέντι κειμένῳ.",
+     "Πολλὰς εἰκόνας καὶ σχήματα τάξον, οἷον πρὸς τὰ ἀριστερὰ ἢ εἰς τὸ μέσον τοῦ πλάτους.",
+     "Στρέψον ἤδη καὶ εἰκόνας καὶ πλαίσια κειμένου.",
+     "Ἀναβίβασον ἢ καταβίβασον τὴν βαθμίδα ἐν τῷ πίνακι τῶν κεφαλαίων, ὥστε τάξαι τὰ κεφάλαια καὶ τὰ μέρη αὐτῶν.",
+     "Ἡ γραμμὴ τῶν ὀργάνων ἐπηνωρθώθη· νῦν μόνα δείκνυσι τὰ κομβία οἷς ἔξεστι τότε χρῆσθαι.",
+     "Ἄλλαι ἐπανορθώσεις καὶ βελτιώσεις."
+    ],
+    "sa": [
+     "PDF सम्पूर्णे पटे पृष्ठशः प्रदर्श्यताम्, प्रदर्शनकाले च प्रकाशसूचकेन लेखन्या दीप्तलेखन्या वा पृष्ठे लिख्यताम्। PowerPoint-इत्यत्र सामग्री पुनः न रचयितव्या।",
+     "आसक्तटिप्पणीभ्यः प्रत्युत्तरं दीयताम्, वृते पाठे च आसक्तटिप्पणी योज्यताम्।",
+     "बहूनि चित्राणि आकृतयः च वामान्ते तिर्यङ्मध्ये वा क्रमेण स्थाप्यन्ताम्।",
+     "चित्राणि पाठपेटिकाः च अपि भ्राम्यन्ताम्।",
+     "अनुक्रमणिकायां स्तरः उन्नीयताम् अवनीयतां वा, येन अध्यायाः खण्डाः च सुव्यवस्थिताः भवेयुः।",
+     "साधनपट्टिका परिष्कृता, इदानीं सा तस्मिन् क्षणे उपयोज्यानि कीलकानि एव दर्शयति।",
+     "अन्यानि संशोधनानि परिष्काराश्च।"
+    ],
+    "da": [
+     "Præsentér PDF-filen i fuld skærm, én side ad gangen, og tegn på siden med laserpegepind, pen og overstregningstusch, mens du taler. Slut med at lave dine dias om i PowerPoint.",
+     "Svar på huskesedler, og tilføj en huskeseddel til markeret tekst.",
+     "Juster flere billeder og figurer pænt, f.eks. til venstre eller centreret.",
+     "Rotér også billeder og tekstfelter.",
+     "Hæv eller sænk niveauet for punkter i indholdsfortegnelsen, og organisér kapitler og afsnit.",
+     "Den dynamiske værktøjslinje er forbedret og viser nu kun de knapper, du kan bruge lige nu.",
+     "Andre rettelser og forbedringer."
+    ],
+    "non": [
+     "ᛋᛦᚿ PDF ᛆ ᚰᛚᚢ ᛐᛁᛆᛚᛑᛁ, ᚼᚡᛂᚱᛐ ᛒᛚᛆᚦ ᛋᛂᚱ, ᚮᚴ ᚱᛁᛐᛆ ᛆ ᚦᛆᛐ ᛘᛂᚦ ᛚᛁᚮᛋᚡᛁᛋᛁ, ᛔᛂᚿᛆ ᛂᚦᛆ ᛚᛁᚮᛋᛔᛂᚿᛆ ᛘᛂᚦᛆᚿ ᚦᚢ ᛘᛅᛚᛁᚱ. ᛂᛁᚵᛁ ᚦᛆᚱᚠᛐᚢ ᛆᛐ ᚵᛂᚱᛆ ᛂᚠᚿᛁᛐ ᛆᚠ ᚿᛦᛁᚢ ᛁ PowerPoint.",
+     "ᛋᚡᛆᚱᛆ ᛋᛂᚦᛚᚢᛘ, ᚮᚴ ᛋᛂᛐ ᛋᛂᚦᛁᛚ ᛆ ᚦᛆᛐ ᛂᚱ ᚡᛆᛚᛁᛐ ᛂᚱ.",
+     "ᛁᛆᚠᚿᛆ ᛘᛆᚱᚵᛆᚱ ᛘᛦᚿᛑᛁᚱ ᚮᚴ ᛚᛁᚴᛁ ᛐᛁᛚ ᚡᛁᚿᛋᛐᚱᛁ ᛂᚦᛆ ᛁ ᛘᛁᚦᛁᚢ.",
+     "ᛋᚿᚢ ᚿᚢ ᚮᚴ ᛘᛦᚿᛑᚢᛘ ᚮᚴ ᚱᛁᛐᚱᛂᛁᛐᚢᛘ.",
+     "ᚠᚯᚱ ᚼᛚᚢᛐᛁ ᚴᛆᛔᛁᛐᚢᛚᛆᛋᚴᚱᛆᚱ ᚢᛔ ᛂᚦᛆ ᚿᛁᚦᚱ ᚢᛘ ᛋᛐᛁᚵ, ᚮᚴ ᛋᚴᛁᛔᛆ ᛋᚡᛆ ᚴᛆᛔᛁᛐᚢᛚᚢᛘ ᚮᚴ ᚵᚱᛂᛁᚿᚢᛘ ᚦᛂᛁᚱᛆ.",
+     "ᛐᚮᛚᛆᛋᛔᛁᛆᛚᛑᛁᛐ ᛒᚯᛐ, ᛋᚡᛆ ᛆᛐ ᚦᛆᛐ ᛋᛦᚿᛁᚱ ᚦᛆ ᛂᛁᚿᛆ ᚴᚿᛆᛔᛆ ᛂᚱ ᚿᛦᛐᛆ ᛘᛆ.",
+     "ᛆᚦᚱᛆᚱ ᛒᚯᛐᚱ."
+    ]
+   }
+  },
+  {
    "version": "1.1.0",
    "notes": {
     "ja": [
@@ -58,7 +234,7 @@
      "Conversion des PDF en Word, PowerPoint et Excel.",
      "Ajout et modification de signets (entrées du sommaire).",
      "Choix des langues reconnues par l'OCR.",
-     "Filtre d'annotations : surlignages et pense-bêtes filtrés par type et par couleur.",
+     "Filtre d'annotations : surlignages et pense-bêtes filtrés par type et par couleur.",
      "Duplication des images et des formes, et réglage précis de leur taille et de leur angle.",
      "Historique des mises à jour et recherche d'une nouvelle version depuis l'application.",
      "Textes revus dans toutes les langues et corrections lors de l'enregistrement et de la conversion.",
@@ -235,7 +411,7 @@
      "Otras correcciones y mejoras."
     ],
     "fr": [
-     "Nouvelles langues d'interface : allemand, portugais (Brésil et Portugal), hindi, bengali, ourdou, latin, grec ancien et sanskrit, soit 17 langues en tout.",
+     "Nouvelles langues d'interface : allemand, portugais (Brésil et Portugal), hindi, bengali, ourdou, latin, grec ancien et sanskrit, soit 17 langues en tout.",
      "Les données de langue haute précision de l'OCR se téléchargent en un clic.",
      "Les PDF enregistrés sont plus légers.",
      "Les zones de texte acceptent toutes les polices installées sur votre PC.",
@@ -251,7 +427,7 @@
     "ar": [
      "لغات واجهة جديدة: الألمانية والبرتغالية (البرازيل والبرتغال) والهندية والبنغالية والأردية واللاتينية واليونانية القديمة والسنسكريتية، ليصبح المجموع 17 لغة.",
      "أصبح تنزيل بيانات اللغة عالية الدقة للتعرف الضوئي على الحروف بنقرة واحدة.",
-     "أصبحت ملفات PDF المحفوظة أصغر حجمًا.",
+     "أصبحت ملفات PDF المحفوظة أصغر حجماً.",
      "يمكن لمربعات النص استخدام أي خط مثبت على جهازك.",
      "إصلاحات وتحسينات أخرى."
     ],

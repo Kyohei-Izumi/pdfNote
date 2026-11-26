@@ -1,6 +1,6 @@
 # pdfNote Terms of Use
 
-Last updated: October 4, 2026
+Last updated: November 10, 2026
 
 **PLEASE READ THESE TERMS CAREFULLY. SECTION 6 (PURCHASES ARE FINAL; REFUNDS), SECTION 13 (DISCLAIMER OF WARRANTIES) AND SECTION 14 (LIMITATION OF LIABILITY) LIMIT YOUR REMEDIES.**
 
@@ -42,15 +42,15 @@ Last updated: October 4, 2026
 
 3.3 We are not responsible for any loss or damage arising from the installation or use of an Unofficial Copy, including loss or damage caused by code that a third party has added or changed.
 
-## 4. Free Trial and Limited Mode
+## 4. Premium Free Trial and Limited Mode
 
-4.1 The Store Edition can be installed and used free of charge. For thirty (30) days from the first time it is started under a Windows user account on a device (the "Trial Period"), all of its features, including the Premium Features, are available.
+4.1 The Store Edition can be installed and used free of charge. For thirty (30) days from the first time it is started under a Windows user account on a device (the "Premium Free Trial"), all of its features, including the Premium Features, are available free of charge.
 
-4.2 After the Trial Period, the Premium Features are available only with a Premium Purchase. The other features of the Store Edition, such as opening, viewing, annotating, saving and printing documents, remain available free of charge.
+4.2 After the Premium Free Trial ends, the Premium Features are available only with a Premium Purchase. The other features of the Store Edition, such as opening, viewing, annotating, saving and printing documents, remain available free of charge.
 
-4.3 The Trial Period is offered so that you can decide, before making any Premium Purchase, whether the Store Edition and its Premium Features meet your needs. You are responsible for making that decision.
+4.3 The Premium Free Trial is offered so that you can decide, before making any Premium Purchase, whether the Store Edition and its Premium Features meet your needs. You are responsible for making that decision.
 
-4.4 We may change the length or other terms of the free trial, or discontinue it, in later versions of the Store Edition.
+4.4 We may change the length or other terms of the Premium Free Trial, or discontinue it, in later versions of the Store Edition.
 
 ## 5. Premium Purchases
 
@@ -110,7 +110,7 @@ Last updated: October 4, 2026
 
 8.2 Saving a document replaces the file to which it is saved. Keep a copy of any important document before you edit it.
 
-8.3 The author of a PDF file can set usage restrictions, for example on printing or copying. The Store Edition tells you about such restrictions but does not enforce them, and it is not designed to remove encryption or other technical protection measures. You are responsible for complying with those restrictions and with the laws on technical protection measures.
+8.3 The author of a PDF file can set usage restrictions, for example on printing or copying, and a password to open it. Remove a restriction or a password, and save or use the file without it, only if you are entitled to do so and at your own responsibility. You are responsible for complying with the laws on such restrictions, passwords and technical protection measures.
 
 8.4 Redaction removes the content under a redaction mark from a document only when the redaction is applied and the document is then saved. The original content may remain in the file as it was before redaction, in other copies, in the recovery copies kept by the Store Edition, on the clipboard and in printouts. Sanitizing removes much of the hidden information in a document, such as metadata and embedded scripts, but not necessarily all of it, and it does not remove the author names recorded in sticky notes. Before you disclose a redacted or sanitized document, open the saved file in another program and confirm that the content you intended to remove is no longer present.
 
